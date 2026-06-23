@@ -16,9 +16,9 @@ STATUSES = ("待处理", "已发货", "异常", "已取消")
 EXPRESS_COMPANIES = ("圆通", "京东", "顺丰")
 DEFAULT_EXPRESS_COMPANY = "圆通"
 DEFAULT_ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "wanwu2026"
+DEFAULT_ADMIN_PASSWORD = "scentpool2026"
 DEFAULT_STORE_USERNAME = "store01"
-DEFAULT_STORE_PASSWORD = "wanwu2026"
+DEFAULT_STORE_PASSWORD = "scentpool2026"
 
 
 class AppError(Exception):
@@ -157,7 +157,7 @@ class Database:
         if production:
             if user_count == 0:
                 if not admin_password or len(admin_password) < 8:
-                    raise AppError("生产环境首次启动必须设置至少 8 位的 WANWU_ADMIN_PASSWORD，或迁移已重置密码的数据库。", 500)
+                    raise AppError("生产环境首次启动必须设置至少 8 位的 SCENTPOOL_ADMIN_PASSWORD，或迁移已重置密码的数据库。", 500)
                 conn.execute(
                     """
                     INSERT INTO users (username, password_hash, role, store_id, active, created_at, updated_at)

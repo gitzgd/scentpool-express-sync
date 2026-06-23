@@ -229,7 +229,7 @@ def env_flag(name: str) -> bool:
 def save_database_backup() -> Path:
     backup_dir = Path(DB.path).parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
-    backup_path = backup_dir / f"wanwu-before-restore-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}.db"
+    backup_path = backup_dir / f"scentpool-before-restore-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}.db"
     backup_path.write_bytes(DB.backup_bytes())
     return backup_path
 
@@ -251,7 +251,7 @@ def validate_database_file(path: Path) -> None:
 def restore_database(payload: bytes) -> None:
     db_path = Path(DB.path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix="wanwu-restore-", suffix=".db", dir=str(db_path.parent))
+    fd, temp_name = tempfile.mkstemp(prefix="scentpool-restore-", suffix=".db", dir=str(db_path.parent))
     temp_path = Path(temp_name)
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -265,7 +265,7 @@ def restore_database(payload: bytes) -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "WanwuExpress/1.0"
+    server_version = "ScentpoolExpress/1.0"
 
     def do_GET(self) -> None:
         self.route()
@@ -379,18 +379,18 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/admin/backup.db" and self.command == "GET":
             self.require_admin(user)
-            filename = f"wanwu-backup-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}.db"
+            filename = f"scentpool-backup-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}.db"
             self.send_bytes(
                 DB.backup_bytes(),
                 "application/octet-stream",
-                attachment_header(filename, "wanwu-backup.db"),
+                attachment_header(filename, "scentpool-backup.db"),
             )
             return
 
         if path == "/api/admin/restore-db" and self.command == "POST":
             self.require_admin(user)
             if not ALLOW_DB_RESTORE:
-                raise AppError("数据库恢复接口未开启。需要临时设置 WANWU_ALLOW_DB_RESTORE=1。", 403)
+                raise AppError("数据库恢复接口未开启。需要临时设置 SCENTPOOL_ALLOW_DB_RESTORE=1。", 403)
             filename, payload = self.read_multipart_file("backup_file")
             if not filename.lower().endswith(".db"):
                 raise AppError("请上传 .db 数据库备份文件。")
@@ -465,7 +465,7 @@ class Handler(BaseHTTPRequestHandler):
         payload = ("\ufeff" + stream.getvalue()).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/csv; charset=utf-8")
-        self.send_header("Content-Disposition", attachment_header(filename, "wanwu-shipments.csv"))
+        self.send_header("Content-Disposition", attachment_header(filename, "scentpool-shipments.csv"))
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -474,7 +474,7 @@ class Handler(BaseHTTPRequestHandler):
         payload = build_shipments_xlsx(shipments)
         self.send_response(200)
         self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        self.send_header("Content-Disposition", attachment_header(filename, "wanwu-shipments.xlsx"))
+        self.send_header("Content-Disposition", attachment_header(filename, "scentpool-shipments.xlsx"))
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -553,14 +553,14 @@ class Handler(BaseHTTPRequestHandler):
         return attrs
 
     def session_cookie(self, token: str) -> str:
-        return f"wwxp_session={token}; {self.cookie_attributes(14 * 24 * 3600)}"
+        return f"scentpool_session={token}; {self.cookie_attributes(14 * 24 * 3600)}"
 
     def expired_session_cookie(self) -> str:
-        return f"wwxp_session=; {self.cookie_attributes(0)}"
+        return f"scentpool_session=; {self.cookie_attributes(0)}"
 
     def session_token(self) -> str:
         jar = cookies.SimpleCookie(self.headers.get("Cookie", ""))
-        morsel = jar.get("wwxp_session")
+        morsel = jar.get("scentpool_session")
         return morsel.value if morsel else ""
 
     def require_user(self) -> Dict[str, Any]:
@@ -578,17 +578,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    production = os.environ.get("WANWU_ENV", "").strip().lower() == "production"
+    production = os.environ.get("SCENTPOOL_ENV", "").strip().lower() == "production"
     default_host = os.environ.get("HOST") or ("0.0.0.0" if production or os.environ.get("PORT") else "127.0.0.1")
     default_port = int(os.environ.get("PORT") or 8765)
-    default_db = os.environ.get("WANWU_DB_PATH") or (
-        "/var/data/wanwu.db" if production else str(BASE_DIR / "data" / "wanwu.db")
+    default_db = os.environ.get("SCENTPOOL_DB_PATH") or (
+        "/var/data/scentpool.db" if production else str(BASE_DIR / "data" / "scentpool.db")
     )
-    default_products = os.environ.get("WANWU_PRODUCT_FILE") or (
+    default_products = os.environ.get("SCENTPOOL_PRODUCT_FILE") or (
         "/var/data/products.xlsx" if production else DEFAULT_PRODUCT_FILE
     )
 
-    parser = argparse.ArgumentParser(description="Wanwu Express Sync")
+    parser = argparse.ArgumentParser(description="Scentpool Express Sync")
     parser.add_argument("--host", default=default_host)
     parser.add_argument("--port", default=default_port, type=int)
     parser.add_argument("--db", default=default_db)
@@ -596,14 +596,14 @@ def main() -> None:
     args = parser.parse_args()
 
     global ALLOW_DB_RESTORE, DB, PRODUCT_FILE_PATH, SESSION_SECURE
-    ALLOW_DB_RESTORE = env_flag("WANWU_ALLOW_DB_RESTORE")
+    ALLOW_DB_RESTORE = env_flag("SCENTPOOL_ALLOW_DB_RESTORE")
     PRODUCT_FILE_PATH = args.products
-    SESSION_SECURE = env_flag("WANWU_SESSION_SECURE") or production
+    SESSION_SECURE = env_flag("SCENTPOOL_SESSION_SECURE") or production
     DB = Database(args.db)
     DB.initialize(
         args.products,
         production=production,
-        admin_password=os.environ.get("WANWU_ADMIN_PASSWORD", ""),
+        admin_password=os.environ.get("SCENTPOOL_ADMIN_PASSWORD", ""),
     )
     if production and DB.default_credentials_active():
         raise RuntimeError("生产数据库仍可使用默认账号密码登录，请先重置 admin 和门店账号密码。")
@@ -613,7 +613,7 @@ def main() -> None:
     print(f"数据库：{args.db}")
     print(f"商品文件：{args.products}")
     if not production:
-        print("本地开发默认账号：admin / wanwu2026、store01 / wanwu2026")
+        print("本地开发默认账号：admin / scentpool2026、store01 / scentpool2026")
     server.serve_forever()
 
 

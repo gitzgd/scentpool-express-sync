@@ -47,7 +47,7 @@ def request_full(opener, base, method, path, payload=None):
 
 
 def request_multipart(opener, base, method, path, field_name, file_path):
-    boundary = "----wanwu-smoke-boundary"
+    boundary = "----scentpool-smoke-boundary"
     file_bytes = Path(file_path).read_bytes()
     body = b"".join(
         [
@@ -102,10 +102,10 @@ def main() -> None:
         status, body = request(admin, base, "GET", "/login")
         assert status == 200
         login_html = body.decode("utf-8")
-        assert "wanwu2026" not in login_html
+        assert "scentpool2026" not in login_html
         assert "示例门店" not in login_html
 
-        status, body = request(admin, base, "POST", "/api/login", {"username": "admin", "password": "wanwu2026"})
+        status, body = request(admin, base, "POST", "/api/login", {"username": "admin", "password": "scentpool2026"})
         assert status == 200, body
         assert body["user"]["role"] == "admin"
 
@@ -118,14 +118,14 @@ def main() -> None:
         status, body, headers = request_full(admin, base, "GET", "/api/admin/backup.db")
         assert status == 200
         assert body.startswith(b"SQLite format 3"), body[:32]
-        assert "wanwu-backup" in headers.get("Content-Disposition", "")
+        assert "scentpool-backup" in headers.get("Content-Disposition", "")
 
         status, body, _headers = request_multipart(admin, base, "POST", "/api/products/import", "product_file", DEFAULT_PRODUCT_FILE)
         assert status == 200, body
         assert body["result"]["imported"] == 52
         assert Path(server.PRODUCT_FILE_PATH).exists()
 
-        status, body = request(staff, base, "POST", "/api/login", {"username": "store01", "password": "wanwu2026"})
+        status, body = request(staff, base, "POST", "/api/login", {"username": "store01", "password": "scentpool2026"})
         assert status == 200, body
         assert body["user"]["role"] == "staff"
 

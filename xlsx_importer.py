@@ -1,4 +1,4 @@
-"""Tiny XLSX reader for Wanwu product imports.
+"""Tiny XLSX reader for Scentpool product imports.
 
 The app intentionally avoids third-party runtime dependencies. This module reads
 the first worksheet in a normal .xlsx file using only zipfile + ElementTree.

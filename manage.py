@@ -9,7 +9,7 @@ from database import AppError, Database
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DB = BASE_DIR / "data" / "wanwu.db"
+DEFAULT_DB = BASE_DIR / "data" / "scentpool.db"
 
 
 def prompt_password(username: str) -> str:

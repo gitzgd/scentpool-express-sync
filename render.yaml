@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: wanwu-express-sync
+    name: scentpool-express-sync
     runtime: python
     region: singapore
     plan: starter
@@ -8,19 +8,19 @@ services:
     startCommand: python3 server.py
     healthCheckPath: /api/health
     envVars:
-      - key: WANWU_ENV
+      - key: SCENTPOOL_ENV
         value: production
-      - key: WANWU_DB_PATH
-        value: /var/data/wanwu.db
-      - key: WANWU_PRODUCT_FILE
+      - key: SCENTPOOL_DB_PATH
+        value: /var/data/scentpool.db
+      - key: SCENTPOOL_PRODUCT_FILE
         value: /var/data/products.xlsx
-      - key: WANWU_SESSION_SECURE
+      - key: SCENTPOOL_SESSION_SECURE
         value: "1"
-      - key: WANWU_ADMIN_PASSWORD
+      - key: SCENTPOOL_ADMIN_PASSWORD
         sync: false
-      - key: WANWU_ALLOW_DB_RESTORE
+      - key: SCENTPOOL_ALLOW_DB_RESTORE
         value: "0"
     disk:
-      name: wanwu-data
+      name: scentpool-data
       mountPath: /var/data
       sizeGB: 1
