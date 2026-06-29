@@ -29,11 +29,11 @@ def env_flag(name: str) -> bool:
 
 
 def tracking_interval_minutes() -> int:
-    raw = os.environ.get("SCENTPOOL_TRACKING_INTERVAL_MINUTES", "360").strip()
+    raw = os.environ.get("SCENTPOOL_TRACKING_INTERVAL_MINUTES", "1440").strip()
     try:
         value = int(raw)
     except ValueError:
-        value = 360
+        value = 1440
     return max(30, value)
 
 
