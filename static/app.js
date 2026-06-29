@@ -8,7 +8,7 @@ const state = {
   statuses: ["待处理", "已发货", "异常", "已取消"],
   submitItems: [{ category: "", barcode: "", quantity: 1 }],
   submitDraft: { store_id: "", recipient_name: "", phone: "", address: "", store_order_no: "", remark: "" },
-  adminFilters: { store_id: "", status: "", date_from: "", date_to: "", q: "" },
+  adminFilters: { store_id: "", status: "待处理", date_from: "", date_to: "", q: "" },
   storeFilters: { status: "", date_from: "", date_to: "", q: "" },
   productFilters: { category: "", q: "" },
 };
@@ -673,6 +673,8 @@ function bindStoreBoard() {
 async function renderAdmin() {
   await loadStores();
   await loadShipments();
+  const today = localDate();
+  const yesterday = localDate(-1);
   const exportParams = new URLSearchParams();
   Object.entries(state.adminFilters).forEach(([key, value]) => {
     if (value) exportParams.set(key, value);
@@ -688,7 +690,11 @@ async function renderAdmin() {
       </div>`
     )}
     <section class="panel panel-pad">
-      <div class="filters">
+      <div class="filters admin-filters">
+        <div class="quick-filters">
+          <button class="btn secondary small ${state.adminFilters.date_from === today && state.adminFilters.date_to === today ? "active" : ""}" data-admin-preset="today" type="button">今日</button>
+          <button class="btn secondary small ${state.adminFilters.date_from === yesterday && state.adminFilters.date_to === yesterday ? "active" : ""}" data-admin-preset="yesterday" type="button">昨日</button>
+        </div>
         <div class="field">
           <label>门店</label>
           <select class="select" id="filterStore">
@@ -742,7 +748,7 @@ function renderShipmentTable(shipments) {
           ${shipments
             .map(
               (row) => `
-                <tr data-shipment="${row.id}">
+                <tr class="shipment-row ${statusClass(row.status)}" data-shipment="${row.id}">
                   <td>${row.id}</td>
                   <td>${escapeHtml(formatDate(row.created_at))}</td>
                   <td>${escapeHtml(row.store_name_snapshot)}</td>
@@ -785,6 +791,18 @@ function renderShipmentTable(shipments) {
 }
 
 function bindAdmin() {
+  document.querySelectorAll("[data-admin-preset]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      const preset = event.currentTarget.dataset.adminPreset;
+      const targetDate = preset === "yesterday" ? localDate(-1) : localDate();
+      state.adminFilters = {
+        ...state.adminFilters,
+        date_from: targetDate,
+        date_to: targetDate,
+      };
+      render();
+    });
+  });
   document.getElementById("applyFilters").addEventListener("click", () => {
     state.adminFilters = {
       store_id: document.getElementById("filterStore").value,
