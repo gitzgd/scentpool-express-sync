@@ -181,6 +181,26 @@ def main() -> None:
         assert body["shipments"][0]["tracking_no"] == "SF123456"
         created_date = body["shipments"][0]["created_at"][:10]
 
+        def fake_query_tracking(_shipment):
+            return {
+                "provider": "kdniao",
+                "tracking_status": "已签收",
+                "state_code": "3",
+                "last_event": f"{created_date} 12:00:00 已签收",
+                "checked_at": f"{created_date}T12:05:00+08:00",
+                "signed_at": f"{created_date} 12:00:00",
+                "error": "",
+                "raw": "{}",
+                "is_signed": True,
+            }
+
+        server.query_tracking = fake_query_tracking
+        status, body = request(admin, base, "POST", f"/api/shipments/{shipment_id}/tracking/refresh", {})
+        assert status == 200, body
+        assert body["shipment"]["status"] == "已签收"
+        assert body["shipment"]["tracking_status"] == "已签收"
+        assert body["shipment"]["tracking_signed_at"]
+
         status, body = request(
             staff,
             base,

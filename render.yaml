@@ -20,6 +20,16 @@ services:
         sync: false
       - key: SCENTPOOL_ALLOW_DB_RESTORE
         value: "0"
+      - key: SCENTPOOL_TRACKING_PROVIDER
+        value: kdniao
+      - key: SCENTPOOL_TRACKING_AUTO
+        value: "1"
+      - key: SCENTPOOL_TRACKING_INTERVAL_MINUTES
+        value: "360"
+      - key: SCENTPOOL_KDNIAO_EBUSINESS_ID
+        sync: false
+      - key: SCENTPOOL_KDNIAO_APP_KEY
+        sync: false
     disk:
       name: scentpool-data
       mountPath: /var/data

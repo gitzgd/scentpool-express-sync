@@ -326,6 +326,11 @@ a {
   color: var(--green);
 }
 
+.status.signed {
+  background: rgba(88, 86, 214, 0.12);
+  color: #3f3ca8;
+}
+
 .status.exception {
   background: rgba(201, 52, 47, 0.12);
   color: var(--red);
@@ -468,6 +473,10 @@ tr:last-child td {
   background: #f6f6f8;
 }
 
+.shipment-row.signed td {
+  background: rgba(88, 86, 214, 0.045);
+}
+
 .shipment-row.exception td {
   background: rgba(255, 149, 0, 0.075);
 }
@@ -565,6 +574,11 @@ tr:last-child td {
 
 .item-name {
   font-weight: 600;
+}
+
+.tracking-event {
+  max-width: 260px;
+  margin-top: 6px;
 }
 
 .toast {

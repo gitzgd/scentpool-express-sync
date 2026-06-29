@@ -7,6 +7,8 @@ import io
 import json
 import mimetypes
 import os
+import threading
+import time
 import zipfile
 from datetime import datetime
 from email.parser import BytesParser
@@ -19,6 +21,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from xml.sax.saxutils import escape as xml_escape
 
 from database import AppError, Database, DEFAULT_PRODUCT_FILE, STATUSES
+from tracking import query_tracking, tracking_auto_enabled, tracking_config_public, tracking_interval_minutes, tracking_stale_before
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -57,11 +60,15 @@ EXPORT_HEADERS = [
     "备注",
     "快递公司",
     "快递单号",
+    "物流状态",
+    "最新轨迹",
+    "上次查询",
+    "签收时间",
     "发货备注",
     "发货时间",
 ]
 
-EXPORT_COLUMN_WIDTHS = [10, 20, 14, 18, 10, 12, 16, 36, 52, 24, 12, 22, 24, 20]
+EXPORT_COLUMN_WIDTHS = [10, 20, 14, 18, 10, 12, 16, 36, 52, 24, 12, 22, 14, 46, 20, 20, 24, 20]
 
 
 def export_rows(shipments: Any) -> list[list[Any]]:
@@ -81,6 +88,10 @@ def export_rows(shipments: Any) -> list[list[Any]]:
                 row["remark"],
                 row["express_company"],
                 row["tracking_no"],
+                row["tracking_status"],
+                row["tracking_last_event"],
+                row["tracking_last_checked_at"],
+                row["tracking_signed_at"],
                 row["shipping_note"],
                 row["shipped_at"],
             ]
@@ -264,6 +275,54 @@ def restore_database(payload: bytes) -> None:
         raise
 
 
+def refresh_tracking_for_shipment(shipment: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        result = query_tracking(shipment)
+    except AppError as exc:
+        result = {
+            "provider": "kdniao",
+            "tracking_status": "查询失败",
+            "state_code": "",
+            "last_event": shipment.get("tracking_last_event") or "",
+            "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "signed_at": "",
+            "error": exc.message,
+            "raw": "",
+            "is_signed": False,
+        }
+    return DB.apply_tracking_result(int(shipment["id"]), result)
+
+
+def sync_tracking_batch(*, force: bool = False, limit: int = 20) -> Dict[str, Any]:
+    candidates = DB.tracking_candidates(stale_before="" if force else tracking_stale_before(), limit=limit)
+    results = []
+    signed = 0
+    errors = 0
+    for shipment in candidates:
+        result = refresh_tracking_for_shipment(shipment)
+        signed += 1 if result.get("status") == "已签收" else 0
+        errors += 1 if result.get("tracking_status") == "查询失败" else 0
+        results.append(result)
+    return {"checked": len(results), "signed": signed, "errors": errors, "results": results}
+
+
+def tracking_worker() -> None:
+    time.sleep(60)
+    while True:
+        try:
+            sync_tracking_batch(force=False, limit=50)
+        except Exception as exc:
+            print(f"[tracking] 自动同步失败：{exc}")
+        time.sleep(max(1800, tracking_interval_minutes() * 60))
+
+
+def start_tracking_worker() -> None:
+    if not tracking_auto_enabled():
+        return
+    thread = threading.Thread(target=tracking_worker, name="scentpool-tracking", daemon=True)
+    thread.start()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ScentpoolExpress/1.0"
 
@@ -398,6 +457,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "summary": DB.database_summary()})
             return
 
+        if path == "/api/admin/tracking/config" and self.command == "GET":
+            self.require_admin(user)
+            self.send_json({"tracking": tracking_config_public()})
+            return
+
+        if path == "/api/admin/tracking/sync" and self.command == "POST":
+            self.require_admin(user)
+            body = self.read_json()
+            result = sync_tracking_batch(force=bool(body.get("force")), limit=int(body.get("limit") or 20))
+            self.send_json({"result": result})
+            return
+
         if path == "/api/shipments" and self.command == "POST":
             shipment = DB.create_shipment(user, self.read_json())
             self.send_json({"shipment": shipment}, status=201)
@@ -405,6 +476,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/shipments" and self.command == "GET":
             self.send_json({"shipments": DB.list_shipments(user, query), "statuses": STATUSES})
+            return
+
+        if path.startswith("/api/shipments/") and path.endswith("/tracking/refresh") and self.command == "POST":
+            self.require_admin(user)
+            shipment_id = int(path.split("/")[3])
+            shipment = DB.get_shipment(shipment_id, user)
+            refresh_tracking_for_shipment(shipment)
+            self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
             return
 
         if path.startswith("/api/shipments/") and self.command == "PATCH":
@@ -614,6 +693,7 @@ def main() -> None:
     print(f"商品文件：{args.products}")
     if not production:
         print("本地开发默认账号：admin / scentpool2026、store01 / scentpool2026")
+    start_tracking_worker()
     server.serve_forever()
 
 

@@ -28,6 +28,11 @@ python3 server.py --host 0.0.0.0 --port 8765
 - `SCENTPOOL_SESSION_SECURE=1`：Cookie 增加 `Secure`。
 - `SCENTPOOL_ADMIN_PASSWORD`：生产首次启动且没有迁移数据库时，用它创建总部账号。
 - `SCENTPOOL_ALLOW_DB_RESTORE=1`：临时开启数据库恢复接口，恢复完成后应改回 `0`。
+- `SCENTPOOL_TRACKING_PROVIDER=kdniao`：物流查询服务商。
+- `SCENTPOOL_TRACKING_AUTO=1`：开启自动物流查询。
+- `SCENTPOOL_TRACKING_INTERVAL_MINUTES=360`：自动查询间隔，默认 6 小时。
+- `SCENTPOOL_KDNIAO_EBUSINESS_ID`：快递鸟用户 ID，只放 Render 环境变量。
+- `SCENTPOOL_KDNIAO_APP_KEY`：快递鸟 API Key，只放 Render 环境变量。
 
 ## 发布到 Render
 
@@ -75,6 +80,20 @@ curl -b cookie.txt -c cookie.txt \
 
 总部进入“商品”页面，上传 `.xlsx` 商品资料即可刷新点菜单。生产环境会把最近一次上传文件保存到 `/var/data/products.xlsx`，不依赖本机 Downloads 路径。
 
+## 物流查询
+
+总部把订单保存为“已发货”并填写快递公司、快递单号后，系统会把订单标记为待查询。开启快递鸟环境变量后，后台会每 6 小时查询一次未签收订单；总部也可以在发货后台点击“同步物流”或单票“查物流”手动刷新。
+
+快递鸟返回签收后，系统会自动更新：
+
+```text
+订单状态：已签收
+物流状态：已签收
+签收时间：快递鸟最新签收轨迹时间
+```
+
+问题件只会显示为“问题件”，不会自动改成“异常”，避免误判影响订单。
+
 ## 备份与回滚
 
 - 总部在“发货后台”点击“备份数据库”，会下载完整 SQLite 文件。
@@ -85,7 +104,7 @@ curl -b cookie.txt -c cookie.txt \
 ## 本地验证
 
 ```bash
-python3 -m py_compile server.py database.py manage.py smoke_test.py
+python3 -m py_compile server.py database.py manage.py smoke_test.py tracking.py
 node --check static/app.js
 python3 smoke_test.py
 ```

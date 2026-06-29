@@ -5,7 +5,7 @@ const state = {
   productsAll: [],
   shipments: [],
   storeShipments: [],
-  statuses: ["待处理", "已发货", "异常", "已取消"],
+  statuses: ["待处理", "已发货", "已签收", "异常", "已取消"],
   submitItems: [{ category: "", barcode: "", quantity: 1 }],
   submitDraft: { store_id: "", recipient_name: "", phone: "", address: "", store_order_no: "", remark: "" },
   adminFilters: { store_id: "", status: "待处理", date_from: "", date_to: "", q: "" },
@@ -29,8 +29,17 @@ function escapeHtml(value) {
 function statusClass(status) {
   if (status === "待处理") return "pending";
   if (status === "已发货") return "shipped";
+  if (status === "已签收") return "signed";
   if (status === "异常") return "exception";
   if (status === "已取消") return "cancelled";
+  return "";
+}
+
+function trackingClass(status) {
+  if (status === "已签收") return "signed";
+  if (status === "查询失败" || status === "问题件") return "exception";
+  if (status === "待查询" || status === "无轨迹") return "pending";
+  if (status === "已揽收" || status === "运输中" || status === "转寄") return "shipped";
   return "";
 }
 
@@ -434,6 +443,11 @@ function renderTrackingInfo(row) {
     return `
       <strong>${escapeHtml(row.express_company || DEFAULT_EXPRESS_COMPANY)}</strong><br />
       <span>${escapeHtml(row.tracking_no)}</span>
+      ${row.tracking_status ? `<div style="margin-top: 7px;"><span class="status ${trackingClass(row.tracking_status)}">${escapeHtml(row.tracking_status)}</span></div>` : `<div class="muted mini" style="margin-top: 7px;">物流待查询</div>`}
+      ${row.tracking_last_event ? `<div class="muted mini tracking-event">${escapeHtml(row.tracking_last_event)}</div>` : ""}
+      ${row.tracking_last_checked_at ? `<div class="muted mini">查询：${escapeHtml(formatDate(row.tracking_last_checked_at))}</div>` : ""}
+      ${row.tracking_signed_at ? `<div class="muted mini">签收：${escapeHtml(formatDate(row.tracking_signed_at))}</div>` : ""}
+      ${row.tracking_error ? `<div class="muted mini">错误：${escapeHtml(row.tracking_error)}</div>` : ""}
       ${row.shipped_at ? `<div class="muted mini">${escapeHtml(formatDate(row.shipped_at))}</div>` : ""}
       ${row.shipping_note ? `<div class="muted mini">${escapeHtml(row.shipping_note)}</div>` : ""}
     `;
@@ -684,6 +698,7 @@ async function renderAdmin() {
       "发货后台",
       "总部统一处理门店提交的发货需求。",
       `<div class="actions">
+        <button class="btn secondary" id="syncTracking" type="button">同步物流</button>
         <a class="btn primary" href="/api/export/shipments.xlsx?${exportParams.toString()}">导出 XLSX</a>
         <a class="btn secondary" href="/api/export/shipments.csv?${exportParams.toString()}">导出 CSV</a>
         <a class="btn secondary" href="/api/admin/backup.db">备份数据库</a>
@@ -778,6 +793,7 @@ function renderShipmentTable(shipments) {
                   </td>
                   <td>
                     <button class="btn primary small" data-save-shipment="${row.id}" type="button">保存</button>
+                    ${row.tracking_no ? `<button class="btn secondary small" data-refresh-tracking="${row.id}" type="button" style="margin-top: 8px;">查物流</button>` : ""}
                     ${row.shipped_at ? `<div class="muted mini" style="margin-top: 8px;">${escapeHtml(formatDate(row.shipped_at))}</div>` : ""}
                   </td>
                 </tr>
@@ -816,6 +832,31 @@ function bindAdmin() {
   document.getElementById("resetFilters").addEventListener("click", () => {
     state.adminFilters = { store_id: "", status: "", date_from: "", date_to: "", q: "" };
     render();
+  });
+  document.getElementById("syncTracking").addEventListener("click", async () => {
+    try {
+      const data = await api("/api/admin/tracking/sync", {
+        method: "POST",
+        body: JSON.stringify({ limit: 50 }),
+      });
+      const result = data.result || {};
+      toast(`已同步 ${result.checked || 0} 单，签收 ${result.signed || 0} 单。`);
+      render();
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+  document.querySelectorAll("[data-refresh-tracking]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const id = event.currentTarget.dataset.refreshTracking;
+      try {
+        await api(`/api/shipments/${id}/tracking/refresh`, { method: "POST", body: JSON.stringify({}) });
+        toast("物流已刷新。");
+        render();
+      } catch (error) {
+        toast(error.message);
+      }
+    });
   });
   document.querySelectorAll("[data-save-shipment]").forEach((node) => {
     node.addEventListener("click", async (event) => {

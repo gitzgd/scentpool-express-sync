@@ -12,7 +12,7 @@ from xlsx_importer import XlsxImportError, read_products
 
 
 DEFAULT_PRODUCT_FILE = "/Users/zgd/Downloads/万物香铺 商品资料 .xlsx"
-STATUSES = ("待处理", "已发货", "异常", "已取消")
+STATUSES = ("待处理", "已发货", "已签收", "异常", "已取消")
 EXPRESS_COMPANIES = ("圆通", "京东", "顺丰")
 DEFAULT_EXPRESS_COMPANY = "圆通"
 DEFAULT_ADMIN_USERNAME = "admin"
@@ -120,6 +120,14 @@ class Database:
                     status TEXT NOT NULL DEFAULT '待处理',
                     express_company TEXT NOT NULL DEFAULT '',
                     tracking_no TEXT NOT NULL DEFAULT '',
+                    tracking_provider TEXT NOT NULL DEFAULT '',
+                    tracking_status TEXT NOT NULL DEFAULT '',
+                    tracking_state_code TEXT NOT NULL DEFAULT '',
+                    tracking_last_event TEXT NOT NULL DEFAULT '',
+                    tracking_last_checked_at TEXT NOT NULL DEFAULT '',
+                    tracking_signed_at TEXT NOT NULL DEFAULT '',
+                    tracking_error TEXT NOT NULL DEFAULT '',
+                    tracking_raw TEXT NOT NULL DEFAULT '',
                     shipping_note TEXT NOT NULL DEFAULT '',
                     shipped_at TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
@@ -144,6 +152,7 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_shipments_store ON shipments(store_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_shipments_created ON shipments(created_at)")
+            self._ensure_shipment_tracking_columns(conn)
             self._seed_defaults(conn, production=production, admin_password=admin_password)
 
         if self.count_products() == 0 and os.path.exists(product_file):
@@ -194,6 +203,22 @@ class Database:
                     """,
                     (DEFAULT_STORE_USERNAME, hash_password(DEFAULT_STORE_PASSWORD), store_id, now, now),
                 )
+
+    def _ensure_shipment_tracking_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(shipments)").fetchall()}
+        columns = {
+            "tracking_provider": "TEXT NOT NULL DEFAULT ''",
+            "tracking_status": "TEXT NOT NULL DEFAULT ''",
+            "tracking_state_code": "TEXT NOT NULL DEFAULT ''",
+            "tracking_last_event": "TEXT NOT NULL DEFAULT ''",
+            "tracking_last_checked_at": "TEXT NOT NULL DEFAULT ''",
+            "tracking_signed_at": "TEXT NOT NULL DEFAULT ''",
+            "tracking_error": "TEXT NOT NULL DEFAULT ''",
+            "tracking_raw": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE shipments ADD COLUMN {name} {definition}")
 
     def database_summary(self) -> Dict[str, int]:
         with self.connect() as conn:
@@ -563,6 +588,72 @@ class Database:
             )
         return rows
 
+    def tracking_candidates(self, stale_before: str = "", limit: int = 20) -> List[Dict[str, Any]]:
+        where = [
+            "shipments.status = '已发货'",
+            "shipments.tracking_no <> ''",
+            "shipments.tracking_signed_at = ''",
+        ]
+        params: List[Any] = []
+        if stale_before:
+            where.append("(shipments.tracking_last_checked_at = '' OR shipments.tracking_last_checked_at <= ?)")
+            params.append(stale_before)
+        sql = f"""
+            SELECT shipments.*
+            FROM shipments
+            WHERE {' AND '.join(where)}
+            ORDER BY
+                CASE WHEN shipments.tracking_last_checked_at = '' THEN 0 ELSE 1 END,
+                shipments.tracking_last_checked_at,
+                shipments.shipped_at,
+                shipments.id
+            LIMIT ?
+        """
+        params.append(max(1, min(int(limit or 20), 100)))
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    def apply_tracking_result(self, shipment_id: int, result: Dict[str, Any]) -> Dict[str, Any]:
+        checked_at = str(result.get("checked_at") or now_text())
+        signed_at = str(result.get("signed_at") or "")
+        tracking_status = str(result.get("tracking_status") or "")
+        is_signed = bool(result.get("is_signed"))
+        if is_signed and not signed_at:
+            signed_at = checked_at
+        status_update = "已签收" if is_signed else None
+        now = now_text()
+        with self.connect() as conn:
+            existing = conn.execute("SELECT status FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
+            if not existing:
+                raise AppError("发货单不存在。", 404)
+            status = status_update or existing["status"]
+            cursor = conn.execute(
+                """
+                UPDATE shipments
+                SET tracking_provider = ?, tracking_status = ?, tracking_state_code = ?,
+                    tracking_last_event = ?, tracking_last_checked_at = ?,
+                    tracking_signed_at = ?, tracking_error = ?, tracking_raw = ?,
+                    status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(result.get("provider") or ""),
+                    tracking_status,
+                    str(result.get("state_code") or ""),
+                    str(result.get("last_event") or ""),
+                    checked_at,
+                    signed_at,
+                    str(result.get("error") or ""),
+                    str(result.get("raw") or ""),
+                    status,
+                    now,
+                    shipment_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise AppError("发货单不存在。", 404)
+        return {"id": shipment_id, "status": status, "tracking_status": tracking_status}
+
     def update_shipment(self, shipment_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
         status = str(payload.get("status", "")).strip()
         if status not in STATUSES:
@@ -573,21 +664,51 @@ class Database:
         tracking_no = str(payload.get("tracking_no", "")).strip()
         shipping_note = str(payload.get("shipping_note", "")).strip()
         shipped_at = str(payload.get("shipped_at", "")).strip()
-        if status == "已发货" and not shipped_at:
-            shipped_at = now_text()
-        if status != "已发货":
+        now = now_text()
+        with self.connect() as conn:
+            existing = conn.execute("SELECT * FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
+            if not existing:
+                raise AppError("发货单不存在。", 404)
+
+        if status in {"已发货", "已签收"} and not shipped_at:
+            shipped_at = existing["shipped_at"] or now
+        if status not in {"已发货", "已签收"}:
             shipped_at = ""
 
-        now = now_text()
+        tracking_changed = tracking_no != existing["tracking_no"] or express_company != existing["express_company"]
+        tracking_status = existing["tracking_status"]
+        tracking_signed_at = existing["tracking_signed_at"]
+        tracking_error = existing["tracking_error"]
+        if tracking_changed and status == "已发货" and tracking_no:
+            tracking_status = "待查询"
+            tracking_signed_at = ""
+            tracking_error = ""
+        if status == "已签收":
+            tracking_status = "已签收"
+            tracking_signed_at = tracking_signed_at or now
+            tracking_error = ""
+
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 UPDATE shipments
                 SET status = ?, express_company = ?, tracking_no = ?, shipping_note = ?,
-                    shipped_at = ?, updated_at = ?
+                    shipped_at = ?, tracking_status = ?, tracking_signed_at = ?,
+                    tracking_error = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (status, express_company, tracking_no, shipping_note, shipped_at, now, shipment_id),
+                (
+                    status,
+                    express_company,
+                    tracking_no,
+                    shipping_note,
+                    shipped_at,
+                    tracking_status,
+                    tracking_signed_at,
+                    tracking_error,
+                    now,
+                    shipment_id,
+                ),
             )
             if cursor.rowcount == 0:
                 raise AppError("发货单不存在。", 404)
