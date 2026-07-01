@@ -794,6 +794,7 @@ function renderShipmentTable(shipments) {
                   <td>
                     <button class="btn primary small" data-save-shipment="${row.id}" type="button">保存</button>
                     ${row.tracking_no ? `<button class="btn secondary small" data-refresh-tracking="${row.id}" type="button" style="margin-top: 8px;">查物流</button>` : ""}
+                    <button class="btn danger small" data-delete-shipment="${row.id}" data-order-no="${escapeHtml(row.store_order_no)}" type="button" style="margin-top: 8px;">删除</button>
                     ${row.shipped_at ? `<div class="muted mini" style="margin-top: 8px;">${escapeHtml(formatDate(row.shipped_at))}</div>` : ""}
                   </td>
                 </tr>
@@ -871,6 +872,20 @@ function bindAdmin() {
       try {
         await api(`/api/shipments/${id}`, { method: "PATCH", body: JSON.stringify(payload) });
         toast("已保存。");
+        render();
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+  });
+  document.querySelectorAll("[data-delete-shipment]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const id = event.currentTarget.dataset.deleteShipment;
+      const orderNo = event.currentTarget.dataset.orderNo || id;
+      if (!confirm(`确认删除发货记录 ${orderNo}？删除后不可恢复。`)) return;
+      try {
+        await api(`/api/shipments/${id}`, { method: "DELETE" });
+        toast("发货记录已删除。");
         render();
       } catch (error) {
         toast(error.message);

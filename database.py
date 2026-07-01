@@ -714,6 +714,13 @@ class Database:
                 raise AppError("发货单不存在。", 404)
         return {"id": shipment_id}
 
+    def delete_shipment(self, shipment_id: int) -> Dict[str, Any]:
+        with self.connect() as conn:
+            cursor = conn.execute("DELETE FROM shipments WHERE id = ?", (shipment_id,))
+            if cursor.rowcount == 0:
+                raise AppError("发货单不存在。", 404)
+        return {"id": shipment_id, "deleted": True}
+
 
 def re_phone_ok(phone: str) -> bool:
     compact = "".join(ch for ch in phone if ch.isdigit() or ch == "+")

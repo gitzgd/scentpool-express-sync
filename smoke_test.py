@@ -238,6 +238,17 @@ def main() -> None:
             assert "ORDER-SMOKE-001" in sheet_xml
             assert "wrapText" in styles_xml
 
+        status, body = request(staff, base, "DELETE", f"/api/shipments/{shipment_id}")
+        assert status == 403, body
+
+        status, body = request(admin, base, "DELETE", f"/api/shipments/{shipment_id}")
+        assert status == 200, body
+        assert body["shipment"]["deleted"] is True
+
+        status, body = request(admin, base, "GET", "/api/shipments?q=ORDER-SMOKE-001")
+        assert status == 200, body
+        assert len(body["shipments"]) == 0
+
         httpd.shutdown()
         thread.join(timeout=2)
 

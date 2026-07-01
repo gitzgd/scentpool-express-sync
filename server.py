@@ -335,6 +335,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:
         self.route()
 
+    def do_DELETE(self) -> None:
+        self.route()
+
     def do_OPTIONS(self) -> None:
         self.send_response(204)
         self.end_headers()
@@ -491,6 +494,12 @@ class Handler(BaseHTTPRequestHandler):
             shipment_id = int(path.rsplit("/", 1)[-1])
             DB.update_shipment(shipment_id, self.read_json())
             self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
+            return
+
+        if path.startswith("/api/shipments/") and self.command == "DELETE":
+            self.require_admin(user)
+            shipment_id = int(path.rsplit("/", 1)[-1])
+            self.send_json({"shipment": DB.delete_shipment(shipment_id)})
             return
 
         if path == "/api/export/shipments.csv" and self.command == "GET":
