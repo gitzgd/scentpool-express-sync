@@ -5,12 +5,21 @@ const state = {
   productsAll: [],
   shipments: [],
   storeShipments: [],
+  returnOrders: [],
+  storeReturnOrders: [],
   statuses: ["待处理", "已发货", "已签收", "异常", "已取消"],
+  returnStatuses: ["待查询", "运输中", "已签收", "异常", "已取消"],
   submitItems: [{ category: "", barcode: "", quantity: 1 }],
   submitDraft: { store_id: "", recipient_name: "", phone: "", address: "", store_order_no: "", remark: "" },
+  returnItems: [{ category: "", barcode: "", quantity: 1 }],
+  returnDraft: { store_id: "", express_company: "圆通", tracking_no: "", sender_phone: "", remark: "" },
   adminFilters: { store_id: "", status: "待处理", date_from: "", date_to: "", q: "" },
   storeFilters: { status: "", date_from: "", date_to: "", q: "" },
+  adminReturnFilters: { store_id: "", status: "", date_from: "", date_to: "", q: "" },
+  storeReturnFilters: { status: "", date_from: "", date_to: "", q: "" },
   productFilters: { category: "", q: "" },
+  editingShipmentId: null,
+  shipmentEditItems: [],
 };
 
 const EXPRESS_COMPANIES = ["圆通", "京东", "顺丰"];
@@ -27,8 +36,8 @@ function escapeHtml(value) {
 }
 
 function statusClass(status) {
-  if (status === "待处理") return "pending";
-  if (status === "已发货") return "shipped";
+  if (status === "待处理" || status === "待查询") return "pending";
+  if (status === "已发货" || status === "运输中") return "shipped";
   if (status === "已签收") return "signed";
   if (status === "异常") return "exception";
   if (status === "已取消") return "cancelled";
@@ -121,13 +130,18 @@ function shell(content) {
     state.user?.role === "admin"
       ? `
         <a class="${isActive("/admin")}" href="/admin" data-route>发货后台</a>
+        <a class="${isActive("/admin/returns")}" href="/admin/returns" data-route>退货看板</a>
         <a class="${isActive("/admin/stores")}" href="/admin/stores" data-route>门店</a>
         <a class="${isActive("/admin/products")}" href="/admin/products" data-route>商品</a>
       `
       : "";
   const storeLinks =
     state.user?.role === "staff"
-      ? `<a class="${isActive("/shipments")}" href="/shipments" data-route>发货看板</a>`
+      ? `
+        <a class="${isActive("/shipments")}" href="/shipments" data-route>发货看板</a>
+        <a class="${isActive("/returns/new")}" href="/returns/new" data-route>新增退货</a>
+        <a class="${isActive("/returns")}" href="/returns" data-route>退货看板</a>
+      `
       : "";
   const submitLink = `<a class="${isActive("/submit")}" href="/submit" data-route>新建发货</a>`;
   return `
@@ -187,6 +201,21 @@ async function loadStoreShipments() {
   const data = await api(`/api/shipments?${params.toString()}`);
   state.storeShipments = data.shipments || [];
   state.statuses = data.statuses || state.statuses;
+}
+
+async function loadReturnOrders(admin = false) {
+  const filters = admin ? state.adminReturnFilters : state.storeReturnFilters;
+  const params = new URLSearchParams();
+  Object.entries(filters).forEach(([key, value]) => {
+    if (value) params.set(key, value);
+  });
+  const data = await api(`/api/returns?${params.toString()}`);
+  if (admin) {
+    state.returnOrders = data.returns || [];
+  } else {
+    state.storeReturnOrders = data.returns || [];
+  }
+  state.returnStatuses = data.statuses || state.returnStatuses;
 }
 
 async function loadProductsAll() {
@@ -268,9 +297,7 @@ function renderLogin() {
 }
 
 function validSubmitItems() {
-  return state.submitItems
-    .filter((item) => item.barcode && Number(item.quantity) > 0)
-    .map((item) => ({ barcode: item.barcode, quantity: Number(item.quantity) }));
+  return validItems(state.submitItems);
 }
 
 function captureSubmitDraft() {
@@ -293,6 +320,20 @@ function selectedProduct(barcode) {
     if (product) return product;
   }
   return null;
+}
+
+function itemsFromProductSnapshots(items) {
+  return (items || []).map((item) => ({
+    category: item.product_category || "",
+    barcode: item.product_barcode || "",
+    quantity: item.quantity || 1,
+  }));
+}
+
+function validItems(items) {
+  return items
+    .filter((item) => item.barcode && Number(item.quantity) > 0)
+    .map((item) => ({ barcode: item.barcode, quantity: Number(item.quantity) }));
 }
 
 function renderSubmitSummary() {
@@ -544,6 +585,7 @@ function bindSubmit() {
 }
 
 async function renderStoreBoard() {
+  await ensureProductsGrouped();
   await loadStoreShipments();
   const today = localDate();
   const yesterday = localDate(-1);
@@ -636,9 +678,7 @@ function renderStoreBoardTable(shipments) {
                     <span>${escapeHtml(row.address)}</span>
                   </td>
                   <td class="items-cell">
-                    ${row.items
-                      ? renderItemLines(row.items)
-                      : `<span class="muted">无商品</span>`}
+                    ${renderStoreShipmentItems(row)}
                   </td>
                   <td><span class="status ${statusClass(row.status)}">${escapeHtml(row.status)}</span></td>
                   <td>${renderTrackingInfo(row)}</td>
@@ -652,6 +692,50 @@ function renderStoreBoardTable(shipments) {
             .join("")}
         </tbody>
       </table>
+    </div>
+  `;
+}
+
+function renderStoreShipmentItems(row) {
+  if (state.editingShipmentId === row.id && row.status === "待处理") {
+    return renderShipmentItemEditor(row);
+  }
+  return `
+    ${row.items ? renderItemLines(row.items) : `<span class="muted">无商品</span>`}
+    ${
+      row.status === "待处理"
+        ? `<button class="btn secondary small" data-edit-shipment-items="${row.id}" type="button" style="margin-top: 8px;">编辑商品</button>`
+        : ""
+    }
+  `;
+}
+
+function renderShipmentItemEditor(row) {
+  const items = state.shipmentEditItems.length ? state.shipmentEditItems : itemsFromProductSnapshots(row.items);
+  state.shipmentEditItems = items.length ? items : [{ category: "", barcode: "", quantity: 1 }];
+  return `
+    <div class="inline-editor">
+      ${state.shipmentEditItems
+        .map(
+          (item, index) => `
+            <div class="item-row compact" data-edit-item-row="${index}">
+              <select class="select" data-edit-item-category="${index}" aria-label="货品分类">
+                ${categoryOptions(item.category)}
+              </select>
+              <select class="select" data-edit-item-product="${index}" aria-label="货品名称">
+                ${productOptions(item.category, item.barcode)}
+              </select>
+              <input class="input" type="number" min="1" step="1" value="${escapeHtml(item.quantity || 1)}" data-edit-item-quantity="${index}" aria-label="数量" />
+              <button class="btn danger small" type="button" data-remove-edit-item="${index}">删</button>
+            </div>
+          `
+        )
+        .join("")}
+      <div class="inline-actions">
+        <button class="btn secondary small" data-add-edit-item type="button">添加</button>
+        <button class="btn primary small" data-save-edit-items="${row.id}" type="button">保存商品</button>
+        <button class="btn ghost small" data-cancel-edit-items type="button">取消</button>
+      </div>
     </div>
   `;
 }
@@ -681,6 +765,443 @@ function bindStoreBoard() {
   document.getElementById("resetStoreFilters").addEventListener("click", () => {
     state.storeFilters = { status: "", date_from: "", date_to: "", q: "" };
     render();
+  });
+  document.querySelectorAll("[data-edit-shipment-items]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      const id = Number(event.currentTarget.dataset.editShipmentItems);
+      const row = state.storeShipments.find((item) => item.id === id);
+      state.editingShipmentId = id;
+      state.shipmentEditItems = itemsFromProductSnapshots(row?.items || []);
+      render();
+    });
+  });
+  document.querySelectorAll("[data-edit-item-category]").forEach((node) => {
+    node.addEventListener("change", (event) => {
+      const index = Number(event.currentTarget.dataset.editItemCategory);
+      state.shipmentEditItems[index].category = event.currentTarget.value;
+      state.shipmentEditItems[index].barcode = "";
+      render();
+    });
+  });
+  document.querySelectorAll("[data-edit-item-product]").forEach((node) => {
+    node.addEventListener("change", (event) => {
+      const index = Number(event.currentTarget.dataset.editItemProduct);
+      state.shipmentEditItems[index].barcode = event.currentTarget.value;
+      render();
+    });
+  });
+  document.querySelectorAll("[data-edit-item-quantity]").forEach((node) => {
+    node.addEventListener("input", (event) => {
+      const index = Number(event.currentTarget.dataset.editItemQuantity);
+      state.shipmentEditItems[index].quantity = Math.max(1, Number(event.currentTarget.value || 1));
+    });
+  });
+  const addEditItem = document.querySelector("[data-add-edit-item]");
+  if (addEditItem) {
+    addEditItem.addEventListener("click", () => {
+      state.shipmentEditItems.push({ category: "", barcode: "", quantity: 1 });
+      render();
+    });
+  }
+  document.querySelectorAll("[data-remove-edit-item]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      const index = Number(event.currentTarget.dataset.removeEditItem);
+      state.shipmentEditItems.splice(index, 1);
+      if (!state.shipmentEditItems.length) state.shipmentEditItems.push({ category: "", barcode: "", quantity: 1 });
+      render();
+    });
+  });
+  const cancelEditItems = document.querySelector("[data-cancel-edit-items]");
+  if (cancelEditItems) {
+    cancelEditItems.addEventListener("click", () => {
+      state.editingShipmentId = null;
+      state.shipmentEditItems = [];
+      render();
+    });
+  }
+  document.querySelectorAll("[data-save-edit-items]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const id = event.currentTarget.dataset.saveEditItems;
+      try {
+        await api(`/api/shipments/${id}/items`, {
+          method: "PATCH",
+          body: JSON.stringify({ items: validItems(state.shipmentEditItems) }),
+        });
+        state.editingShipmentId = null;
+        state.shipmentEditItems = [];
+        toast("商品明细已更新。");
+        render();
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+  });
+}
+
+function validReturnItems() {
+  return validItems(state.returnItems);
+}
+
+function captureReturnDraft() {
+  const form = document.getElementById("returnForm");
+  if (!form) return;
+  const data = new FormData(form);
+  state.returnDraft = {
+    store_id: data.get("store_id") || "",
+    express_company: data.get("express_company") || DEFAULT_EXPRESS_COMPANY,
+    tracking_no: data.get("tracking_no") || "",
+    sender_phone: data.get("sender_phone") || "",
+    remark: data.get("remark") || "",
+  };
+}
+
+function renderReturnSummary() {
+  const items = validReturnItems();
+  if (!items.length) return `<p class="muted">还没有选择退货商品。</p>`;
+  return `
+    <ul class="summary-list">
+      ${items
+        .map((item) => {
+          const product = selectedProduct(item.barcode);
+          return `
+            <li>
+              <span>
+                <strong>${escapeHtml(product?.name || item.barcode)}</strong><br />
+                <span class="mini">${renderCategoryChip(product?.category || "未分类")} <span class="muted">${escapeHtml(item.barcode)}</span></span>
+              </span>
+              <span class="count-pill">x${item.quantity}</span>
+            </li>
+          `;
+        })
+        .join("")}
+    </ul>
+  `;
+}
+
+async function renderReturnNew() {
+  await ensureProductsGrouped();
+  const itemRows = state.returnItems
+    .map(
+      (item, index) => `
+        <div class="item-row" data-return-item-row="${index}">
+          <select class="select" data-return-item-category="${index}" aria-label="退货商品分类">
+            ${categoryOptions(item.category)}
+          </select>
+          <select class="select" data-return-item-product="${index}" aria-label="退货商品名称">
+            ${productOptions(item.category, item.barcode)}
+          </select>
+          <input class="input" type="number" min="1" step="1" value="${escapeHtml(item.quantity || 1)}" data-return-item-quantity="${index}" aria-label="数量" />
+          <button class="btn danger small" type="button" data-remove-return-item="${index}">删</button>
+        </div>
+      `
+    )
+    .join("");
+  const content = `
+    ${pageHead("新增退货", "门店登记退货快递单号和退货商品，总部可在退货看板查看物流进度。")}
+    <div class="grid-2">
+      <section class="panel panel-pad">
+        <form id="returnForm">
+          <div class="form-grid">
+            <div class="field">
+              <label>门店</label>
+              <span class="store-badge">${escapeHtml(state.user.store_name || "当前门店")}</span>
+            </div>
+            <div class="field">
+              <label for="returnCompany">快递公司</label>
+              <select class="select" id="returnCompany" name="express_company">
+                ${expressCompanyOptions(state.returnDraft.express_company)}
+              </select>
+            </div>
+            <div class="field">
+              <label for="returnTrackingNo">退货快递单号</label>
+              <input class="input" id="returnTrackingNo" name="tracking_no" value="${escapeHtml(state.returnDraft.tracking_no)}" required />
+            </div>
+            <div class="field">
+              <label for="returnSenderPhone">联系电话/顺丰尾号</label>
+              <input class="input" id="returnSenderPhone" name="sender_phone" inputmode="tel" value="${escapeHtml(state.returnDraft.sender_phone)}" />
+            </div>
+            <div class="field full">
+              <label for="returnRemark">备注</label>
+              <textarea class="textarea" id="returnRemark" name="remark">${escapeHtml(state.returnDraft.remark)}</textarea>
+            </div>
+          </div>
+          <div class="section-title" style="margin-top: 22px;">
+            <h2>退货商品</h2>
+            <button class="btn secondary small" id="addReturnItemBtn" type="button">添加</button>
+          </div>
+          <div class="item-stack" id="returnItemsBox">${itemRows}</div>
+          <div class="split-actions">
+            <span class="muted mini">同一门店内退货快递单号不能重复。</span>
+            <button class="btn primary" type="submit">提交退货</button>
+          </div>
+        </form>
+      </section>
+      <aside class="panel panel-pad">
+        <div class="section-title"><h2>退货明细</h2></div>
+        ${renderReturnSummary()}
+      </aside>
+    </div>
+  `;
+  document.getElementById("app").innerHTML = shell(content);
+  bindCommon();
+  bindReturnNew();
+}
+
+function bindReturnNew() {
+  document.querySelectorAll("[data-return-item-category]").forEach((node) => {
+    node.addEventListener("change", (event) => {
+      const index = Number(event.currentTarget.dataset.returnItemCategory);
+      captureReturnDraft();
+      state.returnItems[index].category = event.currentTarget.value;
+      state.returnItems[index].barcode = "";
+      render();
+    });
+  });
+  document.querySelectorAll("[data-return-item-product]").forEach((node) => {
+    node.addEventListener("change", (event) => {
+      const index = Number(event.currentTarget.dataset.returnItemProduct);
+      captureReturnDraft();
+      state.returnItems[index].barcode = event.currentTarget.value;
+      render();
+    });
+  });
+  document.querySelectorAll("[data-return-item-quantity]").forEach((node) => {
+    node.addEventListener("input", (event) => {
+      const index = Number(event.currentTarget.dataset.returnItemQuantity);
+      state.returnItems[index].quantity = Math.max(1, Number(event.currentTarget.value || 1));
+      const aside = document.querySelector("aside.panel");
+      if (aside) {
+        aside.innerHTML = `<div class="section-title"><h2>退货明细</h2></div>${renderReturnSummary()}`;
+      }
+    });
+  });
+  document.querySelectorAll("[data-remove-return-item]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      const index = Number(event.currentTarget.dataset.removeReturnItem);
+      captureReturnDraft();
+      state.returnItems.splice(index, 1);
+      if (!state.returnItems.length) state.returnItems.push({ category: "", barcode: "", quantity: 1 });
+      render();
+    });
+  });
+  document.getElementById("addReturnItemBtn").addEventListener("click", () => {
+    captureReturnDraft();
+    state.returnItems.push({ category: "", barcode: "", quantity: 1 });
+    render();
+  });
+  document.getElementById("returnForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const payload = {
+      express_company: form.get("express_company"),
+      tracking_no: form.get("tracking_no"),
+      sender_phone: form.get("sender_phone"),
+      remark: form.get("remark"),
+      items: validReturnItems(),
+    };
+    try {
+      await api("/api/returns", { method: "POST", body: JSON.stringify(payload) });
+      state.returnItems = [{ category: "", barcode: "", quantity: 1 }];
+      state.returnDraft = { store_id: "", express_company: DEFAULT_EXPRESS_COMPANY, tracking_no: "", sender_phone: "", remark: "" };
+      toast("退货已提交。");
+      navigate("/returns");
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+}
+
+async function renderReturnBoard(admin = false) {
+  if (admin) await loadStores();
+  await loadReturnOrders(admin);
+  const filters = admin ? state.adminReturnFilters : state.storeReturnFilters;
+  const rows = admin ? state.returnOrders : state.storeReturnOrders;
+  const today = localDate();
+  const yesterday = localDate(-1);
+  const todayData = await api(`/api/returns?date_from=${today}&date_to=${today}`).catch(() => ({ returns: [] }));
+  const todayCounts = (todayData.returns || []).reduce(
+    (acc, row) => {
+      acc.total += 1;
+      acc[row.status] = (acc[row.status] || 0) + 1;
+      return acc;
+    },
+    { total: 0 }
+  );
+  const counts = rows.reduce(
+    (acc, row) => {
+      acc.total += 1;
+      acc[row.status] = (acc[row.status] || 0) + 1;
+      return acc;
+    },
+    { total: 0 }
+  );
+  const extra = `
+    <div class="actions">
+      ${admin ? `<button class="btn secondary" id="syncReturnTracking" type="button">同步退货物流</button>` : `<a class="btn primary" href="/returns/new" data-route>新增退货</a>`}
+      <span class="count-pill">今日 ${todayCounts.total} 单</span>
+      <span class="count-pill">今日签收 ${todayCounts["已签收"] || 0}</span>
+      <span class="count-pill">共 ${counts.total} 单</span>
+      <span class="count-pill">运输中 ${counts["运输中"] || 0}</span>
+      <span class="count-pill">已签收 ${counts["已签收"] || 0}</span>
+    </div>
+  `;
+  const storeFilter = admin
+    ? `
+      <div class="field">
+        <label>门店</label>
+        <select class="select" id="returnFilterStore">
+          <option value="">全部</option>
+          ${state.stores
+            .map((store) => `<option value="${store.id}" ${String(store.id) === String(filters.store_id) ? "selected" : ""}>${escapeHtml(store.name)}</option>`)
+            .join("")}
+        </select>
+      </div>
+    `
+    : "";
+  const content = `
+    ${pageHead(admin ? "退货看板" : "退货看板", admin ? "总部查看所有门店退货和签收进度。" : "查看本门店退货快递进度。", extra)}
+    <section class="panel panel-pad">
+      <div class="filters ${admin ? "admin-return-filters" : "store-return-filters"}">
+        <div class="quick-filters">
+          <button class="btn secondary small ${filters.date_from === today && filters.date_to === today ? "active" : ""}" data-return-preset="today" type="button">今日</button>
+          <button class="btn secondary small ${filters.date_from === yesterday && filters.date_to === yesterday ? "active" : ""}" data-return-preset="yesterday" type="button">昨日</button>
+        </div>
+        ${storeFilter}
+        <div class="field">
+          <label>状态</label>
+          <select class="select" id="returnFilterStatus">
+            <option value="">全部</option>
+            ${state.returnStatuses.map((status) => `<option value="${status}" ${status === filters.status ? "selected" : ""}>${status}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label>开始日期</label>
+          <input class="input" type="date" id="returnFilterFrom" value="${escapeHtml(filters.date_from)}" />
+        </div>
+        <div class="field">
+          <label>结束日期</label>
+          <input class="input" type="date" id="returnFilterTo" value="${escapeHtml(filters.date_to)}" />
+        </div>
+        <div class="field">
+          <label>搜索</label>
+          <input class="input" id="returnFilterQ" value="${escapeHtml(filters.q)}" placeholder="快递单号 / 电话 / 备注" />
+        </div>
+        <button class="btn primary" id="applyReturnFilters" type="button">筛选</button>
+        <button class="btn secondary" id="resetReturnFilters" type="button">清空</button>
+      </div>
+      ${renderReturnTable(rows, admin)}
+    </section>
+  `;
+  document.getElementById("app").innerHTML = shell(content);
+  bindCommon();
+  bindReturnBoard(admin);
+}
+
+function renderReturnTable(rows, admin = false) {
+  if (!rows.length) return `<div class="empty">没有符合条件的退货单</div>`;
+  return `
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th><th>提交时间</th>${admin ? "<th>门店</th>" : ""}<th>快递</th><th>退货商品</th><th>状态</th><th>备注</th>${admin ? "<th>操作</th>" : ""}
+          </tr>
+        </thead>
+        <tbody>
+          ${rows
+            .map(
+              (row) => `
+                <tr class="shipment-row ${statusClass(row.status)}">
+                  <td>${row.id}</td>
+                  <td>${escapeHtml(formatDate(row.created_at))}</td>
+                  ${admin ? `<td>${escapeHtml(row.store_name_snapshot)}</td>` : ""}
+                  <td>${renderReturnTrackingInfo(row)}</td>
+                  <td class="items-cell">${renderItemLines(row.items)}</td>
+                  <td><span class="status ${statusClass(row.status)}">${escapeHtml(row.status)}</span></td>
+                  <td>
+                    ${row.sender_phone ? `<div class="muted mini">电话：${escapeHtml(row.sender_phone)}</div>` : ""}
+                    ${row.remark ? `<div>${escapeHtml(row.remark)}</div>` : `<span class="muted">无</span>`}
+                  </td>
+                  ${admin ? `<td>${row.status !== "已签收" ? `<button class="btn secondary small" data-refresh-return="${row.id}" type="button">查物流</button>` : `<span class="muted mini">已签收</span>`}</td>` : ""}
+                </tr>
+              `
+            )
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderReturnTrackingInfo(row) {
+  return `
+    <strong>${escapeHtml(row.express_company || DEFAULT_EXPRESS_COMPANY)}</strong><br />
+    <span>${escapeHtml(row.tracking_no)}</span>
+    ${row.tracking_status ? `<div style="margin-top: 7px;"><span class="status ${trackingClass(row.tracking_status)}">${escapeHtml(row.tracking_status)}</span></div>` : `<div class="muted mini" style="margin-top: 7px;">物流待查询</div>`}
+    ${row.tracking_last_event ? `<div class="muted mini tracking-event">${escapeHtml(row.tracking_last_event)}</div>` : ""}
+    ${row.tracking_last_checked_at ? `<div class="muted mini">查询：${escapeHtml(formatDate(row.tracking_last_checked_at))}</div>` : ""}
+    ${row.tracking_signed_at ? `<div class="muted mini">签收：${escapeHtml(formatDate(row.tracking_signed_at))}</div>` : ""}
+    ${row.tracking_error ? `<div class="muted mini">错误：${escapeHtml(row.tracking_error)}</div>` : ""}
+  `;
+}
+
+function bindReturnBoard(admin = false) {
+  const filters = admin ? state.adminReturnFilters : state.storeReturnFilters;
+  document.querySelectorAll("[data-return-preset]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      const preset = event.currentTarget.dataset.returnPreset;
+      const targetDate = preset === "yesterday" ? localDate(-1) : localDate();
+      const next = { ...filters, date_from: targetDate, date_to: targetDate };
+      if (admin) state.adminReturnFilters = next;
+      else state.storeReturnFilters = next;
+      render();
+    });
+  });
+  document.getElementById("applyReturnFilters").addEventListener("click", () => {
+    const next = {
+      store_id: admin ? document.getElementById("returnFilterStore").value : "",
+      status: document.getElementById("returnFilterStatus").value,
+      date_from: document.getElementById("returnFilterFrom").value,
+      date_to: document.getElementById("returnFilterTo").value,
+      q: document.getElementById("returnFilterQ").value.trim(),
+    };
+    if (admin) state.adminReturnFilters = next;
+    else state.storeReturnFilters = next;
+    render();
+  });
+  document.getElementById("resetReturnFilters").addEventListener("click", () => {
+    const empty = { store_id: "", status: "", date_from: "", date_to: "", q: "" };
+    if (admin) state.adminReturnFilters = empty;
+    else state.storeReturnFilters = empty;
+    render();
+  });
+  const syncReturnTracking = document.getElementById("syncReturnTracking");
+  if (syncReturnTracking) {
+    syncReturnTracking.addEventListener("click", async () => {
+      try {
+        const data = await api("/api/admin/return-tracking/sync", {
+          method: "POST",
+          body: JSON.stringify({ limit: 50 }),
+        });
+        const result = data.result || {};
+        toast(`已同步 ${result.checked || 0} 单，签收 ${result.signed || 0} 单。`);
+        render();
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+  }
+  document.querySelectorAll("[data-refresh-return]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const id = event.currentTarget.dataset.refreshReturn;
+      try {
+        await api(`/api/returns/${id}/tracking/refresh`, { method: "POST", body: JSON.stringify({}) });
+        toast("退货物流已刷新。");
+        render();
+      } catch (error) {
+        toast(error.message);
+      }
+    });
   });
 }
 
@@ -1136,8 +1657,14 @@ async function render() {
       await renderSubmit();
     } else if (location.pathname === "/shipments" && state.user.role === "staff") {
       await renderStoreBoard();
+    } else if (location.pathname === "/returns/new" && state.user.role === "staff") {
+      await renderReturnNew();
+    } else if (location.pathname === "/returns" && state.user.role === "staff") {
+      await renderReturnBoard(false);
     } else if (location.pathname === "/admin" && state.user.role === "admin") {
       await renderAdmin();
+    } else if (location.pathname === "/admin/returns" && state.user.role === "admin") {
+      await renderReturnBoard(true);
     } else if (location.pathname === "/admin/stores" && state.user.role === "admin") {
       await renderStores();
     } else if (location.pathname === "/admin/products" && state.user.role === "admin") {

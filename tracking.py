@@ -92,7 +92,7 @@ class KdniaoClient:
             "LogisticCode": tracking_no,
         }
         if shipper_code == "SF":
-            phone_tail = phone_last_four(str(shipment.get("phone") or ""))
+            phone_tail = phone_last_four(str(shipment.get("phone") or shipment.get("sender_phone") or ""))
             if phone_tail:
                 request_data["CustomerName"] = phone_tail
 

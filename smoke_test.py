@@ -149,6 +149,18 @@ def main() -> None:
         shipment_id = body["shipment"]["id"]
         assert body["shipment"]["items"][0]["quantity"] == 2
 
+        status, body = request(
+            staff,
+            base,
+            "PATCH",
+            f"/api/shipments/{shipment_id}/items",
+            {"items": [{"barcode": product["barcode"], "quantity": 1}, {"barcode": product_2["barcode"], "quantity": 3}]},
+        )
+        assert status == 200, body
+        assert len(body["shipment"]["items"]) == 2
+        assert body["shipment"]["items"][1]["product_barcode"] == product_2["barcode"]
+        assert body["shipment"]["items"][1]["quantity"] == 3
+
         status, body = request(staff, base, "POST", "/api/shipments", shipment_payload)
         assert status == 409, body
 
@@ -172,6 +184,15 @@ def main() -> None:
         assert body["shipment"]["status"] == "已发货"
         assert body["shipment"]["tracking_no"] == "SF123456"
         assert body["shipment"]["express_company"] == "顺丰"
+
+        status, body = request(
+            staff,
+            base,
+            "PATCH",
+            f"/api/shipments/{shipment_id}/items",
+            {"items": [{"barcode": product["barcode"], "quantity": 1}]},
+        )
+        assert status == 409, body
 
         status, body = request(staff, base, "GET", "/api/shipments?q=ORDER-SMOKE-001")
         assert status == 200, body
@@ -200,6 +221,41 @@ def main() -> None:
         assert body["shipment"]["status"] == "已签收"
         assert body["shipment"]["tracking_status"] == "已签收"
         assert body["shipment"]["tracking_signed_at"]
+
+        status, body = request(staff, base, "GET", "/returns/new")
+        assert status == 200
+        status, body = request(staff, base, "GET", "/returns")
+        assert status == 200
+
+        return_payload = {
+            "express_company": "圆通",
+            "tracking_no": "YT-SMOKE-001",
+            "sender_phone": "13800138000",
+            "remark": "退货烟测",
+            "items": [{"barcode": product["barcode"], "quantity": 1}],
+        }
+        status, body = request(staff, base, "POST", "/api/returns", return_payload)
+        assert status == 201, body
+        return_id = body["return_order"]["id"]
+        assert body["return_order"]["status"] == "待查询"
+        assert body["return_order"]["items"][0]["product_barcode"] == product["barcode"]
+
+        status, body = request(staff, base, "POST", "/api/returns", return_payload)
+        assert status == 409, body
+
+        status, body = request(staff, base, "GET", "/api/returns?q=YT-SMOKE-001")
+        assert status == 200, body
+        assert len(body["returns"]) == 1
+        assert body["returns"][0]["tracking_no"] == "YT-SMOKE-001"
+
+        status, body = request(admin, base, "GET", "/api/returns?q=YT-SMOKE-001")
+        assert status == 200, body
+        assert len(body["returns"]) == 1
+
+        status, body = request(admin, base, "POST", f"/api/returns/{return_id}/tracking/refresh", {})
+        assert status == 200, body
+        assert body["return_order"]["status"] == "已签收"
+        assert body["return_order"]["tracking_status"] == "已签收"
 
         status, body = request(
             staff,

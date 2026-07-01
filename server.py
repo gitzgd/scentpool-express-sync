@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, quote, urlparse
 from xml.sax.saxutils import escape as xml_escape
 
-from database import AppError, Database, DEFAULT_PRODUCT_FILE, STATUSES
+from database import AppError, Database, DEFAULT_PRODUCT_FILE, RETURN_STATUSES, STATUSES
 from tracking import query_tracking, tracking_auto_enabled, tracking_config_public, tracking_interval_minutes, tracking_stale_before
 
 
@@ -237,6 +237,21 @@ def env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def return_tracking_interval_minutes() -> int:
+    raw = os.environ.get("SCENTPOOL_RETURN_TRACKING_INTERVAL_MINUTES", "720").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 720
+    return max(60, value)
+
+
+def return_tracking_stale_before() -> str:
+    from datetime import timedelta
+
+    return (datetime.now().astimezone() - timedelta(minutes=return_tracking_interval_minutes())).isoformat(timespec="seconds")
+
+
 def save_database_backup() -> Path:
     backup_dir = Path(DB.path).parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -270,6 +285,11 @@ def restore_database(payload: bytes) -> None:
         validate_database_file(temp_path)
         save_database_backup()
         os.replace(temp_path, db_path)
+        DB.initialize(
+            PRODUCT_FILE_PATH,
+            production=os.environ.get("SCENTPOOL_ENV", "").strip().lower() == "production",
+            admin_password=os.environ.get("SCENTPOOL_ADMIN_PASSWORD", ""),
+        )
     except Exception:
         temp_path.unlink(missing_ok=True)
         raise
@@ -293,6 +313,24 @@ def refresh_tracking_for_shipment(shipment: Dict[str, Any]) -> Dict[str, Any]:
     return DB.apply_tracking_result(int(shipment["id"]), result)
 
 
+def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        result = query_tracking(return_order)
+    except AppError as exc:
+        result = {
+            "provider": "kdniao",
+            "tracking_status": "查询失败",
+            "state_code": "",
+            "last_event": return_order.get("tracking_last_event") or "",
+            "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "signed_at": "",
+            "error": exc.message,
+            "raw": "",
+            "is_signed": False,
+        }
+    return DB.apply_return_tracking_result(int(return_order["id"]), result)
+
+
 def sync_tracking_batch(*, force: bool = False, limit: int = 20) -> Dict[str, Any]:
     candidates = DB.tracking_candidates(stale_before="" if force else tracking_stale_before(), limit=limit)
     results = []
@@ -306,14 +344,28 @@ def sync_tracking_batch(*, force: bool = False, limit: int = 20) -> Dict[str, An
     return {"checked": len(results), "signed": signed, "errors": errors, "results": results}
 
 
+def sync_return_tracking_batch(*, force: bool = False, limit: int = 20) -> Dict[str, Any]:
+    candidates = DB.return_tracking_candidates(stale_before="" if force else return_tracking_stale_before(), limit=limit)
+    results = []
+    signed = 0
+    errors = 0
+    for return_order in candidates:
+        result = refresh_tracking_for_return(return_order)
+        signed += 1 if result.get("status") == "已签收" else 0
+        errors += 1 if result.get("tracking_status") == "查询失败" else 0
+        results.append(result)
+    return {"checked": len(results), "signed": signed, "errors": errors, "results": results}
+
+
 def tracking_worker() -> None:
     time.sleep(60)
     while True:
         try:
             sync_tracking_batch(force=False, limit=50)
+            sync_return_tracking_batch(force=False, limit=50)
         except Exception as exc:
             print(f"[tracking] 自动同步失败：{exc}")
-        time.sleep(max(1800, tracking_interval_minutes() * 60))
+        time.sleep(1800)
 
 
 def start_tracking_worker() -> None:
@@ -354,7 +406,7 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/static/"):
                 self.serve_static(path)
                 return
-            if path in {"/", "/login", "/submit", "/shipments", "/admin", "/admin/stores", "/admin/products"}:
+            if path in {"/", "/login", "/submit", "/shipments", "/returns/new", "/returns", "/admin", "/admin/returns", "/admin/stores", "/admin/products"}:
                 self.serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
                 return
             self.error_json("页面不存在。", 404)
@@ -462,13 +514,22 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/admin/tracking/config" and self.command == "GET":
             self.require_admin(user)
-            self.send_json({"tracking": tracking_config_public()})
+            config = tracking_config_public()
+            config["return_interval_minutes"] = return_tracking_interval_minutes()
+            self.send_json({"tracking": config})
             return
 
         if path == "/api/admin/tracking/sync" and self.command == "POST":
             self.require_admin(user)
             body = self.read_json()
             result = sync_tracking_batch(force=bool(body.get("force")), limit=int(body.get("limit") or 20))
+            self.send_json({"result": result})
+            return
+
+        if path == "/api/admin/return-tracking/sync" and self.command == "POST":
+            self.require_admin(user)
+            body = self.read_json()
+            result = sync_return_tracking_batch(force=bool(body.get("force")), limit=int(body.get("limit") or 20))
             self.send_json({"result": result})
             return
 
@@ -489,6 +550,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
             return
 
+        if path.startswith("/api/shipments/") and path.endswith("/items") and self.command == "PATCH":
+            shipment_id = int(path.split("/")[3])
+            shipment = DB.update_shipment_items(shipment_id, user, self.read_json())
+            self.send_json({"shipment": shipment})
+            return
+
         if path.startswith("/api/shipments/") and self.command == "PATCH":
             self.require_admin(user)
             shipment_id = int(path.rsplit("/", 1)[-1])
@@ -500,6 +567,22 @@ class Handler(BaseHTTPRequestHandler):
             self.require_admin(user)
             shipment_id = int(path.rsplit("/", 1)[-1])
             self.send_json({"shipment": DB.delete_shipment(shipment_id)})
+            return
+
+        if path == "/api/returns" and self.command == "POST":
+            return_order = DB.create_return_order(user, self.read_json())
+            self.send_json({"return_order": return_order}, status=201)
+            return
+
+        if path == "/api/returns" and self.command == "GET":
+            self.send_json({"returns": DB.list_return_orders(user, query), "statuses": RETURN_STATUSES})
+            return
+
+        if path.startswith("/api/returns/") and path.endswith("/tracking/refresh") and self.command == "POST":
+            return_id = int(path.split("/")[3])
+            return_order = DB.get_return_order(return_id, user)
+            refresh_tracking_for_return(return_order)
+            self.send_json({"return_order": DB.get_return_order(return_id, user)})
             return
 
         if path == "/api/export/shipments.csv" and self.command == "GET":
@@ -585,6 +668,7 @@ class Handler(BaseHTTPRequestHandler):
                     "database": True,
                     "products": summary["products"],
                     "shipments": summary["shipments"],
+                    "returns": summary["returns"],
                     "time": datetime.now().astimezone().isoformat(timespec="seconds"),
                 }
             )

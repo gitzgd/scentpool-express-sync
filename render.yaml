@@ -26,6 +26,8 @@ services:
         value: "1"
       - key: SCENTPOOL_TRACKING_INTERVAL_MINUTES
         value: "1440"
+      - key: SCENTPOOL_RETURN_TRACKING_INTERVAL_MINUTES
+        value: "720"
       - key: SCENTPOOL_KDNIAO_EBUSINESS_ID
         sync: false
       - key: SCENTPOOL_KDNIAO_APP_KEY
