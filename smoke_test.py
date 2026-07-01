@@ -172,6 +172,17 @@ def main() -> None:
             admin,
             base,
             "PATCH",
+            f"/api/shipments/{shipment_id}/items",
+            {"items": [{"barcode": product["barcode"], "quantity": 2}, {"barcode": product_2["barcode"], "quantity": 1}]},
+        )
+        assert status == 200, body
+        assert len(body["shipment"]["items"]) == 2
+        assert body["shipment"]["items"][0]["quantity"] == 2
+
+        status, body = request(
+            admin,
+            base,
+            "PATCH",
             f"/api/shipments/{shipment_id}",
             {
                 "status": "已发货",

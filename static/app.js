@@ -676,19 +676,20 @@ function renderStoreBoardTable(shipments) {
                     <strong>${escapeHtml(row.recipient_name)}</strong><br />
                     <span class="muted">${escapeHtml(row.phone)}</span><br />
                     <span>${escapeHtml(row.address)}</span>
-                  </td>
-                  <td class="items-cell">
-                    ${renderStoreShipmentItems(row)}
-                  </td>
-                  <td><span class="status ${statusClass(row.status)}">${escapeHtml(row.status)}</span></td>
-                  <td>${renderTrackingInfo(row)}</td>
+	                  </td>
+	                  <td class="items-cell">
+	                    ${renderShipmentItemsWithEditButton(row)}
+	                  </td>
+	                  <td><span class="status ${statusClass(row.status)}">${escapeHtml(row.status)}</span></td>
+	                  <td>${renderTrackingInfo(row)}</td>
                   <td>
                     ${row.remark ? `<div>${escapeHtml(row.remark)}</div>` : `<span class="muted">无</span>`}
                     ${row.shipping_note ? `<div class="muted mini">总部：${escapeHtml(row.shipping_note)}</div>` : ""}
-                  </td>
-                </tr>
-              `
-            )
+	                  </td>
+	                </tr>
+	                ${renderShipmentEditRow(row, 7)}
+	              `
+	            )
             .join("")}
         </tbody>
       </table>
@@ -696,10 +697,7 @@ function renderStoreBoardTable(shipments) {
   `;
 }
 
-function renderStoreShipmentItems(row) {
-  if (state.editingShipmentId === row.id && row.status === "待处理") {
-    return renderShipmentItemEditor(row);
-  }
+function renderShipmentItemsWithEditButton(row) {
   return `
     ${row.items ? renderItemLines(row.items) : `<span class="muted">无商品</span>`}
     ${
@@ -710,22 +708,49 @@ function renderStoreShipmentItems(row) {
   `;
 }
 
+function renderShipmentEditRow(row, colspan) {
+  if (state.editingShipmentId !== row.id || row.status !== "待处理") return "";
+  return `
+    <tr class="shipment-edit-row">
+      <td colspan="${colspan}">
+        ${renderShipmentItemEditor(row)}
+      </td>
+    </tr>
+  `;
+}
+
 function renderShipmentItemEditor(row) {
   const items = state.shipmentEditItems.length ? state.shipmentEditItems : itemsFromProductSnapshots(row.items);
   state.shipmentEditItems = items.length ? items : [{ category: "", barcode: "", quantity: 1 }];
   return `
-    <div class="inline-editor">
+    <div class="shipment-item-editor">
+      <div class="editor-head">
+        <div>
+          <strong>编辑商品明细</strong>
+          <div class="muted mini">${escapeHtml(row.store_order_no || `#${row.id}`)}</div>
+        </div>
+        <span class="status pending">待处理</span>
+      </div>
       ${state.shipmentEditItems
         .map(
           (item, index) => `
-            <div class="item-row compact" data-edit-item-row="${index}">
-              <select class="select" data-edit-item-category="${index}" aria-label="货品分类">
-                ${categoryOptions(item.category)}
-              </select>
-              <select class="select" data-edit-item-product="${index}" aria-label="货品名称">
-                ${productOptions(item.category, item.barcode)}
-              </select>
-              <input class="input" type="number" min="1" step="1" value="${escapeHtml(item.quantity || 1)}" data-edit-item-quantity="${index}" aria-label="数量" />
+            <div class="edit-product-row" data-edit-item-row="${index}">
+              <div class="field">
+                <label>分类</label>
+                <select class="select" data-edit-item-category="${index}" aria-label="货品分类">
+                  ${categoryOptions(item.category)}
+                </select>
+              </div>
+              <div class="field">
+                <label>商品</label>
+                <select class="select" data-edit-item-product="${index}" aria-label="货品名称">
+                  ${productOptions(item.category, item.barcode)}
+                </select>
+              </div>
+              <div class="field">
+                <label>数量</label>
+                <input class="input" type="number" min="1" step="1" value="${escapeHtml(item.quantity || 1)}" data-edit-item-quantity="${index}" aria-label="数量" />
+              </div>
               <button class="btn danger small" type="button" data-remove-edit-item="${index}">删</button>
             </div>
           `
@@ -740,36 +765,11 @@ function renderShipmentItemEditor(row) {
   `;
 }
 
-function bindStoreBoard() {
-  document.querySelectorAll("[data-store-preset]").forEach((node) => {
-    node.addEventListener("click", (event) => {
-      const preset = event.currentTarget.dataset.storePreset;
-      const targetDate = preset === "yesterday" ? localDate(-1) : localDate();
-      state.storeFilters = {
-        ...state.storeFilters,
-        date_from: targetDate,
-        date_to: targetDate,
-      };
-      render();
-    });
-  });
-  document.getElementById("applyStoreFilters").addEventListener("click", () => {
-    state.storeFilters = {
-      status: document.getElementById("storeFilterStatus").value,
-      date_from: document.getElementById("storeFilterFrom").value,
-      date_to: document.getElementById("storeFilterTo").value,
-      q: document.getElementById("storeFilterQ").value.trim(),
-    };
-    render();
-  });
-  document.getElementById("resetStoreFilters").addEventListener("click", () => {
-    state.storeFilters = { status: "", date_from: "", date_to: "", q: "" };
-    render();
-  });
+function bindShipmentItemEditor(sourceRows) {
   document.querySelectorAll("[data-edit-shipment-items]").forEach((node) => {
     node.addEventListener("click", (event) => {
       const id = Number(event.currentTarget.dataset.editShipmentItems);
-      const row = state.storeShipments.find((item) => item.id === id);
+      const row = sourceRows.find((item) => item.id === id);
       state.editingShipmentId = id;
       state.shipmentEditItems = itemsFromProductSnapshots(row?.items || []);
       render();
@@ -836,6 +836,35 @@ function bindStoreBoard() {
       }
     });
   });
+}
+
+function bindStoreBoard() {
+  document.querySelectorAll("[data-store-preset]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      const preset = event.currentTarget.dataset.storePreset;
+      const targetDate = preset === "yesterday" ? localDate(-1) : localDate();
+      state.storeFilters = {
+        ...state.storeFilters,
+        date_from: targetDate,
+        date_to: targetDate,
+      };
+      render();
+    });
+  });
+  document.getElementById("applyStoreFilters").addEventListener("click", () => {
+    state.storeFilters = {
+      status: document.getElementById("storeFilterStatus").value,
+      date_from: document.getElementById("storeFilterFrom").value,
+      date_to: document.getElementById("storeFilterTo").value,
+      q: document.getElementById("storeFilterQ").value.trim(),
+    };
+    render();
+  });
+  document.getElementById("resetStoreFilters").addEventListener("click", () => {
+    state.storeFilters = { status: "", date_from: "", date_to: "", q: "" };
+    render();
+  });
+  bindShipmentItemEditor(state.storeShipments);
 }
 
 function validReturnItems() {
@@ -1206,6 +1235,7 @@ function bindReturnBoard(admin = false) {
 }
 
 async function renderAdmin() {
+  await ensureProductsGrouped();
   await loadStores();
   await loadShipments();
   const today = localDate();
@@ -1296,10 +1326,10 @@ function renderShipmentTable(shipments) {
                     <strong>${escapeHtml(row.recipient_name)}</strong><br />
                     <span class="muted">${escapeHtml(row.phone)}</span><br />
                     <span>${escapeHtml(row.address)}</span>
-                  </td>
-                  <td class="items-cell">
-                    ${renderItemLines(row.items)}
-                  </td>
+	                  </td>
+	                  <td class="items-cell">
+	                    ${renderShipmentItemsWithEditButton(row)}
+	                  </td>
                   <td>
                     <select class="table-input" data-status>
                       ${state.statuses.map((status) => `<option value="${status}" ${status === row.status ? "selected" : ""}>${status}</option>`).join("")}
@@ -1316,11 +1346,12 @@ function renderShipmentTable(shipments) {
                     <button class="btn primary small" data-save-shipment="${row.id}" type="button">保存</button>
                     ${row.tracking_no ? `<button class="btn secondary small" data-refresh-tracking="${row.id}" type="button" style="margin-top: 8px;">查物流</button>` : ""}
                     <button class="btn danger small" data-delete-shipment="${row.id}" data-order-no="${escapeHtml(row.store_order_no)}" type="button" style="margin-top: 8px;">删除</button>
-                    ${row.shipped_at ? `<div class="muted mini" style="margin-top: 8px;">${escapeHtml(formatDate(row.shipped_at))}</div>` : ""}
-                  </td>
-                </tr>
-              `
-            )
+	                    ${row.shipped_at ? `<div class="muted mini" style="margin-top: 8px;">${escapeHtml(formatDate(row.shipped_at))}</div>` : ""}
+	                  </td>
+	                </tr>
+	                ${renderShipmentEditRow(row, 9)}
+	              `
+	            )
             .join("")}
         </tbody>
       </table>
@@ -1413,6 +1444,7 @@ function bindAdmin() {
       }
     });
   });
+  bindShipmentItemEditor(state.shipments);
 }
 
 async function renderStores() {
