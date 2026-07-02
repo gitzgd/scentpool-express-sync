@@ -13,8 +13,8 @@ from typing import Any, Dict, Iterable, List
 from database import AppError, now_text
 
 
-KDNIAO_ENDPOINT = "https://api.kdniao.com/Ebusiness/EbusinessOrderHandle.aspx"
-KDNIAO_REQUEST_TYPE_TRACK = "1002"
+KDNIAO_ENDPOINT = "https://api.kdniao.com/api/dist"
+KDNIAO_REQUEST_TYPE_TRACK = "8002"
 SIGNED_STATE = "3"
 PROBLEM_STATE = "4"
 EXPRESS_COMPANY_CODES = {
@@ -47,6 +47,10 @@ def tracking_auto_enabled() -> bool:
 
 def configured_provider() -> str:
     return os.environ.get("SCENTPOOL_TRACKING_PROVIDER", "kdniao").strip().lower() or "kdniao"
+
+
+def kdniao_request_type() -> str:
+    return os.environ.get("SCENTPOOL_KDNIAO_REQUEST_TYPE", KDNIAO_REQUEST_TYPE_TRACK).strip() or KDNIAO_REQUEST_TYPE_TRACK
 
 
 def mask_secret(value: str) -> str:
@@ -87,8 +91,6 @@ class KdniaoClient:
             raise AppError("快递单号为空。")
 
         request_data: Dict[str, Any] = {
-            "OrderCode": "",
-            "ShipperCode": shipper_code,
             "LogisticCode": tracking_no,
         }
         if shipper_code == "SF":
@@ -101,7 +103,7 @@ class KdniaoClient:
             {
                 "RequestData": request_json,
                 "EBusinessID": self.business_id,
-                "RequestType": KDNIAO_REQUEST_TYPE_TRACK,
+                "RequestType": kdniao_request_type(),
                 "DataSign": self.data_sign(request_json),
                 "DataType": "2",
             }
@@ -149,7 +151,7 @@ def normalize_kdniao_response(data: Dict[str, Any], raw: str) -> Dict[str, Any]:
     tracking_status = state_label(state, last_event)
     signed_at = ""
     if state == SIGNED_STATE:
-        signed_at = str(last_trace.get("AcceptTime") or checked_at) if last_trace else checked_at
+        signed_at = str(trace_value(last_trace, "AcceptTime") or checked_at) if last_trace else checked_at
     return {
         "provider": "kdniao",
         "tracking_status": tracking_status,
@@ -187,9 +189,13 @@ def latest_trace(traces: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
 def trace_text(trace: Dict[str, Any]) -> str:
     if not trace:
         return ""
-    time_text = str(trace.get("AcceptTime") or "").strip()
-    station = str(trace.get("AcceptStation") or "").strip()
+    time_text = str(trace_value(trace, "AcceptTime") or "").strip()
+    station = str(trace_value(trace, "AcceptStation") or "").strip()
     return " ".join(part for part in [time_text, station] if part)
+
+
+def trace_value(trace: Dict[str, Any], key: str) -> Any:
+    return trace.get(key) or trace.get(key[:1].lower() + key[1:]) or trace.get(key.lower())
 
 
 def state_label(state: str, last_event: str) -> str:
@@ -225,6 +231,8 @@ def tracking_config_public() -> Dict[str, Any]:
         "provider": configured_provider(),
         "configured": client.is_configured(),
         "business_id": mask_secret(client.business_id),
+        "endpoint": client.endpoint,
+        "request_type": kdniao_request_type(),
         "auto": tracking_auto_enabled(),
         "interval_minutes": tracking_interval_minutes(),
     }

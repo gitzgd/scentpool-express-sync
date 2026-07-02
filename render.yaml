@@ -28,6 +28,10 @@ services:
         value: "1440"
       - key: SCENTPOOL_RETURN_TRACKING_INTERVAL_MINUTES
         value: "720"
+      - key: SCENTPOOL_KDNIAO_ENDPOINT
+        value: https://api.kdniao.com/api/dist
+      - key: SCENTPOOL_KDNIAO_REQUEST_TYPE
+        value: "8002"
       - key: SCENTPOOL_KDNIAO_EBUSINESS_ID
         sync: false
       - key: SCENTPOOL_KDNIAO_APP_KEY

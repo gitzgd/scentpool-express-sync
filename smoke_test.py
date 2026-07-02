@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from http.cookiejar import CookieJar
@@ -15,6 +16,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import server
+import tracking
 from database import AppError, DEFAULT_PRODUCT_FILE, Database
 
 
@@ -79,6 +81,38 @@ def request_multipart(opener, base, method, path, field_name, file_path):
 
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
+        assert tracking.KDNIAO_ENDPOINT == "https://api.kdniao.com/api/dist"
+        assert tracking.KDNIAO_REQUEST_TYPE_TRACK == "8002"
+        original_urlopen = tracking.urllib.request.urlopen
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"Success":true,"State":"0","Traces":[]}'
+
+        def fake_urlopen(request, timeout=0):
+            captured["url"] = request.full_url
+            captured["payload"] = request.data.decode("utf-8")
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        try:
+            tracking.urllib.request.urlopen = fake_urlopen
+            tracking.KdniaoClient("test-id", "test-key").query({"express_company": "圆通", "tracking_no": "YT123456"})
+        finally:
+            tracking.urllib.request.urlopen = original_urlopen
+        params = urllib.parse.parse_qs(captured["payload"])
+        request_data = json.loads(params["RequestData"][0])
+        assert captured["url"] == "https://api.kdniao.com/api/dist"
+        assert params["RequestType"][0] == "8002"
+        assert request_data == {"LogisticCode": "YT123456"}
+
         db_path = str(Path(tmp) / "test.db")
         server.DB = Database(db_path)
         server.PRODUCT_FILE_PATH = str(Path(tmp) / "products.xlsx")

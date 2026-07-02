@@ -32,6 +32,8 @@ python3 server.py --host 0.0.0.0 --port 8765
 - `SCENTPOOL_TRACKING_AUTO=1`：开启自动物流查询。
 - `SCENTPOOL_TRACKING_INTERVAL_MINUTES=1440`：发货单自动查询间隔，默认 1 天。
 - `SCENTPOOL_RETURN_TRACKING_INTERVAL_MINUTES=720`：退货单自动查询间隔，默认 12 小时。
+- `SCENTPOOL_KDNIAO_ENDPOINT=https://api.kdniao.com/api/dist`：快递鸟“快递查询”接口地址。
+- `SCENTPOOL_KDNIAO_REQUEST_TYPE=8002`：快递鸟“快递查询”接口指令。
 - `SCENTPOOL_KDNIAO_EBUSINESS_ID`：快递鸟用户 ID，只放 Render 环境变量。
 - `SCENTPOOL_KDNIAO_APP_KEY`：快递鸟 API Key，只放 Render 环境变量。
 
@@ -83,7 +85,7 @@ curl -b cookie.txt -c cookie.txt \
 
 ## 物流查询
 
-总部把订单保存为“已发货”并填写快递公司、快递单号后，系统会把订单标记为待查询。开启快递鸟环境变量后，后台会每天查询一次未签收发货单；退货单默认每 12 小时查询一次。总部也可以在发货后台点击“同步物流”，或在退货看板点击“同步退货物流”手动刷新。
+总部把订单保存为“已发货”并填写快递公司、快递单号后，系统会把订单标记为待查询。开启快递鸟环境变量后，后台使用快递鸟“快递查询”接口（`RequestType=8002`，`https://api.kdniao.com/api/dist`）每天查询一次未签收发货单；退货单默认每 12 小时查询一次。总部也可以在发货后台点击“同步物流”，或在退货看板点击“同步退货物流”手动刷新。
 
 快递鸟返回签收后，系统会自动更新：
 
