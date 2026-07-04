@@ -521,7 +521,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/admin/tracking/diagnostics" and self.command == "GET":
             self.require_admin(user)
-            self.send_json({"tracking": tracking_env_diagnostics()})
+            self.send_json({"tracking": tracking_env_diagnostics(reveal_secrets=query.get("reveal") == "1")})
             return
 
         if path == "/api/admin/tracking/sync" and self.command == "POST":

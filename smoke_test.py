@@ -159,6 +159,13 @@ def main() -> None:
         assert body["tracking"]["app_key"]["looks_uuid"] is True
         assert "11111111-2222-3333-4444-555555555555" not in json.dumps(body)
 
+        status, body = request(admin, base, "GET", "/api/admin/tracking/diagnostics?reveal=1")
+        assert status == 200, body
+        assert body["tracking"]["secrets_revealed"] is True
+        assert body["tracking"]["business_id"]["raw_value"] == " 1926656 "
+        assert body["tracking"]["app_key"]["raw_value"] == " 11111111-2222-3333-4444-555555555555 "
+        assert body["tracking"]["app_key"]["trimmed_value"] == "11111111-2222-3333-4444-555555555555"
+
         status, body = request(admin, base, "GET", "/api/products?all=1")
         assert status == 200, body
         assert len(body["products"]) == 52, len(body["products"])

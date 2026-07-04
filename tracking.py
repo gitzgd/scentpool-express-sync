@@ -270,22 +270,27 @@ def tracking_config_public() -> Dict[str, Any]:
     }
 
 
-def tracking_env_diagnostics() -> Dict[str, Any]:
+def tracking_env_diagnostics(*, reveal_secrets: bool = False) -> Dict[str, Any]:
     business_id_raw = os.environ.get("SCENTPOOL_KDNIAO_EBUSINESS_ID")
     app_key_raw = os.environ.get("SCENTPOOL_KDNIAO_APP_KEY")
     business_id = "" if business_id_raw is None else business_id_raw.strip()
     app_key = "" if app_key_raw is None else app_key_raw.strip()
-    return {
+    result = {
         "provider": configured_provider(),
         "endpoint": os.environ.get("SCENTPOOL_KDNIAO_ENDPOINT", KDNIAO_ENDPOINT).strip() or KDNIAO_ENDPOINT,
         "request_type": kdniao_request_type(),
         "data_type": KDNIAO_DATA_TYPE,
+        "secrets_revealed": reveal_secrets,
         "business_id": {
             **secret_diagnostics(business_id_raw, expose_trimmed_value=True),
             "digits_only": business_id.isdigit() if business_id else False,
         },
         "app_key": {
-            **secret_diagnostics(app_key_raw),
+            **secret_diagnostics(app_key_raw, expose_trimmed_value=reveal_secrets),
             **app_key_format_info(app_key),
         },
     }
+    if reveal_secrets:
+        result["business_id"]["raw_value"] = "" if business_id_raw is None else business_id_raw
+        result["app_key"]["raw_value"] = "" if app_key_raw is None else app_key_raw
+    return result
