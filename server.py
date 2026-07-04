@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from xml.sax.saxutils import escape as xml_escape
 
 from database import AppError, Database, DEFAULT_PRODUCT_FILE, RETURN_STATUSES, STATUSES
-from tracking import query_tracking, tracking_auto_enabled, tracking_config_public, tracking_interval_minutes, tracking_stale_before
+from tracking import query_tracking, tracking_auto_enabled, tracking_config_public, tracking_env_diagnostics, tracking_interval_minutes, tracking_stale_before
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -517,6 +517,11 @@ class Handler(BaseHTTPRequestHandler):
             config = tracking_config_public()
             config["return_interval_minutes"] = return_tracking_interval_minutes()
             self.send_json({"tracking": config})
+            return
+
+        if path == "/api/admin/tracking/diagnostics" and self.command == "GET":
+            self.require_admin(user)
+            self.send_json({"tracking": tracking_env_diagnostics()})
             return
 
         if path == "/api/admin/tracking/sync" and self.command == "POST":

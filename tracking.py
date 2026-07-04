@@ -8,13 +8,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from database import AppError, now_text
 
 
 KDNIAO_ENDPOINT = "https://api.kdniao.com/api/dist"
 KDNIAO_REQUEST_TYPE_TRACK = "8002"
+KDNIAO_DATA_TYPE = "2"
 SIGNED_STATE = "3"
 PROBLEM_STATE = "4"
 EXPRESS_COMPANY_CODES = {
@@ -58,6 +59,37 @@ def mask_secret(value: str) -> str:
     if len(value) <= 8:
         return "****" if value else ""
     return f"{value[:4]}...{value[-4:]}"
+
+
+def secret_diagnostics(raw_value: Optional[str], *, expose_trimmed_value: bool = False) -> Dict[str, Any]:
+    raw = "" if raw_value is None else str(raw_value)
+    trimmed = raw.strip()
+    info: Dict[str, Any] = {
+        "present": bool(raw_value),
+        "masked": mask_secret(trimmed),
+        "raw_length": len(raw),
+        "trimmed_length": len(trimmed),
+        "leading_or_trailing_whitespace": raw != trimmed,
+        "contains_whitespace": any(ch.isspace() for ch in raw),
+        "contains_non_ascii": any(ord(ch) > 127 for ch in raw),
+        "sha256": hashlib.sha256(trimmed.encode("utf-8")).hexdigest() if trimmed else "",
+    }
+    if expose_trimmed_value:
+        info["trimmed_value"] = trimmed
+    return info
+
+
+def app_key_format_info(value: str) -> Dict[str, Any]:
+    trimmed = value.strip()
+    uuid_like = (
+        len(trimmed) == 36
+        and trimmed[8:9] == "-"
+        and trimmed[13:14] == "-"
+        and trimmed[18:19] == "-"
+        and trimmed[23:24] == "-"
+        and all(ch.isdigit() or ch.lower() in "abcdef-" for ch in trimmed)
+    )
+    return {"looks_uuid": uuid_like}
 
 
 class KdniaoClient:
@@ -105,7 +137,7 @@ class KdniaoClient:
                 "EBusinessID": self.business_id,
                 "RequestType": kdniao_request_type(),
                 "DataSign": self.data_sign(request_json),
-                "DataType": "2",
+                "DataType": KDNIAO_DATA_TYPE,
             }
         ).encode("utf-8")
         request = urllib.request.Request(
@@ -235,4 +267,25 @@ def tracking_config_public() -> Dict[str, Any]:
         "request_type": kdniao_request_type(),
         "auto": tracking_auto_enabled(),
         "interval_minutes": tracking_interval_minutes(),
+    }
+
+
+def tracking_env_diagnostics() -> Dict[str, Any]:
+    business_id_raw = os.environ.get("SCENTPOOL_KDNIAO_EBUSINESS_ID")
+    app_key_raw = os.environ.get("SCENTPOOL_KDNIAO_APP_KEY")
+    business_id = "" if business_id_raw is None else business_id_raw.strip()
+    app_key = "" if app_key_raw is None else app_key_raw.strip()
+    return {
+        "provider": configured_provider(),
+        "endpoint": os.environ.get("SCENTPOOL_KDNIAO_ENDPOINT", KDNIAO_ENDPOINT).strip() or KDNIAO_ENDPOINT,
+        "request_type": kdniao_request_type(),
+        "data_type": KDNIAO_DATA_TYPE,
+        "business_id": {
+            **secret_diagnostics(business_id_raw, expose_trimmed_value=True),
+            "digits_only": business_id.isdigit() if business_id else False,
+        },
+        "app_key": {
+            **secret_diagnostics(app_key_raw),
+            **app_key_format_info(app_key),
+        },
     }

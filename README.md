@@ -87,6 +87,8 @@ curl -b cookie.txt -c cookie.txt \
 
 总部把订单保存为“已发货”并填写快递公司、快递单号后，系统会把订单标记为待查询。开启快递鸟环境变量后，后台使用快递鸟“快递查询”接口（`RequestType=8002`，`https://api.kdniao.com/api/dist`）每天查询一次未签收发货单；退货单默认每 12 小时查询一次。总部也可以在发货后台点击“同步物流”，或在退货看板点击“同步退货物流”手动刷新。
 
+总部登录后可以打开 `/api/admin/tracking/diagnostics` 查看 Render 实际读取到的快递鸟环境变量诊断信息。页面会显示 `EBusinessID` 明文、`API Key` 的首尾掩码、长度、SHA256 指纹和空格/格式检查，不会直接暴露完整 API Key。
+
 快递鸟返回签收后，系统会自动更新：
 
 ```text

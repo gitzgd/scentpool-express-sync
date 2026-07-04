@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import tempfile
 import threading
 import time
@@ -81,8 +82,11 @@ def request_multipart(opener, base, method, path, field_name, file_path):
 
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
+        os.environ["SCENTPOOL_KDNIAO_EBUSINESS_ID"] = " 1926656 "
+        os.environ["SCENTPOOL_KDNIAO_APP_KEY"] = " 11111111-2222-3333-4444-555555555555 "
         assert tracking.KDNIAO_ENDPOINT == "https://api.kdniao.com/api/dist"
         assert tracking.KDNIAO_REQUEST_TYPE_TRACK == "8002"
+        assert tracking.KDNIAO_DATA_TYPE == "2"
         original_urlopen = tracking.urllib.request.urlopen
         captured = {}
 
@@ -111,6 +115,7 @@ def main() -> None:
         request_data = json.loads(params["RequestData"][0])
         assert captured["url"] == "https://api.kdniao.com/api/dist"
         assert params["RequestType"][0] == "8002"
+        assert params["DataType"][0] == "2"
         assert request_data == {"LogisticCode": "YT123456"}
 
         db_path = str(Path(tmp) / "test.db")
@@ -143,6 +148,17 @@ def main() -> None:
         assert status == 200, body
         assert body["user"]["role"] == "admin"
 
+        status, body = request(admin, base, "GET", "/api/admin/tracking/diagnostics")
+        assert status == 200, body
+        assert body["tracking"]["request_type"] == "8002"
+        assert body["tracking"]["data_type"] == "2"
+        assert body["tracking"]["business_id"]["trimmed_value"] == "1926656"
+        assert body["tracking"]["business_id"]["leading_or_trailing_whitespace"] is True
+        assert body["tracking"]["business_id"]["digits_only"] is True
+        assert body["tracking"]["app_key"]["trimmed_length"] == 36
+        assert body["tracking"]["app_key"]["looks_uuid"] is True
+        assert "11111111-2222-3333-4444-555555555555" not in json.dumps(body)
+
         status, body = request(admin, base, "GET", "/api/products?all=1")
         assert status == 200, body
         assert len(body["products"]) == 52, len(body["products"])
@@ -162,6 +178,9 @@ def main() -> None:
         status, body = request(staff, base, "POST", "/api/login", {"username": "store01", "password": "scentpool2026"})
         assert status == 200, body
         assert body["user"]["role"] == "staff"
+
+        status, body = request(staff, base, "GET", "/api/admin/tracking/diagnostics")
+        assert status == 403, body
 
         status, body = request(staff, base, "GET", "/shipments")
         assert status == 200
