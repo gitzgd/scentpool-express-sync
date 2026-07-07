@@ -115,7 +115,7 @@ a {
 }
 
 .main {
-  width: min(1240px, calc(100% - 40px));
+  width: min(1440px, calc(100% - 32px));
   margin: 26px auto 48px;
 }
 
@@ -520,16 +520,98 @@ table {
 }
 
 .shipments-table table {
-  min-width: 1240px;
+  table-layout: fixed;
+  min-width: 1120px;
+}
+
+.store-shipments-table table {
+  table-layout: fixed;
+  min-width: 980px;
+}
+
+.shipments-table .col-seq {
+  width: 42px;
+}
+
+.shipments-table .col-business {
+  width: 130px;
+}
+
+.shipments-table .col-created {
+  width: 92px;
+}
+
+.shipments-table .col-store {
+  width: 90px;
+}
+
+.shipments-table .col-order {
+  width: 105px;
+}
+
+.shipments-table .col-recipient {
+  width: 160px;
+}
+
+.shipments-table .col-items {
+  width: 190px;
+}
+
+.shipments-table .col-status {
+  width: 86px;
+}
+
+.shipments-table .col-shipping {
+  width: 220px;
+}
+
+.shipments-table .col-actions {
+  width: 86px;
+}
+
+.store-shipments-table th:nth-child(1),
+.store-shipments-table td:nth-child(1) {
+  width: 110px;
+}
+
+.store-shipments-table th:nth-child(2),
+.store-shipments-table td:nth-child(2) {
+  width: 120px;
+}
+
+.store-shipments-table th:nth-child(3),
+.store-shipments-table td:nth-child(3) {
+  width: 200px;
+}
+
+.store-shipments-table th:nth-child(4),
+.store-shipments-table td:nth-child(4) {
+  width: 210px;
+}
+
+.store-shipments-table th:nth-child(5),
+.store-shipments-table td:nth-child(5) {
+  width: 90px;
+}
+
+.store-shipments-table th:nth-child(6),
+.store-shipments-table td:nth-child(6) {
+  width: 210px;
+}
+
+.store-shipments-table th:nth-child(7),
+.store-shipments-table td:nth-child(7) {
+  width: 140px;
 }
 
 th,
 td {
-  padding: 12px;
+  padding: 10px;
   border-bottom: 1px solid #ededf2;
   text-align: left;
   vertical-align: top;
   font-size: 13px;
+  overflow-wrap: anywhere;
 }
 
 th {
@@ -576,8 +658,12 @@ tr:last-child td {
   background: #ffffff;
 }
 
+.shipments-table .table-input {
+  min-width: 0;
+}
+
 .business-cell {
-  min-width: 170px;
+  min-width: 0;
 }
 
 .business-id {
@@ -589,21 +675,21 @@ tr:last-child td {
 }
 
 .status-cell {
-  min-width: 108px;
+  min-width: 0;
 }
 
 .shipping-cell {
-  min-width: 280px;
-  max-width: 360px;
+  min-width: 0;
+  max-width: none;
 }
 
 .actions-cell {
-  min-width: 112px;
+  min-width: 0;
 }
 
 .items-cell {
-  min-width: 260px;
-  max-width: 420px;
+  min-width: 0;
+  max-width: none;
 }
 
 .shipping-editor {
@@ -624,7 +710,7 @@ tr:last-child td {
 
 .tracking-input-row {
   display: grid;
-  grid-template-columns: minmax(150px, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
 }
@@ -724,7 +810,7 @@ tr:last-child td {
   display: grid;
   gap: 6px;
   margin-top: 7px;
-  max-width: 360px;
+  max-width: 100%;
   line-height: 1.45;
 }
 
@@ -735,6 +821,8 @@ tr:last-child td {
 
 .shipment-actions .btn {
   justify-content: center;
+  padding-right: 8px;
+  padding-left: 8px;
 }
 
 .action-time {

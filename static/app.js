@@ -189,6 +189,20 @@ async function copyText(value) {
   toast("已复制快递单号。");
 }
 
+function bindTrackingCopyButtons() {
+  document.querySelectorAll("[data-copy-tracking]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const row = event.currentTarget.closest("[data-shipment]");
+      const explicitTrackingNo = event.currentTarget.dataset.copyTracking || "";
+      try {
+        await copyText(explicitTrackingNo || row?.querySelector("[data-tracking]")?.value || "");
+      } catch (error) {
+        toast(error.message || "复制失败。");
+      }
+    });
+  });
+}
+
 async function api(path, options = {}) {
   const headers = options.headers || {};
   if (options.body && !(options.body instanceof FormData)) {
@@ -617,9 +631,9 @@ function renderTrackingDetailBlock(row, options = {}) {
   `;
 }
 
-function renderTrackingInfo(row) {
+function renderTrackingInfo(row, options = {}) {
   if (row.tracking_no) {
-    return renderTrackingDetailBlock(row);
+    return renderTrackingDetailBlock(row, options);
   }
   if (row.status === "已发货") {
     return `<span class="muted">待总部填写单号</span>`;
@@ -786,7 +800,7 @@ async function renderStoreBoard() {
 function renderStoreBoardTable(shipments) {
   if (!shipments.length) return `<div class="empty">没有符合条件的发货单</div>`;
   return `
-    <div class="table-wrap">
+    <div class="table-wrap store-shipments-table">
       <table>
         <thead>
           <tr>
@@ -809,7 +823,7 @@ function renderStoreBoardTable(shipments) {
 	                    ${renderShipmentItemsWithEditButton(row)}
 	                  </td>
 	                  <td><span class="status ${statusClass(row.status)}">${escapeHtml(row.status)}</span></td>
-	                  <td>${renderTrackingInfo(row)}</td>
+	                  <td>${renderTrackingInfo(row, { showCopy: true })}</td>
                   <td>
                     ${row.remark ? `<div>${escapeHtml(row.remark)}</div>` : `<span class="muted">无</span>`}
                     ${row.shipping_note ? `<div class="muted mini">总部：${escapeHtml(row.shipping_note)}</div>` : ""}
@@ -1525,6 +1539,18 @@ function renderShipmentTable(shipments) {
   return `
     <div class="table-wrap shipments-table">
       <table>
+        <colgroup>
+          <col class="col-seq" />
+          <col class="col-business" />
+          <col class="col-created" />
+          <col class="col-store" />
+          <col class="col-order" />
+          <col class="col-recipient" />
+          <col class="col-items" />
+          <col class="col-status" />
+          <col class="col-shipping" />
+          <col class="col-actions" />
+        </colgroup>
         <thead>
           <tr>
             <th>序号</th><th>业务ID</th><th>提交</th><th>门店</th><th>订单</th><th>收件信息</th><th>商品</th><th>状态</th><th>快递</th><th>操作</th>
@@ -1643,17 +1669,6 @@ function bindAdmin() {
       const row = event.currentTarget.closest("[data-shipment]");
       const button = row?.querySelector("[data-copy-tracking]");
       if (button) button.style.display = event.currentTarget.value.trim() ? "" : "none";
-    });
-  });
-  document.querySelectorAll("[data-copy-tracking]").forEach((node) => {
-    node.addEventListener("click", async (event) => {
-      const row = event.currentTarget.closest("[data-shipment]");
-      const explicitTrackingNo = event.currentTarget.dataset.copyTracking || "";
-      try {
-        await copyText(explicitTrackingNo || row?.querySelector("[data-tracking]")?.value || "");
-      } catch (error) {
-        toast(error.message || "复制失败。");
-      }
     });
   });
   document.querySelectorAll("[data-save-shipment]").forEach((node) => {
@@ -1898,6 +1913,7 @@ function bindProducts() {
 }
 
 function bindCommon() {
+  bindTrackingCopyButtons();
   document.querySelectorAll("[data-route]").forEach((node) => {
     node.addEventListener("click", (event) => {
       event.preventDefault();
