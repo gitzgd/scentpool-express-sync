@@ -99,6 +99,38 @@ function shipmentBusinessId(row) {
   return `${compactDate(row.created_at)}-${shipmentStoreCode(row)}-${row.store_order_no || row.id}`;
 }
 
+function cleanTrackingEvent(value) {
+  let text = String(value || "").trim();
+  if (!text) return "";
+  text = text.replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s*/, "").trim();
+  text = text.replace(/[，,；;。]?(如有疑问|如遇|如需|若有疑问|请联系快递员|或致电专属客服|感谢使用)[\s\S]*$/, "").trim();
+  const arrived = text.match(/(?:您的)?快件已到(?:达)?[^，,。；;\n]*/);
+  if (arrived) return arrived[0].replace(/[，,。；;]+$/, "").trim();
+  const firstSentence = text.split(/[。；;\n]/).find(Boolean) || text;
+  return firstSentence.replace(/[，,。；;]+$/, "").trim();
+}
+
+function trackingTraceLines(row) {
+  const raw = String(row.tracking_raw || "").trim();
+  if (raw) {
+    try {
+      const data = JSON.parse(raw);
+      const traces = Array.isArray(data.data) ? data.data : [];
+      const lines = traces
+        .map((trace) => {
+          const time = trace.ftime || trace.time || "";
+          const context = trace.context || trace.Context || "";
+          return `${time} ${context}`.trim();
+        })
+        .filter(Boolean);
+      if (lines.length) return lines;
+    } catch (error) {
+      // Keep the UI resilient if a provider returns non-standard raw data.
+    }
+  }
+  return row.tracking_last_event ? [row.tracking_last_event] : [];
+}
+
 function shipmentStatusCounts(rows) {
   return rows.reduce(
     (acc, row) => {
@@ -553,27 +585,34 @@ function renderMiniShipments(shipments) {
 function renderTrackingDetailBlock(row, options = {}) {
   const showCopy = Boolean(options.showCopy);
   const company = row.express_company || DEFAULT_EXPRESS_COMPANY;
+  const summary = cleanTrackingEvent(row.tracking_last_event) || row.tracking_status || (row.tracking_error ? "物流查询失败" : "物流待查询");
+  const traceLines = trackingTraceLines(row);
+  const detailParts = [
+    ...traceLines.map((line) => `<div>${escapeHtml(line)}</div>`),
+    row.tracking_last_checked_at ? `<div>查询：${escapeHtml(formatDate(row.tracking_last_checked_at))}</div>` : "",
+    row.tracking_signed_at ? `<div>签收：${escapeHtml(formatDate(row.tracking_signed_at))}</div>` : "",
+    row.shipped_at ? `<div>发货：${escapeHtml(formatDate(row.shipped_at))}</div>` : "",
+    row.tracking_error ? `<div class="tracking-error">错误：${escapeHtml(row.tracking_error)}</div>` : "",
+    row.shipping_note ? `<div>备注：${escapeHtml(row.shipping_note)}</div>` : "",
+  ].filter(Boolean);
   const statusHtml = row.tracking_status
     ? `<span class="status ${trackingClass(row.tracking_status)}">${escapeHtml(row.tracking_status)}</span>`
     : `<span class="muted mini">物流待查询</span>`;
   return `
     <div class="tracking-panel">
-      <div class="tracking-panel-head">
-        <span class="courier-chip">${escapeHtml(company)}</span>
+      <div class="tracking-summary-row">
         ${statusHtml}
+        <strong>${escapeHtml(summary)}</strong>
       </div>
       <div class="tracking-number-row">
-        <strong>${escapeHtml(row.tracking_no)}</strong>
+        <span>${escapeHtml(company)} ${escapeHtml(row.tracking_no)}</span>
         ${showCopy ? `<button class="btn secondary small" data-copy-tracking="${escapeHtml(row.tracking_no)}" type="button">复制</button>` : ""}
       </div>
-      ${row.tracking_last_event ? `<div class="tracking-event">${escapeHtml(row.tracking_last_event)}</div>` : ""}
-      <div class="tracking-meta">
-        ${row.tracking_last_checked_at ? `<span>查询 ${escapeHtml(formatDate(row.tracking_last_checked_at))}</span>` : ""}
-        ${row.tracking_signed_at ? `<span>签收 ${escapeHtml(formatDate(row.tracking_signed_at))}</span>` : ""}
-        ${row.shipped_at ? `<span>发货 ${escapeHtml(formatDate(row.shipped_at))}</span>` : ""}
-      </div>
-      ${row.tracking_error ? `<div class="tracking-error">错误：${escapeHtml(row.tracking_error)}</div>` : ""}
-      ${row.shipping_note ? `<div class="tracking-note">${escapeHtml(row.shipping_note)}</div>` : ""}
+      ${
+        detailParts.length
+          ? `<details class="tracking-details"><summary>显示详细物流信息</summary><div class="tracking-detail-lines">${detailParts.join("")}</div></details>`
+          : ""
+      }
     </div>
   `;
 }
@@ -1252,15 +1291,7 @@ function renderReturnTable(rows, admin = false) {
 }
 
 function renderReturnTrackingInfo(row) {
-  return `
-    <strong>${escapeHtml(row.express_company || DEFAULT_EXPRESS_COMPANY)}</strong><br />
-    <span>${escapeHtml(row.tracking_no)}</span>
-    ${row.tracking_status ? `<div style="margin-top: 7px;"><span class="status ${trackingClass(row.tracking_status)}">${escapeHtml(row.tracking_status)}</span></div>` : `<div class="muted mini" style="margin-top: 7px;">物流待查询</div>`}
-    ${row.tracking_last_event ? `<div class="muted mini tracking-event">${escapeHtml(row.tracking_last_event)}</div>` : ""}
-    ${row.tracking_last_checked_at ? `<div class="muted mini">查询：${escapeHtml(formatDate(row.tracking_last_checked_at))}</div>` : ""}
-    ${row.tracking_signed_at ? `<div class="muted mini">签收：${escapeHtml(formatDate(row.tracking_signed_at))}</div>` : ""}
-    ${row.tracking_error ? `<div class="muted mini">错误：${escapeHtml(row.tracking_error)}</div>` : ""}
-  `;
+  return renderTrackingDetailBlock(row);
 }
 
 function bindReturnBoard(admin = false) {
