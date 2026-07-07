@@ -16,6 +16,8 @@ const state = {
   returnDraft: { store_id: "", express_company: "圆通", tracking_no: "", sender_phone: "", remark: "" },
   adminFilters: { store_id: "", status: "待处理", date_from: "", date_to: "", q: "" },
   storeFilters: { status: "", date_from: "", date_to: "", q: "" },
+  adminShipmentPage: 1,
+  storeShipmentPage: 1,
   adminReturnFilters: { store_id: "", status: "", date_from: "", date_to: "", q: "" },
   storeReturnFilters: { status: "", date_from: "", date_to: "", q: "" },
   productFilters: { category: "", q: "" },
@@ -27,6 +29,7 @@ const state = {
 const EXPRESS_COMPANIES = ["圆通", "京东", "顺丰"];
 const DEFAULT_EXPRESS_COMPANY = "圆通";
 const CATEGORY_COLOR_COUNT = 10;
+const SHIPMENT_PAGE_SIZE = 50;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -142,6 +145,62 @@ function shipmentStatusCounts(rows) {
   );
 }
 
+function shipmentPageState(scope) {
+  return scope === "admin" ? state.adminShipmentPage : state.storeShipmentPage;
+}
+
+function setShipmentPage(scope, page) {
+  const nextPage = Math.max(1, Number(page) || 1);
+  if (scope === "admin") {
+    state.adminShipmentPage = nextPage;
+  } else {
+    state.storeShipmentPage = nextPage;
+  }
+}
+
+function paginatedShipments(rows, scope) {
+  const total = rows.length;
+  const totalPages = Math.max(1, Math.ceil(total / SHIPMENT_PAGE_SIZE));
+  const page = Math.min(Math.max(1, shipmentPageState(scope)), totalPages);
+  setShipmentPage(scope, page);
+  const start = (page - 1) * SHIPMENT_PAGE_SIZE;
+  const end = Math.min(start + SHIPMENT_PAGE_SIZE, total);
+  return {
+    rows: rows.slice(start, end),
+    total,
+    totalPages,
+    page,
+    start,
+    end,
+  };
+}
+
+function renderShipmentPagination(scope, pageData) {
+  if (!pageData.total) return "";
+  const pageOptions = Array.from({ length: pageData.totalPages }, (_, index) => {
+    const page = index + 1;
+    return `<option value="${page}" ${page === pageData.page ? "selected" : ""}>第 ${page} 页</option>`;
+  }).join("");
+  return `
+    <div class="pagination-bar">
+      <div class="muted mini">显示 ${pageData.start + 1}-${pageData.end} / 共 ${pageData.total} 单，每页 ${SHIPMENT_PAGE_SIZE} 单</div>
+      ${
+        pageData.totalPages > 1
+          ? `
+            <div class="pagination-controls">
+              <button class="btn secondary small" data-shipment-page="${scope}" data-page="${pageData.page - 1}" type="button" ${pageData.page <= 1 ? "disabled" : ""}>上一页</button>
+              <select class="select pagination-select" data-shipment-page-select="${scope}">
+                ${pageOptions}
+              </select>
+              <button class="btn secondary small" data-shipment-page="${scope}" data-page="${pageData.page + 1}" type="button" ${pageData.page >= pageData.totalPages ? "disabled" : ""}>下一页</button>
+            </div>
+          `
+          : ""
+      }
+    </div>
+  `;
+}
+
 function expressCompanyOptions(selected = "") {
   const current = selected || DEFAULT_EXPRESS_COMPANY;
   return EXPRESS_COMPANIES.map(
@@ -199,6 +258,23 @@ function bindTrackingCopyButtons() {
       } catch (error) {
         toast(error.message || "复制失败。");
       }
+    });
+  });
+}
+
+function bindShipmentPagination() {
+  document.querySelectorAll("[data-shipment-page]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      const scope = event.currentTarget.dataset.shipmentPage;
+      setShipmentPage(scope, event.currentTarget.dataset.page);
+      render();
+    });
+  });
+  document.querySelectorAll("[data-shipment-page-select]").forEach((node) => {
+    node.addEventListener("change", (event) => {
+      const scope = event.currentTarget.dataset.shipmentPageSelect;
+      setShipmentPage(scope, event.currentTarget.value);
+      render();
     });
   });
 }
@@ -748,6 +824,7 @@ async function renderStoreBoard() {
     },
     { total: 0 }
   );
+  const pageData = paginatedShipments(state.storeShipments, "store");
   const content = `
     ${pageHead(
       "发货看板",
@@ -789,7 +866,8 @@ async function renderStoreBoard() {
         <button class="btn primary" id="applyStoreFilters" type="button">筛选</button>
         <button class="btn secondary" id="resetStoreFilters" type="button">清空</button>
       </div>
-      ${renderStoreBoardTable(state.storeShipments)}
+      ${renderStoreBoardTable(pageData.rows)}
+      ${renderShipmentPagination("store", pageData)}
     </section>
   `;
   document.getElementById("app").innerHTML = shell(content);
@@ -990,6 +1068,7 @@ function bindStoreBoard() {
         date_from: targetDate,
         date_to: targetDate,
       };
+      state.storeShipmentPage = 1;
       render();
     });
   });
@@ -1000,10 +1079,12 @@ function bindStoreBoard() {
       date_to: document.getElementById("storeFilterTo").value,
       q: document.getElementById("storeFilterQ").value.trim(),
     };
+    state.storeShipmentPage = 1;
     render();
   });
   document.getElementById("resetStoreFilters").addEventListener("click", () => {
     state.storeFilters = { status: "", date_from: "", date_to: "", q: "" };
+    state.storeShipmentPage = 1;
     render();
   });
   bindShipmentItemEditor(state.storeShipments);
@@ -1379,6 +1460,7 @@ async function renderAdmin() {
     if (value) exportParams.set(key, value);
   });
   const counts = shipmentStatusCounts(state.adminShipmentSummary);
+  const pageData = paginatedShipments(state.shipments, "admin");
   const content = `
     ${pageHead(
       "发货后台",
@@ -1434,7 +1516,8 @@ async function renderAdmin() {
         <button class="btn primary" id="applyFilters" type="button">筛选</button>
         <button class="btn secondary" id="resetFilters" type="button">清空</button>
       </div>
-      ${renderShipmentBoard(state.shipments)}
+      ${renderShipmentBoard(pageData.rows, pageData.start)}
+      ${renderShipmentPagination("admin", pageData)}
     </section>
   `;
   document.getElementById("app").innerHTML = shell(content);
@@ -1442,7 +1525,7 @@ async function renderAdmin() {
   bindAdmin();
 }
 
-function renderShipmentBoard(shipments) {
+function renderShipmentBoard(shipments, offset = 0) {
   if (!shipments.length) return `<div class="empty">没有符合条件的发货单</div>`;
   const groups = [];
   shipments.forEach((row, index) => {
@@ -1452,7 +1535,7 @@ function renderShipmentBoard(shipments) {
       group = { day, rows: [] };
       groups.push(group);
     }
-    group.rows.push({ ...row, displayIndex: index + 1 });
+    group.rows.push({ ...row, displayIndex: offset + index + 1 });
   });
   return groups
     .map(
@@ -1610,6 +1693,7 @@ function bindAdmin() {
         date_from: targetDate,
         date_to: targetDate,
       };
+      state.adminShipmentPage = 1;
       render();
     });
   });
@@ -1621,10 +1705,12 @@ function bindAdmin() {
       date_to: document.getElementById("filterTo").value,
       q: document.getElementById("filterQ").value.trim(),
     };
+    state.adminShipmentPage = 1;
     render();
   });
   document.getElementById("resetFilters").addEventListener("click", () => {
     state.adminFilters = { store_id: "", status: "", date_from: "", date_to: "", q: "" };
+    state.adminShipmentPage = 1;
     render();
   });
   document.getElementById("syncTracking").addEventListener("click", async () => {
@@ -1914,6 +2000,7 @@ function bindProducts() {
 
 function bindCommon() {
   bindTrackingCopyButtons();
+  bindShipmentPagination();
   document.querySelectorAll("[data-route]").forEach((node) => {
     node.addEventListener("click", (event) => {
       event.preventDefault();

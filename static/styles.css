@@ -257,6 +257,12 @@ a {
   transform: translateY(1px);
 }
 
+.btn:disabled {
+  cursor: default;
+  opacity: 0.45;
+  transform: none;
+}
+
 .btn.primary {
   background: var(--blue);
   color: #ffffff;
@@ -338,6 +344,28 @@ a {
   margin: 0;
   font-size: 16px;
   letter-spacing: 0;
+}
+
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid #ededf2;
+}
+
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pagination-select {
+  min-height: 34px;
+  min-width: 116px;
+  padding: 6px 10px;
 }
 
 .status {
@@ -1004,6 +1032,15 @@ tr:last-child td {
   .split-actions {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .pagination-bar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .pagination-controls {
+    flex-wrap: wrap;
   }
 
   .actions {
