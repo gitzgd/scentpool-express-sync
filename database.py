@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 import sqlite3
 from datetime import datetime, timedelta
@@ -41,6 +42,14 @@ def local_day_start(date_text: str) -> str:
 
 def local_day_end(date_text: str) -> str:
     return datetime.fromisoformat(f"{date_text}T23:59:59").replace(tzinfo=APP_TZ).isoformat(timespec="seconds")
+
+
+def business_search_parts(query: str) -> Optional[tuple[str, str]]:
+    text = str(query or "").strip()
+    match = re.match(r"^(\d{4})-?(\d{2})-?(\d{2})[-_\s]+(.+)$", text)
+    if not match:
+        return None
+    return f"{match.group(1)}-{match.group(2)}-{match.group(3)}", match.group(4).strip()
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -636,17 +645,37 @@ class Database:
             where.append("datetime(shipments.created_at) <= datetime(?)")
             params.append(local_day_end(str(filters["date_to"])))
         if filters.get("q"):
-            q = f"%{filters['q']}%"
-            where.append(
-                """
-                (
-                    shipments.store_order_no LIKE ? OR shipments.recipient_name LIKE ? OR
-                    shipments.phone LIKE ? OR shipments.tracking_no LIKE ? OR
-                    shipments.address LIKE ?
+            query_text = str(filters["q"]).strip()
+            q = f"%{query_text}%"
+            business_parts = business_search_parts(query_text)
+            if business_parts:
+                date_text, order_text = business_parts
+                where.append(
+                    """
+                    (
+                        shipments.store_order_no LIKE ? OR shipments.recipient_name LIKE ? OR
+                        shipments.phone LIKE ? OR shipments.tracking_no LIKE ? OR
+                        shipments.address LIKE ? OR
+                        (
+                            datetime(shipments.created_at) >= datetime(?) AND
+                            datetime(shipments.created_at) <= datetime(?) AND
+                            shipments.store_order_no LIKE ?
+                        )
+                    )
+                    """
                 )
-                """
-            )
-            params.extend([q, q, q, q, q])
+                params.extend([q, q, q, q, q, local_day_start(date_text), local_day_end(date_text), f"%{order_text}%"])
+            else:
+                where.append(
+                    """
+                    (
+                        shipments.store_order_no LIKE ? OR shipments.recipient_name LIKE ? OR
+                        shipments.phone LIKE ? OR shipments.tracking_no LIKE ? OR
+                        shipments.address LIKE ?
+                    )
+                    """
+                )
+                params.extend([q, q, q, q, q])
 
         sql = "SELECT shipments.* FROM shipments"
         if where:
@@ -714,7 +743,7 @@ class Database:
             existing = conn.execute("SELECT status FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
             if not existing:
                 raise AppError("发货单不存在。", 404)
-            status = status_update or existing["status"]
+            status = status_update or ("已发货" if existing["status"] == "待处理" and tracking_status and tracking_status != "查询失败" else existing["status"])
             cursor = conn.execute(
                 """
                 UPDATE shipments

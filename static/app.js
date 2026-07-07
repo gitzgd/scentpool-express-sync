@@ -4,6 +4,7 @@ const state = {
   productsGrouped: null,
   productsAll: [],
   shipments: [],
+  adminShipmentSummary: [],
   storeShipments: [],
   returnOrders: [],
   storeReturnOrders: [],
@@ -75,6 +76,29 @@ function localDate(offsetDays = 0) {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function datePart(value) {
+  return formatDate(value).slice(0, 10) || "未分日期";
+}
+
+function compactDate(value) {
+  return datePart(value).replaceAll("-", "");
+}
+
+function shipmentBusinessId(row) {
+  return `${compactDate(row.created_at)}-${row.store_order_no || row.id}`;
+}
+
+function shipmentStatusCounts(rows) {
+  return rows.reduce(
+    (acc, row) => {
+      acc.total += 1;
+      acc[row.status] = (acc[row.status] || 0) + 1;
+      return acc;
+    },
+    { total: 0 }
+  );
 }
 
 function expressCompanyOptions(selected = "") {
@@ -224,6 +248,11 @@ async function loadShipments() {
   const data = await api(`/api/shipments?${params.toString()}`);
   state.shipments = data.shipments || [];
   state.statuses = data.statuses || state.statuses;
+
+  const summaryParams = new URLSearchParams(params);
+  summaryParams.delete("status");
+  const summaryData = await api(`/api/shipments?${summaryParams.toString()}`);
+  state.adminShipmentSummary = summaryData.shipments || [];
 }
 
 async function loadStoreShipments() {
@@ -1277,6 +1306,7 @@ async function renderAdmin() {
   Object.entries(state.adminFilters).forEach(([key, value]) => {
     if (value) exportParams.set(key, value);
   });
+  const counts = shipmentStatusCounts(state.adminShipmentSummary);
   const content = `
     ${pageHead(
       "发货后台",
@@ -1289,6 +1319,13 @@ async function renderAdmin() {
       </div>`
     )}
     <section class="panel panel-pad">
+      <div class="status-overview">
+        <span class="count-pill">当前范围 ${counts.total} 单</span>
+        <span class="count-pill">待处理 ${counts["待处理"] || 0}</span>
+        <span class="count-pill">已发货 ${counts["已发货"] || 0}</span>
+        <span class="count-pill">已签收 ${counts["已签收"] || 0}</span>
+        <span class="count-pill">异常 ${counts["异常"] || 0}</span>
+      </div>
       <div class="filters admin-filters">
         <div class="quick-filters">
           <button class="btn secondary small ${state.adminFilters.date_from === today && state.adminFilters.date_to === today ? "active" : ""}" data-admin-preset="today" type="button">今日</button>
@@ -1320,17 +1357,44 @@ async function renderAdmin() {
         </div>
         <div class="field">
           <label>搜索</label>
-          <input class="input" id="filterQ" value="${escapeHtml(state.adminFilters.q)}" placeholder="订单号 / 姓名 / 电话 / 单号" />
+          <input class="input" id="filterQ" value="${escapeHtml(state.adminFilters.q)}" placeholder="业务ID / 订单号 / 姓名 / 电话 / 单号" />
         </div>
         <button class="btn primary" id="applyFilters" type="button">筛选</button>
         <button class="btn secondary" id="resetFilters" type="button">清空</button>
       </div>
-      ${renderShipmentTable(state.shipments)}
+      ${renderShipmentBoard(state.shipments)}
     </section>
   `;
   document.getElementById("app").innerHTML = shell(content);
   bindCommon();
   bindAdmin();
+}
+
+function renderShipmentBoard(shipments) {
+  if (!shipments.length) return `<div class="empty">没有符合条件的发货单</div>`;
+  const groups = [];
+  shipments.forEach((row, index) => {
+    const day = datePart(row.created_at);
+    let group = groups.find((item) => item.day === day);
+    if (!group) {
+      group = { day, rows: [] };
+      groups.push(group);
+    }
+    group.rows.push({ ...row, displayIndex: index + 1 });
+  });
+  return groups
+    .map(
+      (group) => `
+        <div class="date-shipment-group">
+          <div class="date-group-title">
+            <h3>${escapeHtml(group.day)}</h3>
+            <span class="count-pill">${group.rows.length} 单</span>
+          </div>
+          ${renderShipmentTable(group.rows)}
+        </div>
+      `
+    )
+    .join("");
 }
 
 function renderShipmentTable(shipments) {
@@ -1340,7 +1404,7 @@ function renderShipmentTable(shipments) {
       <table>
         <thead>
           <tr>
-            <th>ID</th><th>提交</th><th>门店</th><th>订单</th><th>收件信息</th><th>商品</th><th>状态</th><th>快递</th><th>操作</th>
+            <th>序号</th><th>业务ID</th><th>提交</th><th>门店</th><th>订单</th><th>收件信息</th><th>商品</th><th>状态</th><th>快递</th><th>操作</th>
           </tr>
         </thead>
         <tbody>
@@ -1348,7 +1412,11 @@ function renderShipmentTable(shipments) {
             .map(
               (row) => `
                 <tr class="shipment-row ${statusClass(row.status)}" data-shipment="${row.id}">
-                  <td>${row.id}</td>
+                  <td>${row.displayIndex || ""}</td>
+                  <td>
+                    <strong>${escapeHtml(shipmentBusinessId(row))}</strong>
+                    <div class="muted mini">系统ID ${row.id}</div>
+                  </td>
                   <td>${escapeHtml(formatDate(row.created_at))}</td>
                   <td>${escapeHtml(row.store_name_snapshot)}</td>
                   <td>
@@ -1385,7 +1453,7 @@ function renderShipmentTable(shipments) {
 	                    ${row.shipped_at ? `<div class="muted mini" style="margin-top: 8px;">${escapeHtml(formatDate(row.shipped_at))}</div>` : ""}
 	                  </td>
 	                </tr>
-	                ${renderShipmentEditRow(row, 9)}
+	                ${renderShipmentEditRow(row, 10)}
 	              `
 	            )
             .join("")}

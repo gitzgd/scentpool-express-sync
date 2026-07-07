@@ -354,6 +354,12 @@ def main() -> None:
         assert len(body["shipments"]) == 1
         assert body["shipments"][0]["tracking_no"] == "SF123456"
 
+        business_id = f"{created_date.replace('-', '')}-ORDER-SMOKE-001"
+        status, body = request(admin, base, "GET", f"/api/shipments?q={quote(business_id)}")
+        assert status == 200, body
+        assert len(body["shipments"]) == 1
+        assert body["shipments"][0]["store_order_no"] == "ORDER-SMOKE-001"
+
         expected_csv_name = f"{quote('示例门店_' + created_date + '.csv')}"
         status, body, headers = request_full(admin, base, "GET", f"/api/export/shipments.csv?date_from={created_date}&date_to={created_date}&q=ORDER-SMOKE-001")
         assert status == 200

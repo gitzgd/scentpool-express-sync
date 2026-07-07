@@ -311,6 +311,35 @@ a {
   color: #4a4a4f;
 }
 
+.status-overview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.date-shipment-group {
+  margin-top: 18px;
+}
+
+.date-shipment-group:first-of-type {
+  margin-top: 0;
+}
+
+.date-group-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.date-group-title h3 {
+  margin: 0;
+  font-size: 16px;
+  letter-spacing: 0;
+}
+
 .status {
   background: #f1f1f4;
   color: #4a4a4f;
