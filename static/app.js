@@ -20,6 +20,7 @@ const state = {
   storeReturnFilters: { status: "", date_from: "", date_to: "", q: "" },
   productFilters: { category: "", q: "" },
   editingShipmentId: null,
+  editingShipmentShippingId: null,
   shipmentEditItems: [],
 };
 
@@ -86,8 +87,16 @@ function compactDate(value) {
   return datePart(value).replaceAll("-", "");
 }
 
+function shipmentStoreCode(row) {
+  const storeId = Number(row.store_id);
+  if (Number.isFinite(storeId) && storeId > 0) {
+    return `S${String(storeId).padStart(2, "0")}`;
+  }
+  return "S00";
+}
+
 function shipmentBusinessId(row) {
-  return `${compactDate(row.created_at)}-${row.store_order_no || row.id}`;
+  return `${compactDate(row.created_at)}-${shipmentStoreCode(row)}-${row.store_order_no || row.id}`;
 }
 
 function shipmentStatusCounts(rows) {
@@ -541,19 +550,37 @@ function renderMiniShipments(shipments) {
   `;
 }
 
+function renderTrackingDetailBlock(row, options = {}) {
+  const showCopy = Boolean(options.showCopy);
+  const company = row.express_company || DEFAULT_EXPRESS_COMPANY;
+  const statusHtml = row.tracking_status
+    ? `<span class="status ${trackingClass(row.tracking_status)}">${escapeHtml(row.tracking_status)}</span>`
+    : `<span class="muted mini">物流待查询</span>`;
+  return `
+    <div class="tracking-panel">
+      <div class="tracking-panel-head">
+        <span class="courier-chip">${escapeHtml(company)}</span>
+        ${statusHtml}
+      </div>
+      <div class="tracking-number-row">
+        <strong>${escapeHtml(row.tracking_no)}</strong>
+        ${showCopy ? `<button class="btn secondary small" data-copy-tracking="${escapeHtml(row.tracking_no)}" type="button">复制</button>` : ""}
+      </div>
+      ${row.tracking_last_event ? `<div class="tracking-event">${escapeHtml(row.tracking_last_event)}</div>` : ""}
+      <div class="tracking-meta">
+        ${row.tracking_last_checked_at ? `<span>查询 ${escapeHtml(formatDate(row.tracking_last_checked_at))}</span>` : ""}
+        ${row.tracking_signed_at ? `<span>签收 ${escapeHtml(formatDate(row.tracking_signed_at))}</span>` : ""}
+        ${row.shipped_at ? `<span>发货 ${escapeHtml(formatDate(row.shipped_at))}</span>` : ""}
+      </div>
+      ${row.tracking_error ? `<div class="tracking-error">错误：${escapeHtml(row.tracking_error)}</div>` : ""}
+      ${row.shipping_note ? `<div class="tracking-note">${escapeHtml(row.shipping_note)}</div>` : ""}
+    </div>
+  `;
+}
+
 function renderTrackingInfo(row) {
   if (row.tracking_no) {
-    return `
-      <strong>${escapeHtml(row.express_company || DEFAULT_EXPRESS_COMPANY)}</strong><br />
-      <span>${escapeHtml(row.tracking_no)}</span>
-      ${row.tracking_status ? `<div style="margin-top: 7px;"><span class="status ${trackingClass(row.tracking_status)}">${escapeHtml(row.tracking_status)}</span></div>` : `<div class="muted mini" style="margin-top: 7px;">物流待查询</div>`}
-      ${row.tracking_last_event ? `<div class="muted mini tracking-event">${escapeHtml(row.tracking_last_event)}</div>` : ""}
-      ${row.tracking_last_checked_at ? `<div class="muted mini">查询：${escapeHtml(formatDate(row.tracking_last_checked_at))}</div>` : ""}
-      ${row.tracking_signed_at ? `<div class="muted mini">签收：${escapeHtml(formatDate(row.tracking_signed_at))}</div>` : ""}
-      ${row.tracking_error ? `<div class="muted mini">错误：${escapeHtml(row.tracking_error)}</div>` : ""}
-      ${row.shipped_at ? `<div class="muted mini">${escapeHtml(formatDate(row.shipped_at))}</div>` : ""}
-      ${row.shipping_note ? `<div class="muted mini">${escapeHtml(row.shipping_note)}</div>` : ""}
-    `;
+    return renderTrackingDetailBlock(row);
   }
   if (row.status === "已发货") {
     return `<span class="muted">待总部填写单号</span>`;
@@ -1397,10 +1424,75 @@ function renderShipmentBoard(shipments) {
     .join("");
 }
 
+function shipmentShippingEditing(row) {
+  return state.editingShipmentShippingId === row.id || !String(row.tracking_no || "").trim();
+}
+
+function renderAdminShipmentStatusCell(row) {
+  if (!shipmentShippingEditing(row)) {
+    return `<span class="status ${statusClass(row.status)}">${escapeHtml(row.status)}</span>`;
+  }
+  return `
+    <select class="table-input" data-status>
+      ${state.statuses.map((status) => `<option value="${status}" ${status === row.status ? "selected" : ""}>${status}</option>`).join("")}
+    </select>
+  `;
+}
+
+function renderAdminShipmentShippingCell(row) {
+  if (!shipmentShippingEditing(row)) {
+    return renderTrackingDetailBlock(row, { showCopy: true });
+  }
+  return `
+    <div class="shipping-editor">
+      <label>
+        <span>快递公司</span>
+        <select class="table-input" data-company>
+          ${expressCompanyOptions(row.express_company)}
+        </select>
+      </label>
+      <label>
+        <span>快递单号</span>
+        <div class="tracking-input-row">
+          <input class="table-input" data-tracking value="${escapeHtml(row.tracking_no)}" placeholder="快递单号" />
+          <button class="btn secondary small" data-copy-tracking type="button" style="${row.tracking_no ? "" : "display: none;"}">复制</button>
+        </div>
+      </label>
+      <label>
+        <span>发货备注</span>
+        <input class="table-input" data-note value="${escapeHtml(row.shipping_note)}" placeholder="可选" />
+      </label>
+    </div>
+  `;
+}
+
+function renderShipmentActions(row) {
+  const editing = shipmentShippingEditing(row);
+  const shippedAt = row.shipped_at ? `<div class="muted mini action-time">${escapeHtml(formatDate(row.shipped_at))}</div>` : "";
+  if (editing) {
+    return `
+      <div class="shipment-actions">
+        <button class="btn primary small" data-save-shipment="${row.id}" type="button">保存</button>
+        ${row.tracking_no ? `<button class="btn ghost small" data-cancel-shipping="${row.id}" type="button">取消</button>` : ""}
+        <button class="btn danger small" data-delete-shipment="${row.id}" data-order-no="${escapeHtml(row.store_order_no)}" type="button">删除</button>
+        ${shippedAt}
+      </div>
+    `;
+  }
+  return `
+    <div class="shipment-actions">
+      <button class="btn secondary small" data-edit-shipping="${row.id}" type="button">编辑</button>
+      ${row.tracking_no ? `<button class="btn secondary small" data-refresh-tracking="${row.id}" type="button">查物流</button>` : ""}
+      <button class="btn danger small" data-delete-shipment="${row.id}" data-order-no="${escapeHtml(row.store_order_no)}" type="button">删除</button>
+      ${shippedAt}
+    </div>
+  `;
+}
+
 function renderShipmentTable(shipments) {
   if (!shipments.length) return `<div class="empty">没有符合条件的发货单</div>`;
   return `
-    <div class="table-wrap">
+    <div class="table-wrap shipments-table">
       <table>
         <thead>
           <tr>
@@ -1413,8 +1505,8 @@ function renderShipmentTable(shipments) {
               (row) => `
                 <tr class="shipment-row ${statusClass(row.status)}" data-shipment="${row.id}">
                   <td>${row.displayIndex || ""}</td>
-                  <td>
-                    <strong>${escapeHtml(shipmentBusinessId(row))}</strong>
+                  <td class="business-cell">
+                    <strong class="business-id">${escapeHtml(shipmentBusinessId(row))}</strong>
                     <div class="muted mini">系统ID ${row.id}</div>
                   </td>
                   <td>${escapeHtml(formatDate(row.created_at))}</td>
@@ -1431,26 +1523,14 @@ function renderShipmentTable(shipments) {
 	                  <td class="items-cell">
 	                    ${renderShipmentItemsWithEditButton(row)}
 	                  </td>
-                  <td>
-                    <select class="table-input" data-status>
-                      ${state.statuses.map((status) => `<option value="${status}" ${status === row.status ? "selected" : ""}>${status}</option>`).join("")}
-                    </select>
+                  <td class="status-cell">
+                    ${renderAdminShipmentStatusCell(row)}
                   </td>
-                  <td>
-                    <select class="table-input" data-company>
-                      ${expressCompanyOptions(row.express_company)}
-                    </select><br />
-                    <div style="display: flex; gap: 6px; align-items: center; margin-top: 6px;">
-                      <input class="table-input" data-tracking value="${escapeHtml(row.tracking_no)}" placeholder="快递单号" style="min-width: 150px; flex: 1;" />
-                      <button class="btn secondary small" data-copy-tracking type="button" style="${row.tracking_no ? "" : "display: none;"}">复制</button>
-                    </div>
-                    <input class="table-input" data-note value="${escapeHtml(row.shipping_note)}" placeholder="发货备注" style="margin-top: 6px;" />
+                  <td class="shipping-cell">
+                    ${renderAdminShipmentShippingCell(row)}
                   </td>
-                  <td>
-                    <button class="btn primary small" data-save-shipment="${row.id}" type="button">保存</button>
-                    ${row.tracking_no ? `<button class="btn secondary small" data-refresh-tracking="${row.id}" type="button" style="margin-top: 8px;">查物流</button>` : ""}
-                    <button class="btn danger small" data-delete-shipment="${row.id}" data-order-no="${escapeHtml(row.store_order_no)}" type="button" style="margin-top: 8px;">删除</button>
-	                    ${row.shipped_at ? `<div class="muted mini" style="margin-top: 8px;">${escapeHtml(formatDate(row.shipped_at))}</div>` : ""}
+                  <td class="actions-cell">
+                    ${renderShipmentActions(row)}
 	                  </td>
 	                </tr>
 	                ${renderShipmentEditRow(row, 10)}
@@ -1503,6 +1583,18 @@ function bindAdmin() {
       toast(error.message);
     }
   });
+  document.querySelectorAll("[data-edit-shipping]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      state.editingShipmentShippingId = Number(event.currentTarget.dataset.editShipping);
+      render();
+    });
+  });
+  document.querySelectorAll("[data-cancel-shipping]").forEach((node) => {
+    node.addEventListener("click", () => {
+      state.editingShipmentShippingId = null;
+      render();
+    });
+  });
   document.querySelectorAll("[data-refresh-tracking]").forEach((node) => {
     node.addEventListener("click", async (event) => {
       const id = event.currentTarget.dataset.refreshTracking;
@@ -1525,8 +1617,9 @@ function bindAdmin() {
   document.querySelectorAll("[data-copy-tracking]").forEach((node) => {
     node.addEventListener("click", async (event) => {
       const row = event.currentTarget.closest("[data-shipment]");
+      const explicitTrackingNo = event.currentTarget.dataset.copyTracking || "";
       try {
-        await copyText(row?.querySelector("[data-tracking]")?.value || "");
+        await copyText(explicitTrackingNo || row?.querySelector("[data-tracking]")?.value || "");
       } catch (error) {
         toast(error.message || "复制失败。");
       }
@@ -1544,6 +1637,7 @@ function bindAdmin() {
       };
       try {
         await api(`/api/shipments/${id}`, { method: "PATCH", body: JSON.stringify(payload) });
+        state.editingShipmentShippingId = null;
         toast("已保存。");
         render();
       } catch (error) {

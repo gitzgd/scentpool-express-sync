@@ -516,7 +516,11 @@ a {
 table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 980px;
+  min-width: 1080px;
+}
+
+.shipments-table table {
+  min-width: 1240px;
 }
 
 th,
@@ -565,14 +569,142 @@ tr:last-child td {
 .table-input {
   min-width: 124px;
   min-height: 32px;
+  width: 100%;
   border: 1px solid #d7d7dd;
   border-radius: 7px;
   padding: 6px 8px;
+  background: #ffffff;
+}
+
+.business-cell {
+  min-width: 170px;
+}
+
+.business-id {
+  display: inline-block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.status-cell {
+  min-width: 108px;
+}
+
+.shipping-cell {
+  min-width: 280px;
+  max-width: 360px;
+}
+
+.actions-cell {
+  min-width: 112px;
 }
 
 .items-cell {
   min-width: 260px;
   max-width: 420px;
+}
+
+.shipping-editor {
+  display: grid;
+  gap: 10px;
+}
+
+.shipping-editor label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.shipping-editor label > span {
+  font-weight: 650;
+}
+
+.tracking-input-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.tracking-panel {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #e4e4ea;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.tracking-panel-head,
+.tracking-number-row,
+.tracking-meta,
+.shipment-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.tracking-panel-head,
+.tracking-number-row {
+  justify-content: space-between;
+}
+
+.tracking-number-row strong {
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.courier-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #eef5ff;
+  color: var(--blue-ink);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.tracking-event,
+.tracking-error,
+.tracking-note {
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.tracking-event {
+  color: #343439;
+}
+
+.tracking-error {
+  color: var(--red);
+}
+
+.tracking-note {
+  color: var(--muted);
+}
+
+.tracking-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.shipment-actions {
+  align-items: stretch;
+  flex-direction: column;
+}
+
+.shipment-actions .btn {
+  justify-content: center;
+}
+
+.action-time {
+  margin-top: 2px;
 }
 
 .item-line {

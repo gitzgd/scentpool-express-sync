@@ -285,6 +285,7 @@ def main() -> None:
         assert body["shipments"][0]["express_company"] == "顺丰"
         assert body["shipments"][0]["tracking_no"] == "SF123456"
         created_date = body["shipments"][0]["created_at"][:10]
+        store_code = f"S{int(body['shipments'][0]['store_id']):02d}"
 
         def fake_query_tracking(_shipment):
             return {
@@ -354,7 +355,7 @@ def main() -> None:
         assert len(body["shipments"]) == 1
         assert body["shipments"][0]["tracking_no"] == "SF123456"
 
-        business_id = f"{created_date.replace('-', '')}-ORDER-SMOKE-001"
+        business_id = f"{created_date.replace('-', '')}-{store_code}-ORDER-SMOKE-001"
         status, body = request(admin, base, "GET", f"/api/shipments?q={quote(business_id)}")
         assert status == 200, body
         assert len(body["shipments"]) == 1

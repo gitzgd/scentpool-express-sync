@@ -44,12 +44,15 @@ def local_day_end(date_text: str) -> str:
     return datetime.fromisoformat(f"{date_text}T23:59:59").replace(tzinfo=APP_TZ).isoformat(timespec="seconds")
 
 
-def business_search_parts(query: str) -> Optional[tuple[str, str]]:
+def business_search_parts(query: str) -> Optional[tuple[str, Optional[int], str]]:
     text = str(query or "").strip()
+    match = re.match(r"^(\d{4})-?(\d{2})-?(\d{2})[-_\s]+[sS](\d+)[-_\s]+(.+)$", text)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}-{match.group(3)}", int(match.group(4)), match.group(5).strip()
     match = re.match(r"^(\d{4})-?(\d{2})-?(\d{2})[-_\s]+(.+)$", text)
     if not match:
         return None
-    return f"{match.group(1)}-{match.group(2)}-{match.group(3)}", match.group(4).strip()
+    return f"{match.group(1)}-{match.group(2)}-{match.group(3)}", None, match.group(4).strip()
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -212,6 +215,7 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_return_orders_store ON return_orders(store_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_return_orders_created ON return_orders(created_at)")
             self._ensure_shipment_tracking_columns(conn)
+            self._normalize_shipments_with_tracking(conn)
             self._seed_defaults(conn, production=production, admin_password=admin_password)
 
         if self.count_products() == 0 and os.path.exists(product_file):
@@ -278,6 +282,21 @@ class Database:
         for name, definition in columns.items():
             if name not in existing:
                 conn.execute(f"ALTER TABLE shipments ADD COLUMN {name} {definition}")
+
+    def _normalize_shipments_with_tracking(self, conn: sqlite3.Connection) -> None:
+        now = now_text()
+        conn.execute(
+            """
+            UPDATE shipments
+            SET status = '已发货',
+                express_company = CASE WHEN express_company = '' THEN ? ELSE express_company END,
+                shipped_at = CASE WHEN shipped_at = '' THEN updated_at ELSE shipped_at END,
+                tracking_status = CASE WHEN tracking_status = '' THEN '待查询' ELSE tracking_status END,
+                updated_at = ?
+            WHERE status = '待处理' AND tracking_no <> ''
+            """,
+            (DEFAULT_EXPRESS_COMPANY, now),
+        )
 
     def database_summary(self) -> Dict[str, int]:
         with self.connect() as conn:
@@ -649,22 +668,52 @@ class Database:
             q = f"%{query_text}%"
             business_parts = business_search_parts(query_text)
             if business_parts:
-                date_text, order_text = business_parts
-                where.append(
-                    """
-                    (
-                        shipments.store_order_no LIKE ? OR shipments.recipient_name LIKE ? OR
-                        shipments.phone LIKE ? OR shipments.tracking_no LIKE ? OR
-                        shipments.address LIKE ? OR
+                date_text, business_store_id, order_text = business_parts
+                if business_store_id is not None:
+                    where.append(
+                        """
                         (
-                            datetime(shipments.created_at) >= datetime(?) AND
-                            datetime(shipments.created_at) <= datetime(?) AND
-                            shipments.store_order_no LIKE ?
+                            shipments.store_order_no LIKE ? OR shipments.recipient_name LIKE ? OR
+                            shipments.phone LIKE ? OR shipments.tracking_no LIKE ? OR
+                            shipments.address LIKE ? OR
+                            (
+                                datetime(shipments.created_at) >= datetime(?) AND
+                                datetime(shipments.created_at) <= datetime(?) AND
+                                shipments.store_id = ? AND
+                                shipments.store_order_no LIKE ?
+                            )
                         )
+                        """
                     )
-                    """
-                )
-                params.extend([q, q, q, q, q, local_day_start(date_text), local_day_end(date_text), f"%{order_text}%"])
+                    params.extend(
+                        [
+                            q,
+                            q,
+                            q,
+                            q,
+                            q,
+                            local_day_start(date_text),
+                            local_day_end(date_text),
+                            business_store_id,
+                            f"%{order_text}%",
+                        ]
+                    )
+                else:
+                    where.append(
+                        """
+                        (
+                            shipments.store_order_no LIKE ? OR shipments.recipient_name LIKE ? OR
+                            shipments.phone LIKE ? OR shipments.tracking_no LIKE ? OR
+                            shipments.address LIKE ? OR
+                            (
+                                datetime(shipments.created_at) >= datetime(?) AND
+                                datetime(shipments.created_at) <= datetime(?) AND
+                                shipments.store_order_no LIKE ?
+                            )
+                        )
+                        """
+                    )
+                    params.extend([q, q, q, q, q, local_day_start(date_text), local_day_end(date_text), f"%{order_text}%"])
             else:
                 where.append(
                     """
@@ -787,7 +836,8 @@ class Database:
             if not existing:
                 raise AppError("发货单不存在。", 404)
 
-        if status == "待处理" and existing["status"] == "待处理" and tracking_no:
+        auto_shipped = status == "待处理" and tracking_no
+        if auto_shipped:
             status = "已发货"
         if status in {"已发货", "已签收"} and not shipped_at:
             shipped_at = existing["shipped_at"] or now
@@ -803,7 +853,8 @@ class Database:
         tracking_signed_at = existing["tracking_signed_at"]
         tracking_error = existing["tracking_error"]
         tracking_raw = existing["tracking_raw"]
-        if tracking_changed and status == "已发货" and tracking_no:
+        tracking_reset = (tracking_changed or auto_shipped) and status == "已发货" and tracking_no
+        if tracking_reset:
             tracking_provider = ""
             tracking_status = "待查询"
             tracking_state_code = ""
@@ -848,7 +899,12 @@ class Database:
             )
             if cursor.rowcount == 0:
                 raise AppError("发货单不存在。", 404)
-        return {"id": shipment_id, "status": status, "tracking_changed": tracking_changed, "should_refresh_tracking": status == "已发货" and tracking_no and tracking_changed}
+        return {
+            "id": shipment_id,
+            "status": status,
+            "tracking_changed": tracking_changed,
+            "should_refresh_tracking": tracking_reset,
+        }
 
     def delete_shipment(self, shipment_id: int) -> Dict[str, Any]:
         with self.connect() as conn:
