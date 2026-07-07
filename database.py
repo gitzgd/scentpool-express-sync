@@ -7,6 +7,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+from zoneinfo import ZoneInfo
 
 from xlsx_importer import XlsxImportError, read_products
 
@@ -20,6 +21,7 @@ DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "scentpool2026"
 DEFAULT_STORE_USERNAME = "store01"
 DEFAULT_STORE_PASSWORD = "scentpool2026"
+APP_TZ = ZoneInfo("Asia/Shanghai")
 
 
 class AppError(Exception):
@@ -30,7 +32,15 @@ class AppError(Exception):
 
 
 def now_text() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+    return datetime.now(APP_TZ).isoformat(timespec="seconds")
+
+
+def local_day_start(date_text: str) -> str:
+    return datetime.fromisoformat(f"{date_text}T00:00:00").replace(tzinfo=APP_TZ).isoformat(timespec="seconds")
+
+
+def local_day_end(date_text: str) -> str:
+    return datetime.fromisoformat(f"{date_text}T23:59:59").replace(tzinfo=APP_TZ).isoformat(timespec="seconds")
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -343,7 +353,7 @@ class Database:
     def create_session(self, user_id: int) -> str:
         token = secrets.token_urlsafe(32)
         now = now_text()
-        expires = (datetime.now().astimezone() + timedelta(days=14)).isoformat(timespec="seconds")
+        expires = (datetime.now(APP_TZ) + timedelta(days=14)).isoformat(timespec="seconds")
         with self.connect() as conn:
             conn.execute(
                 "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
@@ -372,7 +382,7 @@ class Database:
             if not row:
                 return None
             try:
-                if datetime.fromisoformat(row["expires_at"]) < datetime.now().astimezone():
+                if datetime.fromisoformat(row["expires_at"]) < datetime.now(APP_TZ):
                     conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
                     return None
             except ValueError:
@@ -620,11 +630,11 @@ class Database:
             where.append("shipments.status = ?")
             params.append(filters["status"])
         if filters.get("date_from"):
-            where.append("date(shipments.created_at) >= date(?)")
-            params.append(filters["date_from"])
+            where.append("datetime(shipments.created_at) >= datetime(?)")
+            params.append(local_day_start(str(filters["date_from"])))
         if filters.get("date_to"):
-            where.append("date(shipments.created_at) <= date(?)")
-            params.append(filters["date_to"])
+            where.append("datetime(shipments.created_at) <= datetime(?)")
+            params.append(local_day_end(str(filters["date_to"])))
         if filters.get("q"):
             q = f"%{filters['q']}%"
             where.append(
@@ -748,19 +758,31 @@ class Database:
             if not existing:
                 raise AppError("发货单不存在。", 404)
 
+        if status == "待处理" and existing["status"] == "待处理" and tracking_no:
+            status = "已发货"
         if status in {"已发货", "已签收"} and not shipped_at:
             shipped_at = existing["shipped_at"] or now
         if status not in {"已发货", "已签收"}:
             shipped_at = ""
 
         tracking_changed = tracking_no != existing["tracking_no"] or express_company != existing["express_company"]
+        tracking_provider = existing["tracking_provider"]
         tracking_status = existing["tracking_status"]
+        tracking_state_code = existing["tracking_state_code"]
+        tracking_last_event = existing["tracking_last_event"]
+        tracking_last_checked_at = existing["tracking_last_checked_at"]
         tracking_signed_at = existing["tracking_signed_at"]
         tracking_error = existing["tracking_error"]
+        tracking_raw = existing["tracking_raw"]
         if tracking_changed and status == "已发货" and tracking_no:
+            tracking_provider = ""
             tracking_status = "待查询"
+            tracking_state_code = ""
+            tracking_last_event = ""
+            tracking_last_checked_at = ""
             tracking_signed_at = ""
             tracking_error = ""
+            tracking_raw = ""
         if status == "已签收":
             tracking_status = "已签收"
             tracking_signed_at = tracking_signed_at or now
@@ -771,8 +793,10 @@ class Database:
                 """
                 UPDATE shipments
                 SET status = ?, express_company = ?, tracking_no = ?, shipping_note = ?,
-                    shipped_at = ?, tracking_status = ?, tracking_signed_at = ?,
-                    tracking_error = ?, updated_at = ?
+                    shipped_at = ?, tracking_provider = ?, tracking_status = ?,
+                    tracking_state_code = ?, tracking_last_event = ?,
+                    tracking_last_checked_at = ?, tracking_signed_at = ?,
+                    tracking_error = ?, tracking_raw = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -781,16 +805,21 @@ class Database:
                     tracking_no,
                     shipping_note,
                     shipped_at,
+                    tracking_provider,
                     tracking_status,
+                    tracking_state_code,
+                    tracking_last_event,
+                    tracking_last_checked_at,
                     tracking_signed_at,
                     tracking_error,
+                    tracking_raw,
                     now,
                     shipment_id,
                 ),
             )
             if cursor.rowcount == 0:
                 raise AppError("发货单不存在。", 404)
-        return {"id": shipment_id}
+        return {"id": shipment_id, "status": status, "tracking_changed": tracking_changed, "should_refresh_tracking": status == "已发货" and tracking_no and tracking_changed}
 
     def delete_shipment(self, shipment_id: int) -> Dict[str, Any]:
         with self.connect() as conn:
@@ -897,11 +926,11 @@ class Database:
             where.append("return_orders.status = ?")
             params.append(filters["status"])
         if filters.get("date_from"):
-            where.append("date(return_orders.created_at) >= date(?)")
-            params.append(filters["date_from"])
+            where.append("datetime(return_orders.created_at) >= datetime(?)")
+            params.append(local_day_start(str(filters["date_from"])))
         if filters.get("date_to"):
-            where.append("date(return_orders.created_at) <= date(?)")
-            params.append(filters["date_to"])
+            where.append("datetime(return_orders.created_at) <= datetime(?)")
+            params.append(local_day_end(str(filters["date_to"])))
         if filters.get("q"):
             q = f"%{filters['q']}%"
             where.append(

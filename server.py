@@ -20,8 +20,8 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, quote, urlparse
 from xml.sax.saxutils import escape as xml_escape
 
-from database import AppError, Database, DEFAULT_PRODUCT_FILE, RETURN_STATUSES, STATUSES
-from tracking import query_tracking, tracking_auto_enabled, tracking_config_public, tracking_env_diagnostics, tracking_interval_minutes, tracking_stale_before
+from database import AppError, Database, DEFAULT_PRODUCT_FILE, RETURN_STATUSES, STATUSES, now_text
+from tracking import manual_refresh_stale_before, query_tracking, tracking_auto_enabled, tracking_config_public, tracking_interval_minutes, tracking_stale_before
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -222,7 +222,7 @@ def export_date_part(query: Dict[str, str]) -> str:
         return safe_filename_part(f"{date_from}起")
     if date_to:
         return safe_filename_part(f"至{date_to}")
-    return datetime.now().astimezone().strftime("%Y-%m-%d")
+    return local_now().strftime("%Y-%m-%d")
 
 
 def export_filename(query: Dict[str, str], shipments: Any, extension: str) -> str:
@@ -237,6 +237,10 @@ def env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def local_now() -> datetime:
+    return datetime.fromisoformat(now_text())
+
+
 def return_tracking_interval_minutes() -> int:
     raw = os.environ.get("SCENTPOOL_RETURN_TRACKING_INTERVAL_MINUTES", "720").strip()
     try:
@@ -249,13 +253,13 @@ def return_tracking_interval_minutes() -> int:
 def return_tracking_stale_before() -> str:
     from datetime import timedelta
 
-    return (datetime.now().astimezone() - timedelta(minutes=return_tracking_interval_minutes())).isoformat(timespec="seconds")
+    return (local_now() - timedelta(minutes=return_tracking_interval_minutes())).isoformat(timespec="seconds")
 
 
 def save_database_backup() -> Path:
     backup_dir = Path(DB.path).parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
-    backup_path = backup_dir / f"scentpool-before-restore-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}.db"
+    backup_path = backup_dir / f"scentpool-before-restore-{local_now().strftime('%Y%m%d-%H%M%S')}.db"
     backup_path.write_bytes(DB.backup_bytes())
     return backup_path
 
@@ -300,11 +304,11 @@ def refresh_tracking_for_shipment(shipment: Dict[str, Any]) -> Dict[str, Any]:
         result = query_tracking(shipment)
     except AppError as exc:
         result = {
-            "provider": "kdniao",
+            "provider": "kuaidi100",
             "tracking_status": "查询失败",
             "state_code": "",
             "last_event": shipment.get("tracking_last_event") or "",
-            "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "checked_at": now_text(),
             "signed_at": "",
             "error": exc.message,
             "raw": "",
@@ -318,17 +322,32 @@ def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
         result = query_tracking(return_order)
     except AppError as exc:
         result = {
-            "provider": "kdniao",
+            "provider": "kuaidi100",
             "tracking_status": "查询失败",
             "state_code": "",
             "last_event": return_order.get("tracking_last_event") or "",
-            "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "checked_at": now_text(),
             "signed_at": "",
             "error": exc.message,
             "raw": "",
             "is_signed": False,
         }
     return DB.apply_return_tracking_result(int(return_order["id"]), result)
+
+
+def recently_checked(row: Dict[str, Any]) -> bool:
+    checked_at = str(row.get("tracking_last_checked_at") or "").strip()
+    if not checked_at:
+        return False
+    try:
+        return datetime.fromisoformat(checked_at) > datetime.fromisoformat(manual_refresh_stale_before())
+    except ValueError:
+        return False
+
+
+def require_manual_tracking_allowed(row: Dict[str, Any]) -> None:
+    if recently_checked(row):
+        raise AppError("该单号 30 分钟内已查询过，请稍后再试，避免快递100锁单。", 429)
 
 
 def sync_tracking_batch(*, force: bool = False, limit: int = 20) -> Dict[str, Any]:
@@ -493,7 +512,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/admin/backup.db" and self.command == "GET":
             self.require_admin(user)
-            filename = f"scentpool-backup-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}.db"
+            filename = f"scentpool-backup-{local_now().strftime('%Y%m%d-%H%M%S')}.db"
             self.send_bytes(
                 DB.backup_bytes(),
                 "application/octet-stream",
@@ -517,11 +536,6 @@ class Handler(BaseHTTPRequestHandler):
             config = tracking_config_public()
             config["return_interval_minutes"] = return_tracking_interval_minutes()
             self.send_json({"tracking": config})
-            return
-
-        if path == "/api/admin/tracking/diagnostics" and self.command == "GET":
-            self.require_admin(user)
-            self.send_json({"tracking": tracking_env_diagnostics(reveal_secrets=query.get("reveal") == "1")})
             return
 
         if path == "/api/admin/tracking/sync" and self.command == "POST":
@@ -551,6 +565,7 @@ class Handler(BaseHTTPRequestHandler):
             self.require_admin(user)
             shipment_id = int(path.split("/")[3])
             shipment = DB.get_shipment(shipment_id, user)
+            require_manual_tracking_allowed(shipment)
             refresh_tracking_for_shipment(shipment)
             self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
             return
@@ -564,8 +579,12 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/shipments/") and self.command == "PATCH":
             self.require_admin(user)
             shipment_id = int(path.rsplit("/", 1)[-1])
-            DB.update_shipment(shipment_id, self.read_json())
-            self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
+            update_result = DB.update_shipment(shipment_id, self.read_json())
+            shipment = DB.get_shipment(shipment_id, user)
+            if update_result.get("should_refresh_tracking"):
+                refresh_tracking_for_shipment(shipment)
+                shipment = DB.get_shipment(shipment_id, user)
+            self.send_json({"shipment": shipment})
             return
 
         if path.startswith("/api/shipments/") and self.command == "DELETE":
@@ -586,6 +605,7 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/returns/") and path.endswith("/tracking/refresh") and self.command == "POST":
             return_id = int(path.split("/")[3])
             return_order = DB.get_return_order(return_id, user)
+            require_manual_tracking_allowed(return_order)
             refresh_tracking_for_return(return_order)
             self.send_json({"return_order": DB.get_return_order(return_id, user)})
             return
@@ -674,7 +694,7 @@ class Handler(BaseHTTPRequestHandler):
                     "products": summary["products"],
                     "shipments": summary["shipments"],
                     "returns": summary["returns"],
-                    "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    "time": now_text(),
                 }
             )
         except Exception as exc:

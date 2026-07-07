@@ -46,15 +46,26 @@ function statusClass(status) {
 
 function trackingClass(status) {
   if (status === "已签收") return "signed";
-  if (status === "查询失败" || status === "问题件") return "exception";
+  if (status === "查询失败" || status === "问题件" || status === "退签" || status === "退回" || status === "拒签") return "exception";
   if (status === "待查询" || status === "无轨迹") return "pending";
-  if (status === "已揽收" || status === "运输中" || status === "转寄") return "shipped";
+  if (status === "已揽收" || status === "运输中" || status === "转寄" || status === "转投" || status === "派件中" || status === "清关") return "shipped";
   return "";
 }
 
 function formatDate(value) {
   if (!value) return "";
-  return String(value).replace("T", " ").replace(/\+\d\d:\d\d$/, "");
+  const raw = String(value);
+  const normalized = raw.includes("T") ? raw : raw.replace(" ", "T");
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) {
+    return raw.replace("T", " ").replace(/\+\d\d:\d\d$/, "");
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hour = String(date.getHours()).padStart(2, "0");
+  const minute = String(date.getMinutes()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hour}:${minute}`;
 }
 
 function localDate(offsetDays = 0) {
@@ -89,6 +100,28 @@ function toast(message) {
   node.textContent = message;
   document.body.appendChild(node);
   setTimeout(() => node.remove(), 3200);
+}
+
+async function copyText(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    toast("没有可复制的快递单号。");
+    return;
+  }
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+  } else {
+    const input = document.createElement("textarea");
+    input.value = text;
+    input.style.position = "fixed";
+    input.style.opacity = "0";
+    document.body.appendChild(input);
+    input.focus();
+    input.select();
+    document.execCommand("copy");
+    input.remove();
+  }
+  toast("已复制快递单号。");
 }
 
 async function api(path, options = {}) {
@@ -1339,7 +1372,10 @@ function renderShipmentTable(shipments) {
                     <select class="table-input" data-company>
                       ${expressCompanyOptions(row.express_company)}
                     </select><br />
-                    <input class="table-input" data-tracking value="${escapeHtml(row.tracking_no)}" placeholder="快递单号" style="margin-top: 6px;" /><br />
+                    <div style="display: flex; gap: 6px; align-items: center; margin-top: 6px;">
+                      <input class="table-input" data-tracking value="${escapeHtml(row.tracking_no)}" placeholder="快递单号" style="min-width: 150px; flex: 1;" />
+                      <button class="btn secondary small" data-copy-tracking type="button" style="${row.tracking_no ? "" : "display: none;"}">复制</button>
+                    </div>
                     <input class="table-input" data-note value="${escapeHtml(row.shipping_note)}" placeholder="发货备注" style="margin-top: 6px;" />
                   </td>
                   <td>
@@ -1408,6 +1444,23 @@ function bindAdmin() {
         render();
       } catch (error) {
         toast(error.message);
+      }
+    });
+  });
+  document.querySelectorAll("[data-tracking]").forEach((node) => {
+    node.addEventListener("input", (event) => {
+      const row = event.currentTarget.closest("[data-shipment]");
+      const button = row?.querySelector("[data-copy-tracking]");
+      if (button) button.style.display = event.currentTarget.value.trim() ? "" : "none";
+    });
+  });
+  document.querySelectorAll("[data-copy-tracking]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const row = event.currentTarget.closest("[data-shipment]");
+      try {
+        await copyText(row?.querySelector("[data-tracking]")?.value || "");
+      } catch (error) {
+        toast(error.message || "复制失败。");
       }
     });
   });

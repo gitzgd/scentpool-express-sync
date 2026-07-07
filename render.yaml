@@ -21,20 +21,18 @@ services:
       - key: SCENTPOOL_ALLOW_DB_RESTORE
         value: "0"
       - key: SCENTPOOL_TRACKING_PROVIDER
-        value: kdniao
+        value: kuaidi100
       - key: SCENTPOOL_TRACKING_AUTO
         value: "1"
       - key: SCENTPOOL_TRACKING_INTERVAL_MINUTES
-        value: "1440"
+        value: "360"
       - key: SCENTPOOL_RETURN_TRACKING_INTERVAL_MINUTES
         value: "720"
-      - key: SCENTPOOL_KDNIAO_ENDPOINT
-        value: https://api.kdniao.com/api/dist
-      - key: SCENTPOOL_KDNIAO_REQUEST_TYPE
-        value: "8002"
-      - key: SCENTPOOL_KDNIAO_EBUSINESS_ID
+      - key: SCENTPOOL_KUAIDI100_ENDPOINT
+        value: https://poll.kuaidi100.com/poll/query.do
+      - key: SCENTPOOL_KUAIDI100_CUSTOMER
         sync: false
-      - key: SCENTPOOL_KDNIAO_APP_KEY
+      - key: SCENTPOOL_KUAIDI100_KEY
         sync: false
     disk:
       name: scentpool-data

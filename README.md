@@ -28,14 +28,13 @@ python3 server.py --host 0.0.0.0 --port 8765
 - `SCENTPOOL_SESSION_SECURE=1`：Cookie 增加 `Secure`。
 - `SCENTPOOL_ADMIN_PASSWORD`：生产首次启动且没有迁移数据库时，用它创建总部账号。
 - `SCENTPOOL_ALLOW_DB_RESTORE=1`：临时开启数据库恢复接口，恢复完成后应改回 `0`。
-- `SCENTPOOL_TRACKING_PROVIDER=kdniao`：物流查询服务商。
+- `SCENTPOOL_TRACKING_PROVIDER=kuaidi100`：物流查询服务商。
 - `SCENTPOOL_TRACKING_AUTO=1`：开启自动物流查询。
-- `SCENTPOOL_TRACKING_INTERVAL_MINUTES=1440`：发货单自动查询间隔，默认 1 天。
+- `SCENTPOOL_TRACKING_INTERVAL_MINUTES=360`：发货单自动查询间隔，默认 6 小时。
 - `SCENTPOOL_RETURN_TRACKING_INTERVAL_MINUTES=720`：退货单自动查询间隔，默认 12 小时。
-- `SCENTPOOL_KDNIAO_ENDPOINT=https://api.kdniao.com/api/dist`：快递鸟“快递查询”接口地址。
-- `SCENTPOOL_KDNIAO_REQUEST_TYPE=8002`：快递鸟“快递查询”接口指令。
-- `SCENTPOOL_KDNIAO_EBUSINESS_ID`：快递鸟用户 ID，只放 Render 环境变量。
-- `SCENTPOOL_KDNIAO_APP_KEY`：快递鸟 API Key，只放 Render 环境变量。
+- `SCENTPOOL_KUAIDI100_ENDPOINT=https://poll.kuaidi100.com/poll/query.do`：快递100实时查询接口地址。
+- `SCENTPOOL_KUAIDI100_CUSTOMER`：快递100 customer，只放 Render 环境变量。
+- `SCENTPOOL_KUAIDI100_KEY`：快递100 key，只放 Render 环境变量。
 
 ## 发布到 Render
 
@@ -85,16 +84,14 @@ curl -b cookie.txt -c cookie.txt \
 
 ## 物流查询
 
-总部把订单保存为“已发货”并填写快递公司、快递单号后，系统会把订单标记为待查询。开启快递鸟环境变量后，后台使用快递鸟“快递查询”接口（`RequestType=8002`，`https://api.kdniao.com/api/dist`）每天查询一次未签收发货单；退货单默认每 12 小时查询一次。总部也可以在发货后台点击“同步物流”，或在退货看板点击“同步退货物流”手动刷新。
+总部在发货后台为待处理订单填写快递单号后，系统会自动改为“已发货”并立即查询一次物流。开启快递100环境变量后，后台使用快递100实时查询接口（`https://poll.kuaidi100.com/poll/query.do`）每 6 小时查询一次未签收发货单；退货单默认每 12 小时查询一次。总部也可以在发货后台点击“同步物流”，或在退货看板点击“同步退货物流”手动刷新。
 
-总部登录后可以打开 `/api/admin/tracking/diagnostics` 查看 Render 实际读取到的快递鸟环境变量诊断信息。页面会显示 `EBusinessID` 明文、`API Key` 的首尾掩码、长度、SHA256 指纹和空格/格式检查。需要临时查看完整 API Key 原文时，打开 `/api/admin/tracking/diagnostics?reveal=1`。
-
-快递鸟返回签收后，系统会自动更新：
+快递100返回签收后，系统会自动更新：
 
 ```text
 订单状态：已签收
 物流状态：已签收
-签收时间：快递鸟最新签收轨迹时间
+签收时间：快递100最新签收轨迹时间
 ```
 
 问题件只会显示为“问题件”，不会自动改成“异常”，避免误判影响订单。

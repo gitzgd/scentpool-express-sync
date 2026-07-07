@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import os
@@ -82,11 +83,10 @@ def request_multipart(opener, base, method, path, field_name, file_path):
 
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        os.environ["SCENTPOOL_KDNIAO_EBUSINESS_ID"] = " 1926656 "
-        os.environ["SCENTPOOL_KDNIAO_APP_KEY"] = " 11111111-2222-3333-4444-555555555555 "
-        assert tracking.KDNIAO_ENDPOINT == "https://api.kdniao.com/api/dist"
-        assert tracking.KDNIAO_REQUEST_TYPE_TRACK == "8002"
-        assert tracking.KDNIAO_DATA_TYPE == "2"
+        os.environ["SCENTPOOL_TRACKING_PROVIDER"] = "kuaidi100"
+        os.environ["SCENTPOOL_KUAIDI100_CUSTOMER"] = " test-customer "
+        os.environ["SCENTPOOL_KUAIDI100_KEY"] = " test-key "
+        assert tracking.KUAIDI100_ENDPOINT == "https://poll.kuaidi100.com/poll/query.do"
         original_urlopen = tracking.urllib.request.urlopen
         captured = {}
 
@@ -98,7 +98,15 @@ def main() -> None:
                 return False
 
             def read(self):
-                return b'{"Success":true,"State":"0","Traces":[]}'
+                return json.dumps(
+                    {
+                        "status": "200",
+                        "state": "0",
+                        "ischeck": "0",
+                        "data": [{"ftime": "2026-07-07 12:00:00", "context": "快件运输中"}],
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
 
         def fake_urlopen(request, timeout=0):
             captured["url"] = request.full_url
@@ -108,15 +116,16 @@ def main() -> None:
 
         try:
             tracking.urllib.request.urlopen = fake_urlopen
-            tracking.KdniaoClient("test-id", "test-key").query({"express_company": "圆通", "tracking_no": "YT123456"})
+            tracking.Kuaidi100Client("test-customer", "test-key").query({"express_company": "圆通", "tracking_no": "YT123456"})
         finally:
             tracking.urllib.request.urlopen = original_urlopen
         params = urllib.parse.parse_qs(captured["payload"])
-        request_data = json.loads(params["RequestData"][0])
-        assert captured["url"] == "https://api.kdniao.com/api/dist"
-        assert params["RequestType"][0] == "8002"
-        assert params["DataType"][0] == "2"
-        assert request_data == {"LogisticCode": "YT123456"}
+        request_data = json.loads(params["param"][0])
+        expected_sign = hashlib.md5(f"{params['param'][0]}test-keytest-customer".encode("utf-8")).hexdigest().upper()
+        assert captured["url"] == "https://poll.kuaidi100.com/poll/query.do"
+        assert params["customer"][0] == "test-customer"
+        assert params["sign"][0] == expected_sign
+        assert request_data == {"com": "yuantong", "num": "YT123456", "resultv2": "1", "show": "0", "order": "desc"}
 
         db_path = str(Path(tmp) / "test.db")
         server.DB = Database(db_path)
@@ -148,23 +157,12 @@ def main() -> None:
         assert status == 200, body
         assert body["user"]["role"] == "admin"
 
-        status, body = request(admin, base, "GET", "/api/admin/tracking/diagnostics")
+        status, body = request(admin, base, "GET", "/api/admin/tracking/config")
         assert status == 200, body
-        assert body["tracking"]["request_type"] == "8002"
-        assert body["tracking"]["data_type"] == "2"
-        assert body["tracking"]["business_id"]["trimmed_value"] == "1926656"
-        assert body["tracking"]["business_id"]["leading_or_trailing_whitespace"] is True
-        assert body["tracking"]["business_id"]["digits_only"] is True
-        assert body["tracking"]["app_key"]["trimmed_length"] == 36
-        assert body["tracking"]["app_key"]["looks_uuid"] is True
-        assert "11111111-2222-3333-4444-555555555555" not in json.dumps(body)
-
-        status, body = request(admin, base, "GET", "/api/admin/tracking/diagnostics?reveal=1")
-        assert status == 200, body
-        assert body["tracking"]["secrets_revealed"] is True
-        assert body["tracking"]["business_id"]["raw_value"] == " 1926656 "
-        assert body["tracking"]["app_key"]["raw_value"] == " 11111111-2222-3333-4444-555555555555 "
-        assert body["tracking"]["app_key"]["trimmed_value"] == "11111111-2222-3333-4444-555555555555"
+        assert body["tracking"]["provider"] == "kuaidi100"
+        assert body["tracking"]["configured"] is True
+        assert body["tracking"]["customer"] == "test...omer"
+        assert body["tracking"]["endpoint"] == "https://poll.kuaidi100.com/poll/query.do"
 
         status, body = request(admin, base, "GET", "/api/products?all=1")
         assert status == 200, body
@@ -186,7 +184,7 @@ def main() -> None:
         assert status == 200, body
         assert body["user"]["role"] == "staff"
 
-        status, body = request(staff, base, "GET", "/api/admin/tracking/diagnostics")
+        status, body = request(staff, base, "GET", "/api/admin/tracking/config")
         assert status == 403, body
 
         status, body = request(staff, base, "GET", "/shipments")
@@ -239,13 +237,27 @@ def main() -> None:
         assert len(body["shipment"]["items"]) == 2
         assert body["shipment"]["items"][0]["quantity"] == 2
 
+        def fake_in_transit(_shipment):
+            return {
+                "provider": "kuaidi100",
+                "tracking_status": "运输中",
+                "state_code": "0",
+                "last_event": "2026-07-07 12:00:00 快件运输中",
+                "checked_at": "2026-07-07T12:05:00+08:00",
+                "signed_at": "",
+                "error": "",
+                "raw": "{}",
+                "is_signed": False,
+            }
+
+        server.query_tracking = fake_in_transit
         status, body = request(
             admin,
             base,
             "PATCH",
             f"/api/shipments/{shipment_id}",
             {
-                "status": "已发货",
+                "status": "待处理",
                 "express_company": "顺丰",
                 "tracking_no": "SF123456",
                 "shipping_note": "已交接",
@@ -255,6 +267,7 @@ def main() -> None:
         assert body["shipment"]["status"] == "已发货"
         assert body["shipment"]["tracking_no"] == "SF123456"
         assert body["shipment"]["express_company"] == "顺丰"
+        assert body["shipment"]["tracking_status"] == "运输中"
 
         status, body = request(
             staff,
@@ -275,7 +288,7 @@ def main() -> None:
 
         def fake_query_tracking(_shipment):
             return {
-                "provider": "kdniao",
+                "provider": "kuaidi100",
                 "tracking_status": "已签收",
                 "state_code": "3",
                 "last_event": f"{created_date} 12:00:00 已签收",
@@ -287,11 +300,14 @@ def main() -> None:
             }
 
         server.query_tracking = fake_query_tracking
-        status, body = request(admin, base, "POST", f"/api/shipments/{shipment_id}/tracking/refresh", {})
+        status, body = request(admin, base, "POST", "/api/admin/tracking/sync", {"force": True, "limit": 5})
         assert status == 200, body
-        assert body["shipment"]["status"] == "已签收"
-        assert body["shipment"]["tracking_status"] == "已签收"
-        assert body["shipment"]["tracking_signed_at"]
+        assert body["result"]["signed"] == 1
+        status, body = request(admin, base, "GET", "/api/shipments?q=ORDER-SMOKE-001")
+        assert status == 200, body
+        assert body["shipments"][0]["status"] == "已签收"
+        assert body["shipments"][0]["tracking_status"] == "已签收"
+        assert body["shipments"][0]["tracking_signed_at"]
 
         status, body = request(staff, base, "GET", "/returns/new")
         assert status == 200
