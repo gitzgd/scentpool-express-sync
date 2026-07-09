@@ -529,6 +529,16 @@ class Database:
             product = conn.execute("SELECT * FROM products WHERE barcode = ?", (barcode,)).fetchone()
         return dict(product)
 
+    def delete_product(self, barcode: str) -> Dict[str, Any]:
+        barcode = str(barcode or "").strip()
+        if not barcode:
+            raise AppError("商品条码不能为空。")
+        with self.connect() as conn:
+            cursor = conn.execute("DELETE FROM products WHERE barcode = ?", (barcode,))
+            if cursor.rowcount == 0:
+                raise AppError("商品不存在。", 404)
+        return {"barcode": barcode, "deleted": True}
+
     def grouped_products(self) -> Dict[str, List[Dict[str, Any]]]:
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for product in self.list_products(active_only=True):

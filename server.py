@@ -17,7 +17,7 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from xml.sax.saxutils import escape as xml_escape
 
 from database import AppError, Database, DEFAULT_PRODUCT_FILE, RETURN_STATUSES, STATUSES, now_text
@@ -497,6 +497,12 @@ class Handler(BaseHTTPRequestHandler):
             self.require_admin(user)
             product = DB.upsert_product(self.read_json())
             self.send_json({"product": product, "products": DB.list_products(active_only=False)}, status=201)
+            return
+
+        if path.startswith("/api/products/") and self.command == "DELETE":
+            self.require_admin(user)
+            barcode = unquote(path.split("/", 3)[-1])
+            self.send_json({"product": DB.delete_product(barcode), "products": DB.list_products(active_only=False)})
             return
 
         if path == "/api/products/import" and self.command == "POST":

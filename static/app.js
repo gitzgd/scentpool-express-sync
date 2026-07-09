@@ -1977,7 +1977,7 @@ function renderProductsTable(products) {
   return `
     <div class="table-wrap">
       <table>
-        <thead><tr><th>分类</th><th>货品名称</th><th>条码</th><th>售价</th><th>状态</th><th>更新时间</th></tr></thead>
+        <thead><tr><th>分类</th><th>货品名称</th><th>条码</th><th>售价</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
         <tbody>
           ${products
             .map(
@@ -1989,6 +1989,7 @@ function renderProductsTable(products) {
                   <td>¥${escapeHtml(product.price)}</td>
                   <td><span class="status ${product.status === "启用" ? "shipped" : "cancelled"}">${escapeHtml(product.status)}</span></td>
                   <td>${escapeHtml(formatDate(product.updated_at))}</td>
+                  <td><button class="btn danger small" data-delete-product="${escapeHtml(product.barcode)}" data-product-name="${escapeHtml(product.name)}" type="button">删除</button></td>
                 </tr>
               `
             )
@@ -2055,6 +2056,22 @@ function bindProducts() {
     } catch (error) {
       toast(error.message);
     }
+  });
+  document.querySelectorAll("[data-delete-product]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const barcode = event.currentTarget.dataset.deleteProduct;
+      const name = event.currentTarget.dataset.productName || barcode;
+      if (!confirm(`确认删除商品「${name}」？删除后门店点菜单将不再显示该商品。`)) return;
+      try {
+        const data = await api(`/api/products/${encodeURIComponent(barcode)}`, { method: "DELETE" });
+        state.productsAll = data.products || [];
+        state.productsGrouped = null;
+        toast("商品已删除。");
+        render();
+      } catch (error) {
+        toast(error.message);
+      }
+    });
   });
 }
 

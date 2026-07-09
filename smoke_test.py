@@ -185,6 +185,13 @@ def main() -> None:
         status, body = request(admin, base, "GET", "/api/products")
         assert status == 200, body
         assert any(item["barcode"] == "SMOKE-PRODUCT-001" for item in body["categories"]["烟测分类"])
+        status, body = request(admin, base, "DELETE", f"/api/products/{quote('SMOKE-PRODUCT-001')}")
+        assert status == 200, body
+        assert body["product"]["deleted"] is True
+        assert len(body["products"]) == 52
+        status, body = request(admin, base, "GET", "/api/products")
+        assert status == 200, body
+        assert "烟测分类" not in body["categories"]
 
         status, body, headers = request_full(admin, base, "GET", "/api/admin/backup.db")
         assert status == 200
