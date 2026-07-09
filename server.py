@@ -493,6 +493,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"categories": DB.grouped_products()})
             return
 
+        if path == "/api/products" and self.command == "POST":
+            self.require_admin(user)
+            product = DB.upsert_product(self.read_json())
+            self.send_json({"product": product, "products": DB.list_products(active_only=False)}, status=201)
+            return
+
         if path == "/api/products/import" and self.command == "POST":
             self.require_admin(user)
             if self.is_multipart():

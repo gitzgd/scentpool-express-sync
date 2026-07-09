@@ -975,6 +975,17 @@ tr:last-child td {
   margin-bottom: 14px;
 }
 
+.product-form-grid {
+  display: grid;
+  grid-template-columns: 160px minmax(150px, 180px) minmax(220px, 1fr) minmax(130px, 150px) 110px 110px auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.product-submit {
+  min-width: 104px;
+}
+
 @media (max-width: 920px) {
   .topbar {
     align-items: flex-start;
@@ -1012,7 +1023,8 @@ tr:last-child td {
   .filters.store-filters,
   .filters.admin-return-filters,
   .filters.store-return-filters,
-  .product-toolbar {
+  .product-toolbar,
+  .product-form-grid {
     grid-template-columns: 1fr;
   }
 
@@ -1025,7 +1037,8 @@ tr:last-child td {
   }
 
   .item-row .btn,
-  .edit-product-row .btn {
+  .edit-product-row .btn,
+  .product-submit {
     width: 100%;
   }
 

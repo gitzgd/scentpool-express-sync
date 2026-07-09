@@ -170,6 +170,22 @@ def main() -> None:
         product = body["products"][0]
         product_2 = next(item for item in body["products"] if item["category"] != product["category"])
 
+        manual_product = {
+            "barcode": "SMOKE-PRODUCT-001",
+            "category": "烟测分类",
+            "name": "烟测商品",
+            "spec": "1盒",
+            "price": "9.90",
+            "status": "启用",
+        }
+        status, body = request(admin, base, "POST", "/api/products", manual_product)
+        assert status == 201, body
+        assert body["product"]["barcode"] == "SMOKE-PRODUCT-001"
+        assert len(body["products"]) == 53
+        status, body = request(admin, base, "GET", "/api/products")
+        assert status == 200, body
+        assert any(item["barcode"] == "SMOKE-PRODUCT-001" for item in body["categories"]["烟测分类"])
+
         status, body, headers = request_full(admin, base, "GET", "/api/admin/backup.db")
         assert status == 200
         assert body.startswith(b"SQLite format 3"), body[:32]
@@ -179,6 +195,10 @@ def main() -> None:
         assert status == 200, body
         assert body["result"]["imported"] == 52
         assert Path(server.PRODUCT_FILE_PATH).exists()
+        status, body = request(admin, base, "GET", "/api/products?all=1")
+        assert status == 200, body
+        product = body["products"][0]
+        product_2 = next(item for item in body["products"] if item["category"] != product["category"])
 
         status, body = request(staff, base, "POST", "/api/login", {"username": "store01", "password": "scentpool2026"})
         assert status == 200, body

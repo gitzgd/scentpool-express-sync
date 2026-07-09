@@ -1904,7 +1904,43 @@ async function renderProducts() {
     return categoryOk && qOk;
   });
   const content = `
-    ${pageHead("商品", "上传 Excel 商品资料刷新点菜单。", `<span class="count-pill">${state.productsAll.length} 个商品</span>`)}
+    ${pageHead("商品", "维护点菜单商品，可单个新增，也可用 Excel 批量刷新。", `<span class="count-pill">${state.productsAll.length} 个商品</span>`)}
+    <section class="panel panel-pad">
+      <div class="section-title"><h2>新增 / 更新商品</h2></div>
+      <form id="productForm" class="product-form-grid">
+        <div class="field">
+          <label for="newProductBarcode">条码</label>
+          <input class="input" id="newProductBarcode" name="barcode" required placeholder="唯一商品 ID" />
+        </div>
+        <div class="field">
+          <label for="newProductCategory">分类</label>
+          <input class="input" id="newProductCategory" name="category" list="productCategoryList" required placeholder="例如 线香" />
+          <datalist id="productCategoryList">
+            ${categoriesAll.map((cat) => `<option value="${escapeHtml(cat)}"></option>`).join("")}
+          </datalist>
+        </div>
+        <div class="field">
+          <label for="newProductName">名称</label>
+          <input class="input" id="newProductName" name="name" required placeholder="商品名称" />
+        </div>
+        <div class="field">
+          <label for="newProductSpec">规格</label>
+          <input class="input" id="newProductSpec" name="spec" placeholder="可选" />
+        </div>
+        <div class="field">
+          <label for="newProductPrice">售价</label>
+          <input class="input" id="newProductPrice" name="price" inputmode="decimal" placeholder="0.00" />
+        </div>
+        <div class="field">
+          <label for="newProductStatus">状态</label>
+          <select class="select" id="newProductStatus" name="status">
+            <option value="启用">启用</option>
+            <option value="停用">停用</option>
+          </select>
+        </div>
+        <button class="btn primary product-submit" type="submit">保存商品</button>
+      </form>
+    </section>
     <section class="panel panel-pad">
       <div class="product-toolbar">
         <div class="field product-upload-field">
@@ -1964,6 +2000,30 @@ function renderProductsTable(products) {
 }
 
 function bindProducts() {
+  document.getElementById("productForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    try {
+      const data = await api("/api/products", {
+        method: "POST",
+        body: JSON.stringify({
+          barcode: form.get("barcode"),
+          category: form.get("category"),
+          name: form.get("name"),
+          spec: form.get("spec"),
+          price: form.get("price"),
+          status: form.get("status"),
+        }),
+      });
+      state.productsAll = data.products || [];
+      state.productsGrouped = null;
+      event.currentTarget.reset();
+      toast("商品已保存。");
+      render();
+    } catch (error) {
+      toast(error.message);
+    }
+  });
   document.getElementById("applyProductFilters").addEventListener("click", () => {
     state.productFilters = {
       category: document.getElementById("productCategory").value,

@@ -493,6 +493,42 @@ class Database:
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
+    def upsert_product(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        barcode = str(payload.get("barcode", "")).strip()
+        name = str(payload.get("name", "")).strip()
+        category = str(payload.get("category", "")).strip()
+        spec = str(payload.get("spec", "")).strip()
+        price = str(payload.get("price", "")).strip() or "0.00"
+        status = str(payload.get("status", "")).strip() or "启用"
+
+        if not barcode:
+            raise AppError("请输入商品条码。")
+        if not name:
+            raise AppError("请输入商品名称。")
+        if not category:
+            raise AppError("请输入商品分类。")
+        if status not in {"启用", "停用"}:
+            raise AppError("请选择有效商品状态。")
+
+        now = now_text()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO products (barcode, name, category, spec, price, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(barcode) DO UPDATE SET
+                    name = excluded.name,
+                    category = excluded.category,
+                    spec = excluded.spec,
+                    price = excluded.price,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
+                """,
+                (barcode, name, category, spec, price, status, now),
+            )
+            product = conn.execute("SELECT * FROM products WHERE barcode = ?", (barcode,)).fetchone()
+        return dict(product)
+
     def grouped_products(self) -> Dict[str, List[Dict[str, Any]]]:
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for product in self.list_products(active_only=True):
