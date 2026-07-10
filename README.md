@@ -35,6 +35,10 @@ python3 server.py --host 0.0.0.0 --port 8765
 - `SCENTPOOL_KUAIDI100_ENDPOINT=https://poll.kuaidi100.com/poll/query.do`：快递100实时查询接口地址。
 - `SCENTPOOL_KUAIDI100_CUSTOMER`：快递100 customer，只放 Render 环境变量。
 - `SCENTPOOL_KUAIDI100_KEY`：快递100 key，只放 Render 环境变量。
+- `SCENTPOOL_KUAIDI100_ORDER_ENABLED=0`：快递100寄件下单开关，测试完成前保持 `0`。
+- `SCENTPOOL_KUAIDI100_ORDER_ENDPOINT=https://order.kuaidi100.com/order/corderapi.do`：上门取件线下支付下单接口。
+- `SCENTPOOL_KUAIDI100_ORDER_SECRET`：寄件下单 secret，只放 Render 环境变量。
+- `SCENTPOOL_PUBLIC_BASE_URL`：网站公网根地址，用于生成快递100订单回调地址。
 
 ## 发布到 Render
 
@@ -96,6 +100,16 @@ curl -b cookie.txt -c cookie.txt \
 
 问题件只会显示为“问题件”，不会自动改成“异常”，避免误判影响订单。
 
+## 快递一键下单
+
+总部先进入“发货设置”，填写固定寄件人、联系电话和完整寄件地址。发货后台的“批量下单”会读取当前筛选条件下的全部可下单订单，不受每页 50 条限制；确认圆通、京东或顺丰及取件时间后，系统在后台逐单提交快递100。
+
+圆通可能在首次响应中不返回单号，此时显示“等待快递单号”。快递100回调取得单号后，系统自动写入单号并改为“已发货”。失败订单可以按批次单独重试；已经接单的订单如需修改，应先取消快递下单。
+
+正式启用前需要在快递100企业后台开通“上门取件线下支付”并取得 `ORDER_SECRET`。配置完成并完成一张测试单后，将 Render 中的 `SCENTPOOL_KUAIDI100_ORDER_ENABLED` 改为 `1`。
+
+“菜鸟打印数据”目前导出标准收寄件和商品字段。拿到菜鸟商家后台的实际空白导入模板后，应再按模板列名和工作表结构做精确对齐。
+
 ## 备份与回滚
 
 - 总部在“发货后台”点击“备份数据库”，会下载完整 SQLite 文件。
@@ -106,7 +120,7 @@ curl -b cookie.txt -c cookie.txt \
 ## 本地验证
 
 ```bash
-python3 -m py_compile server.py database.py manage.py smoke_test.py tracking.py
+python3 -m py_compile server.py database.py manage.py smoke_test.py tracking.py shipping.py
 node --check static/app.js
 python3 smoke_test.py
 ```

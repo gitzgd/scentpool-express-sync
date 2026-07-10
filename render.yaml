@@ -34,6 +34,14 @@ services:
         sync: false
       - key: SCENTPOOL_KUAIDI100_KEY
         sync: false
+      - key: SCENTPOOL_KUAIDI100_ORDER_ENABLED
+        value: "0"
+      - key: SCENTPOOL_KUAIDI100_ORDER_ENDPOINT
+        value: https://order.kuaidi100.com/order/corderapi.do
+      - key: SCENTPOOL_KUAIDI100_ORDER_SECRET
+        sync: false
+      - key: SCENTPOOL_PUBLIC_BASE_URL
+        value: https://scentpool-express-sync-ec7c.onrender.com
     disk:
       name: scentpool-data
       mountPath: /var/data

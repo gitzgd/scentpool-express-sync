@@ -24,6 +24,11 @@ const state = {
   editingShipmentId: null,
   editingShipmentShippingId: null,
   shipmentEditItems: [],
+  shippingSettings: null,
+  shippingConfig: null,
+  batchPreview: null,
+  activeShippingBatch: null,
+  shippingBatchPollTimer: null,
 };
 
 const EXPRESS_COMPANIES = ["圆通", "京东", "顺丰"];
@@ -99,7 +104,30 @@ function shipmentStoreCode(row) {
 }
 
 function shipmentBusinessId(row) {
-  return `${compactDate(row.created_at)}-${shipmentStoreCode(row)}-${row.store_order_no || row.id}`;
+  return row.business_id || `${compactDate(row.created_at)}-${shipmentStoreCode(row)}-${row.store_order_no || row.id}`;
+}
+
+function bookingEditable(row) {
+  return ["未下单", "下单失败", "已取消", ""].includes(String(row.booking_status || ""));
+}
+
+function bookingStatusClass(status) {
+  if (["下单失败"].includes(status)) return "exception";
+  if (["已出单"].includes(status)) return "shipped";
+  if (["已取消"].includes(status)) return "cancelled";
+  return "pending";
+}
+
+function renderBookingStatus(row) {
+  const status = String(row.booking_status || "未下单");
+  if (status === "未下单") return "";
+  return `
+    <div class="booking-status-block">
+      <span class="status ${bookingStatusClass(status)}">${escapeHtml(status === "待取号" ? "等待快递单号" : status === "排队中" || status === "提交中" ? "总部下单中" : status)}</span>
+      ${row.booking_error ? `<div class="tracking-error">${escapeHtml(row.booking_error)}</div>` : ""}
+      ${row.booking_courier_mobile ? `<div class="muted mini">取件员 ${escapeHtml(row.booking_courier_name || "")} ${escapeHtml(row.booking_courier_mobile)}</div>` : ""}
+    </div>
+  `;
 }
 
 function cleanTrackingEvent(value) {
@@ -321,6 +349,7 @@ function shell(content) {
         <a class="${isActive("/admin/returns")}" href="/admin/returns" data-route>退货看板</a>
         <a class="${isActive("/admin/stores")}" href="/admin/stores" data-route>门店</a>
         <a class="${isActive("/admin/products")}" href="/admin/products" data-route>商品</a>
+        <a class="${isActive("/admin/shipping")}" href="/admin/shipping" data-route>发货设置</a>
       `
       : "";
   const storeLinks =
@@ -384,6 +413,30 @@ async function loadShipments() {
   summaryParams.delete("status");
   const summaryData = await api(`/api/shipments?${summaryParams.toString()}`);
   state.adminShipmentSummary = summaryData.shipments || [];
+}
+
+async function loadShippingSettings() {
+  const data = await api("/api/admin/shipping-settings");
+  state.shippingSettings = data.settings || {};
+  state.shippingConfig = data.shipping || {};
+}
+
+async function loadActiveShippingBatch() {
+  const batchId = state.activeShippingBatch?.batch?.id || sessionStorage.getItem("scentpool_shipping_batch_id");
+  if (!batchId) return;
+  try {
+    state.activeShippingBatch = await api(`/api/admin/shipping-batches/${batchId}`);
+  } catch {
+    state.activeShippingBatch = null;
+    sessionStorage.removeItem("scentpool_shipping_batch_id");
+  }
+}
+
+function scheduleShippingBatchPoll() {
+  if (state.shippingBatchPollTimer) clearTimeout(state.shippingBatchPollTimer);
+  const status = state.activeShippingBatch?.batch?.status;
+  if (!status || !["排队中", "处理中", "等待单号"].includes(status) || location.pathname !== "/admin") return;
+  state.shippingBatchPollTimer = setTimeout(() => render(), 2500);
 }
 
 async function loadStoreShipments() {
@@ -625,7 +678,7 @@ async function renderSubmit() {
           </div>
           <div class="item-stack" id="itemsBox">${itemRows}</div>
           <div class="split-actions">
-            <span class="muted mini">订单号在同一门店内不能重复。</span>
+            <span class="muted mini">同一门店同一天的订单号不能重复；次日可重新从 1001 开始。</span>
             <button class="btn primary" type="submit">提交总部</button>
           </div>
         </form>
@@ -710,6 +763,12 @@ function renderTrackingDetailBlock(row, options = {}) {
 function renderTrackingInfo(row, options = {}) {
   if (row.tracking_no) {
     return renderTrackingDetailBlock(row, options);
+  }
+  if (!bookingEditable(row)) {
+    return renderBookingStatus(row);
+  }
+  if (row.booking_status === "下单失败") {
+    return renderBookingStatus(row);
   }
   if (row.status === "已发货") {
     return `<span class="muted">待总部填写单号</span>`;
@@ -921,7 +980,7 @@ function renderShipmentItemsWithEditButton(row) {
   return `
     ${row.items ? renderItemLines(row.items) : `<span class="muted">无商品</span>`}
     ${
-      row.status === "待处理"
+      row.status === "待处理" && bookingEditable(row)
         ? `<button class="btn secondary small" data-edit-shipment-items="${row.id}" type="button" style="margin-top: 8px;">编辑商品</button>`
         : ""
     }
@@ -1449,10 +1508,85 @@ function bindReturnBoard(admin = false) {
   });
 }
 
+function renderShippingBatchPreview() {
+  const preview = state.batchPreview;
+  if (!preview) return "";
+  const eligible = preview.eligible || [];
+  return `
+    <section class="panel panel-pad shipping-batch-panel">
+      <div class="section-title">
+        <div><h2>确认批量下单</h2><div class="muted mini">当前筛选匹配 ${preview.matched || 0} 单，可下单 ${eligible.length} 单，排除 ${(preview.excluded || []).length} 单</div></div>
+        <button class="btn ghost small" id="closeBatchPreview" type="button">关闭</button>
+      </div>
+      ${!preview.settings_ready ? `<div class="notice danger-notice">总部寄件信息未完成，请先进入“发货设置”。</div>` : ""}
+      ${!state.shippingConfig?.enabled || !state.shippingConfig?.configured ? `<div class="notice">快递100下单开关未开启或密钥未配置，目前只能预览，不能正式提交。</div>` : ""}
+      <div class="batch-controls">
+        <div class="field">
+          <label>整批快递公司</label>
+          <select class="select" id="batchBulkCompany">${expressCompanyOptions(DEFAULT_EXPRESS_COMPANY)}</select>
+        </div>
+        <div class="field">
+          <label>取件日期</label>
+          <select class="select" id="batchPickupDay"><option>今天</option><option>明天</option><option>后天</option></select>
+        </div>
+        <div class="field">
+          <label>开始时间</label>
+          <input class="input" id="batchPickupStart" type="time" value="09:00" />
+        </div>
+        <div class="field">
+          <label>结束时间</label>
+          <input class="input" id="batchPickupEnd" type="time" value="11:00" />
+        </div>
+        <button class="btn primary" id="createShippingBatch" type="button" ${eligible.length && preview.settings_ready && state.shippingConfig?.enabled && state.shippingConfig?.configured ? "" : "disabled"}>确认提交 ${eligible.length} 单</button>
+      </div>
+      <div class="batch-order-list">
+        ${eligible.map((row) => `
+          <div class="batch-order-row" data-batch-shipment="${row.id}">
+            <div><strong>${escapeHtml(row.business_id)}</strong><div class="muted mini">${escapeHtml(row.store_name_snapshot)} · ${escapeHtml(row.recipient_name)} · ${escapeHtml(row.address)}</div></div>
+            <select class="select" data-batch-company>${expressCompanyOptions(row.express_company)}</select>
+          </div>
+        `).join("") || `<div class="empty">当前筛选没有可下单订单</div>`}
+      </div>
+      ${(preview.excluded || []).length ? `<details class="tracking-details"><summary>查看被排除的 ${(preview.excluded || []).length} 单</summary><div class="tracking-detail-lines">${preview.excluded.map((row) => `<div>${escapeHtml(row.business_id)}：${escapeHtml(row.reason)}</div>`).join("")}</div></details>` : ""}
+    </section>
+  `;
+}
+
+function renderShippingBatchProgress() {
+  const data = state.activeShippingBatch;
+  if (!data?.batch) return "";
+  const batch = data.batch;
+  const counts = data.counts || {};
+  const failed = counts["失败"] || 0;
+  return `
+    <section class="panel panel-pad shipping-batch-panel">
+      <div class="section-title">
+        <div><h2>下单批次 #${batch.id}</h2><div class="muted mini">${escapeHtml(batch.pickup_day)} ${escapeHtml(batch.pickup_start_time)}-${escapeHtml(batch.pickup_end_time)}</div></div>
+        <span class="status ${failed ? "exception" : batch.status === "已完成" ? "shipped" : "pending"}">${escapeHtml(batch.status)}</span>
+      </div>
+      <div class="status-overview">
+        <span class="count-pill">总数 ${batch.total_count || 0}</span>
+        <span class="count-pill">排队 ${counts["排队中"] || 0}</span>
+        <span class="count-pill">提交中 ${counts["提交中"] || 0}</span>
+        <span class="count-pill">待取号 ${counts["待取号"] || 0}</span>
+        <span class="count-pill">成功 ${counts["成功"] || 0}</span>
+        <span class="count-pill">失败 ${failed}</span>
+      </div>
+      <div class="inline-actions">
+        ${failed ? `<button class="btn secondary small" id="retryShippingBatch" type="button">仅重试失败订单</button>` : ""}
+        <button class="btn ghost small" id="closeShippingBatch" type="button">收起批次</button>
+      </div>
+      ${failed ? `<div class="batch-errors">${(data.items || []).filter((item) => item.status === "失败").map((item) => `<div><strong>${escapeHtml(item.business_id)}</strong> ${escapeHtml(item.error || "下单失败")}</div>`).join("")}</div>` : ""}
+    </section>
+  `;
+}
+
 async function renderAdmin() {
   await ensureProductsGrouped();
   await loadStores();
   await loadShipments();
+  await loadShippingSettings();
+  await loadActiveShippingBatch();
   const today = localDate();
   const yesterday = localDate(-1);
   const exportParams = new URLSearchParams();
@@ -1466,12 +1600,16 @@ async function renderAdmin() {
       "发货后台",
       "总部统一处理门店提交的发货需求。",
       `<div class="actions">
+        <button class="btn primary" id="previewShippingBatch" type="button">批量下单</button>
         <button class="btn secondary" id="syncTracking" type="button">同步物流</button>
+        <a class="btn secondary" href="/api/export/cainiao.xlsx?${exportParams.toString()}">菜鸟打印数据</a>
         <a class="btn primary" href="/api/export/shipments.xlsx?${exportParams.toString()}">导出 XLSX</a>
         <a class="btn secondary" href="/api/export/shipments.csv?${exportParams.toString()}">导出 CSV</a>
         <a class="btn secondary" href="/api/admin/backup.db">备份数据库</a>
       </div>`
     )}
+    ${renderShippingBatchPreview()}
+    ${renderShippingBatchProgress()}
     <section class="panel panel-pad">
       <div class="status-overview">
         <span class="count-pill">当前范围 ${counts.total} 单</span>
@@ -1523,19 +1661,20 @@ async function renderAdmin() {
   document.getElementById("app").innerHTML = shell(content);
   bindCommon();
   bindAdmin();
+  scheduleShippingBatchPoll();
 }
 
-function renderShipmentBoard(shipments, offset = 0) {
+function renderShipmentBoard(shipments) {
   if (!shipments.length) return `<div class="empty">没有符合条件的发货单</div>`;
   const groups = [];
-  shipments.forEach((row, index) => {
-    const day = datePart(row.created_at);
+  shipments.forEach((row) => {
+    const day = row.order_date || datePart(row.created_at);
     let group = groups.find((item) => item.day === day);
     if (!group) {
       group = { day, rows: [] };
       groups.push(group);
     }
-    group.rows.push({ ...row, displayIndex: offset + index + 1 });
+    group.rows.push(row);
   });
   return groups
     .map(
@@ -1553,12 +1692,13 @@ function renderShipmentBoard(shipments, offset = 0) {
 }
 
 function shipmentShippingEditing(row) {
+  if (!bookingEditable(row)) return false;
   return state.editingShipmentShippingId === row.id || !String(row.tracking_no || "").trim();
 }
 
 function renderAdminShipmentStatusCell(row) {
   if (!shipmentShippingEditing(row)) {
-    return `<span class="status ${statusClass(row.status)}">${escapeHtml(row.status)}</span>`;
+    return `<span class="status ${statusClass(row.status)}">${escapeHtml(row.status)}</span>${renderBookingStatus(row)}`;
   }
   return `
     <select class="table-input" data-status>
@@ -1569,6 +1709,7 @@ function renderAdminShipmentStatusCell(row) {
 
 function renderAdminShipmentShippingCell(row) {
   if (!shipmentShippingEditing(row)) {
+    if (!row.tracking_no) return `<span class="muted">快递平台正在分配单号</span>`;
     return renderTrackingDetailBlock(row, { showCopy: true });
   }
   return `
@@ -1597,6 +1738,16 @@ function renderAdminShipmentShippingCell(row) {
 function renderShipmentActions(row) {
   const editing = shipmentShippingEditing(row);
   const shippedAt = row.shipped_at ? `<div class="muted mini action-time">${escapeHtml(formatDate(row.shipped_at))}</div>` : "";
+  if (!bookingEditable(row)) {
+    const canCancel = row.booking_task_id && row.booking_order_id && row.status !== "已签收";
+    return `
+      <div class="shipment-actions">
+        ${canCancel ? `<button class="btn danger small" data-cancel-booking="${row.id}" type="button">取消下单</button>` : `<span class="muted mini">快递处理中</span>`}
+        ${row.tracking_no ? `<button class="btn secondary small" data-refresh-tracking="${row.id}" type="button">查物流</button>` : ""}
+        ${shippedAt}
+      </div>
+    `;
+  }
   if (editing) {
     return `
       <div class="shipment-actions">
@@ -1644,10 +1795,9 @@ function renderShipmentTable(shipments) {
             .map(
               (row) => `
                 <tr class="shipment-row ${statusClass(row.status)}" data-shipment="${row.id}">
-                  <td>${row.displayIndex || ""}</td>
+                  <td>${row.id}</td>
                   <td class="business-cell">
                     <strong class="business-id">${escapeHtml(shipmentBusinessId(row))}</strong>
-                    <div class="muted mini">系统ID ${row.id}</div>
                   </td>
                   <td>${escapeHtml(formatDate(row.created_at))}</td>
                   <td>${escapeHtml(row.store_name_snapshot)}</td>
@@ -1684,6 +1834,72 @@ function renderShipmentTable(shipments) {
 }
 
 function bindAdmin() {
+  const previewButton = document.getElementById("previewShippingBatch");
+  if (previewButton) {
+    previewButton.addEventListener("click", async () => {
+      try {
+        const data = await api("/api/admin/shipping-batches/preview", {
+          method: "POST",
+          body: JSON.stringify({ filters: state.adminFilters }),
+        });
+        state.batchPreview = data.preview || null;
+        render();
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+  }
+  document.getElementById("closeBatchPreview")?.addEventListener("click", () => {
+    state.batchPreview = null;
+    render();
+  });
+  document.getElementById("batchBulkCompany")?.addEventListener("change", (event) => {
+    document.querySelectorAll("[data-batch-company]").forEach((select) => {
+      select.value = event.currentTarget.value;
+    });
+  });
+  document.getElementById("createShippingBatch")?.addEventListener("click", async () => {
+    const shipments = Array.from(document.querySelectorAll("[data-batch-shipment]")).map((row) => ({
+      id: Number(row.dataset.batchShipment),
+      express_company: row.querySelector("[data-batch-company]").value,
+    }));
+    if (!confirm(`确认向快递100提交 ${shipments.length} 张寄件订单？`)) return;
+    try {
+      const data = await api("/api/admin/shipping-batches", {
+        method: "POST",
+        body: JSON.stringify({
+          filters: state.adminFilters,
+          shipments,
+          pickup_day: document.getElementById("batchPickupDay").value,
+          pickup_start_time: document.getElementById("batchPickupStart").value,
+          pickup_end_time: document.getElementById("batchPickupEnd").value,
+        }),
+      });
+      state.batchPreview = null;
+      state.activeShippingBatch = data;
+      sessionStorage.setItem("scentpool_shipping_batch_id", String(data.batch.id));
+      toast("批量下单任务已创建。即使关闭页面，后台也会继续处理。");
+      render();
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+  document.getElementById("retryShippingBatch")?.addEventListener("click", async () => {
+    const batchId = state.activeShippingBatch?.batch?.id;
+    if (!batchId) return;
+    try {
+      state.activeShippingBatch = await api(`/api/admin/shipping-batches/${batchId}/retry`, { method: "POST", body: JSON.stringify({}) });
+      toast("失败订单已重新加入队列。");
+      render();
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+  document.getElementById("closeShippingBatch")?.addEventListener("click", () => {
+    state.activeShippingBatch = null;
+    sessionStorage.removeItem("scentpool_shipping_batch_id");
+    render();
+  });
   document.querySelectorAll("[data-admin-preset]").forEach((node) => {
     node.addEventListener("click", (event) => {
       const preset = event.currentTarget.dataset.adminPreset;
@@ -1744,6 +1960,19 @@ function bindAdmin() {
       try {
         await api(`/api/shipments/${id}/tracking/refresh`, { method: "POST", body: JSON.stringify({}) });
         toast("物流已刷新。");
+        render();
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+  });
+  document.querySelectorAll("[data-cancel-booking]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const id = event.currentTarget.dataset.cancelBooking;
+      if (!confirm("确认取消这张快递下单？取消成功后订单会恢复为待处理，可重新编辑和下单。")) return;
+      try {
+        await api(`/api/shipments/${id}/booking/cancel`, { method: "POST", body: JSON.stringify({}) });
+        toast("快递下单已取消。");
         render();
       } catch (error) {
         toast(error.message);
@@ -1831,6 +2060,72 @@ async function renderStores() {
   document.getElementById("app").innerHTML = shell(content);
   bindCommon();
   bindStores();
+}
+
+async function renderShippingSettings() {
+  await loadShippingSettings();
+  const settings = state.shippingSettings || {};
+  const config = state.shippingConfig || {};
+  const content = `
+    ${pageHead("发货设置", "维护总部寄件信息和快递100下单配置状态。")}
+    <div class="grid-2">
+      <section class="panel panel-pad">
+        <div class="section-title"><h2>总部寄件信息</h2></div>
+        <form id="shippingSettingsForm" class="form-grid">
+          <div class="field">
+            <label for="senderName">寄件人姓名</label>
+            <input class="input" id="senderName" name="sender_name" value="${escapeHtml(settings.sender_name || "")}" required />
+          </div>
+          <div class="field">
+            <label for="senderMobile">联系电话</label>
+            <input class="input" id="senderMobile" name="sender_mobile" value="${escapeHtml(settings.sender_mobile || "")}" required />
+          </div>
+          <div class="field full">
+            <label for="senderAddress">完整寄件地址</label>
+            <textarea class="textarea" id="senderAddress" name="sender_address" required>${escapeHtml(settings.sender_address || "")}</textarea>
+          </div>
+          <div class="field">
+            <label for="defaultCompany">默认快递公司</label>
+            <select class="select" id="defaultCompany" name="default_company">${expressCompanyOptions(settings.default_company || DEFAULT_EXPRESS_COMPANY)}</select>
+          </div>
+          <div class="field">
+            <label for="cargoName">物品名称</label>
+            <input class="input" id="cargoName" name="cargo_name" value="${escapeHtml(settings.cargo_name || "香氛商品")}" required />
+          </div>
+          <div class="field full"><button class="btn primary" type="submit">保存发货设置</button></div>
+        </form>
+      </section>
+      <section class="panel panel-pad">
+        <div class="section-title"><h2>快递100下单</h2></div>
+        <ul class="summary-list">
+          <li><span>功能开关</span><span class="status ${config.enabled ? "shipped" : "pending"}">${config.enabled ? "已开启" : "未开启"}</span></li>
+          <li><span>鉴权配置</span><span class="status ${config.configured ? "shipped" : "exception"}">${config.configured ? "完整" : "缺少配置"}</span></li>
+          <li><span>KEY</span><strong>${escapeHtml(config.key || "未设置")}</strong></li>
+          <li><span>ORDER SECRET</span><strong>${escapeHtml(config.secret || "未设置")}</strong></li>
+        </ul>
+        <div class="config-detail"><span class="muted mini">回调地址</span><code>${escapeHtml(config.callback_url || "请设置 SCENTPOOL_PUBLIC_BASE_URL")}</code></div>
+        <div class="notice">密钥只在 Render Environment 中维护，页面不会保存或显示完整内容。测试通过后再把 SCENTPOOL_KUAIDI100_ORDER_ENABLED 改为 1。</div>
+      </section>
+    </div>
+  `;
+  document.getElementById("app").innerHTML = shell(content);
+  bindCommon();
+  document.getElementById("shippingSettingsForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    try {
+      const data = await api("/api/admin/shipping-settings", {
+        method: "PUT",
+        body: JSON.stringify(Object.fromEntries(form.entries())),
+      });
+      state.shippingSettings = data.settings;
+      state.shippingConfig = data.shipping;
+      toast("发货设置已保存。");
+      render();
+    } catch (error) {
+      toast(error.message);
+    }
+  });
 }
 
 function renderStoresTable() {
@@ -2127,6 +2422,8 @@ async function render() {
       await renderStores();
     } else if (location.pathname === "/admin/products" && state.user.role === "admin") {
       await renderProducts();
+    } else if (location.pathname === "/admin/shipping" && state.user.role === "admin") {
+      await renderShippingSettings();
     } else {
       navigate(state.user.role === "admin" ? "/admin" : "/submit");
     }

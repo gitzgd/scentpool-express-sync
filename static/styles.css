@@ -586,7 +586,7 @@ table {
 }
 
 .shipments-table .col-status {
-  width: 86px;
+  width: 108px;
 }
 
 .shipments-table .col-shipping {
@@ -594,7 +594,7 @@ table {
 }
 
 .shipments-table .col-actions {
-  width: 86px;
+  width: 102px;
 }
 
 .store-shipments-table th:nth-child(1),
@@ -986,6 +986,79 @@ tr:last-child td {
   min-width: 104px;
 }
 
+.booking-status-block {
+  display: grid;
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.shipping-batch-panel {
+  margin-bottom: 16px;
+}
+
+.batch-controls {
+  display: grid;
+  grid-template-columns: 180px 140px 140px 140px auto;
+  gap: 12px;
+  align-items: end;
+  margin: 16px 0;
+}
+
+.batch-order-list {
+  display: grid;
+  max-height: 420px;
+  overflow: auto;
+  border-top: 1px solid #ededf2;
+}
+
+.batch-order-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px;
+  gap: 14px;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid #ededf2;
+}
+
+.batch-errors {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+  color: var(--red);
+  font-size: 13px;
+}
+
+.notice {
+  margin-top: 14px;
+  padding: 11px 12px;
+  border: 1px solid rgba(178, 93, 0, 0.22);
+  border-radius: var(--radius);
+  background: rgba(255, 149, 0, 0.08);
+  color: #774500;
+  font-size: 13px;
+}
+
+.danger-notice {
+  border-color: rgba(201, 52, 47, 0.24);
+  background: rgba(201, 52, 47, 0.07);
+  color: var(--red);
+}
+
+.config-detail {
+  display: grid;
+  gap: 6px;
+  margin-top: 16px;
+}
+
+.config-detail code {
+  overflow-wrap: anywhere;
+  padding: 10px;
+  border: 1px solid #ededf2;
+  border-radius: var(--radius);
+  background: #f7f7f9;
+  font-size: 12px;
+}
+
 @media (max-width: 920px) {
   .topbar {
     align-items: flex-start;
@@ -1028,6 +1101,11 @@ tr:last-child td {
     grid-template-columns: 1fr;
   }
 
+  .batch-controls,
+  .batch-order-row {
+    grid-template-columns: 1fr;
+  }
+
   .item-row {
     grid-template-columns: 1fr;
   }
@@ -1056,12 +1134,15 @@ tr:last-child td {
     flex-wrap: wrap;
   }
 
-  .actions {
+  .page-head .actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     width: 100%;
   }
 
-  .actions .btn {
-    flex: 1;
+  .page-head .actions .btn {
+    width: 100%;
+    white-space: nowrap;
   }
 }
 

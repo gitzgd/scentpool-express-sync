@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -23,13 +24,16 @@ DEFAULT_ADMIN_PASSWORD = "scentpool2026"
 DEFAULT_STORE_USERNAME = "store01"
 DEFAULT_STORE_PASSWORD = "scentpool2026"
 APP_TZ = ZoneInfo("Asia/Shanghai")
+BOOKING_EDITABLE_STATUSES = ("未下单", "下单失败", "已取消")
+BOOKING_ACTIVE_STATUSES = ("排队中", "提交中", "已接单", "待取号")
 
 
 class AppError(Exception):
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, details: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.message = message
         self.status = status
+        self.details = details or {}
 
 
 def now_text() -> str:
@@ -42,6 +46,10 @@ def local_day_start(date_text: str) -> str:
 
 def local_day_end(date_text: str) -> str:
     return datetime.fromisoformat(f"{date_text}T23:59:59").replace(tzinfo=APP_TZ).isoformat(timespec="seconds")
+
+
+def shipment_business_id(order_date: str, store_id: int, store_order_no: str) -> str:
+    return f"{order_date.replace('-', '')}-S{int(store_id):02d}-{store_order_no}"
 
 
 def business_search_parts(query: str) -> Optional[tuple[str, Optional[int], str]]:
@@ -132,6 +140,8 @@ class Database:
 
                 CREATE TABLE IF NOT EXISTS shipments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_date TEXT NOT NULL,
+                    business_id TEXT NOT NULL UNIQUE,
                     store_id INTEGER NOT NULL,
                     store_name_snapshot TEXT NOT NULL,
                     created_by INTEGER NOT NULL,
@@ -153,9 +163,27 @@ class Database:
                     tracking_raw TEXT NOT NULL DEFAULT '',
                     shipping_note TEXT NOT NULL DEFAULT '',
                     shipped_at TEXT NOT NULL DEFAULT '',
+                    booking_status TEXT NOT NULL DEFAULT '未下单',
+                    booking_task_id TEXT NOT NULL DEFAULT '',
+                    booking_order_id TEXT NOT NULL DEFAULT '',
+                    booking_request_id TEXT NOT NULL DEFAULT '',
+                    booking_poll_token TEXT NOT NULL DEFAULT '',
+                    booking_salt TEXT NOT NULL DEFAULT '',
+                    booking_error TEXT NOT NULL DEFAULT '',
+                    booking_carrier_status TEXT NOT NULL DEFAULT '',
+                    booking_raw TEXT NOT NULL DEFAULT '',
+                    booking_requested_at TEXT NOT NULL DEFAULT '',
+                    booking_updated_at TEXT NOT NULL DEFAULT '',
+                    booking_courier_name TEXT NOT NULL DEFAULT '',
+                    booking_courier_mobile TEXT NOT NULL DEFAULT '',
+                    booking_weight TEXT NOT NULL DEFAULT '',
+                    booking_freight TEXT NOT NULL DEFAULT '',
+                    pickup_day TEXT NOT NULL DEFAULT '',
+                    pickup_start_time TEXT NOT NULL DEFAULT '',
+                    pickup_end_time TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    UNIQUE (store_id, store_order_no),
+                    UNIQUE (order_date, store_id, store_order_no),
                     FOREIGN KEY (store_id) REFERENCES stores(id),
                     FOREIGN KEY (created_by) REFERENCES users(id)
                 );
@@ -206,20 +234,236 @@ class Database:
                     quantity INTEGER NOT NULL CHECK (quantity > 0),
                     FOREIGN KEY (return_order_id) REFERENCES return_orders(id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS shipping_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    sender_name TEXT NOT NULL DEFAULT '',
+                    sender_mobile TEXT NOT NULL DEFAULT '',
+                    sender_address TEXT NOT NULL DEFAULT '',
+                    default_company TEXT NOT NULL DEFAULT '圆通',
+                    cargo_name TEXT NOT NULL DEFAULT '香氛商品',
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS shipping_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_by INTEGER NOT NULL,
+                    filters_json TEXT NOT NULL DEFAULT '{}',
+                    pickup_day TEXT NOT NULL,
+                    pickup_start_time TEXT NOT NULL,
+                    pickup_end_time TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT '排队中',
+                    total_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY (created_by) REFERENCES users(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS shipping_batch_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL,
+                    shipment_id INTEGER NOT NULL,
+                    express_company TEXT NOT NULL DEFAULT '圆通',
+                    request_id TEXT NOT NULL DEFAULT '',
+                    callback_salt TEXT NOT NULL DEFAULT '',
+                    task_id TEXT NOT NULL DEFAULT '',
+                    order_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '排队中',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    error TEXT NOT NULL DEFAULT '',
+                    response_raw TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (batch_id, shipment_id),
+                    FOREIGN KEY (batch_id) REFERENCES shipping_batches(id) ON DELETE CASCADE,
+                    FOREIGN KEY (shipment_id) REFERENCES shipments(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS shipping_callback_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    carrier_status TEXT NOT NULL,
+                    event_key TEXT NOT NULL UNIQUE,
+                    param_raw TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
+
+        self._migrate_shipments_schema()
+
+        with self.connect() as conn:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_shipments_store ON shipments(store_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_shipments_created ON shipments(created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_shipments_order_date ON shipments(order_date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_shipments_booking_status ON shipments(booking_status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_shipping_batch_items_status ON shipping_batch_items(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_return_orders_status ON return_orders(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_return_orders_store ON return_orders(store_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_return_orders_created ON return_orders(created_at)")
             self._ensure_shipment_tracking_columns(conn)
+            self._ensure_shipping_batch_columns(conn)
             self._normalize_shipments_with_tracking(conn)
+            conn.execute(
+                """
+                INSERT INTO shipping_settings (id, default_company, cargo_name, updated_at)
+                VALUES (1, ?, '香氛商品', ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (DEFAULT_EXPRESS_COMPANY, now_text()),
+            )
             self._seed_defaults(conn, production=production, admin_password=admin_password)
 
         if self.count_products() == 0 and os.path.exists(product_file):
             self.import_products(product_file)
+
+    def _migrate_shipments_schema(self) -> None:
+        with sqlite3.connect(self.path) as check:
+            check.row_factory = sqlite3.Row
+            row = check.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'shipments'").fetchone()
+            if not row:
+                return
+            columns = {item[1] for item in check.execute("PRAGMA table_info(shipments)").fetchall()}
+            normalized_sql = re.sub(r"\s+", " ", str(row["sql"] or "").lower())
+            needs_rebuild = (
+                "order_date" not in columns
+                or "business_id" not in columns
+                or "booking_status" not in columns
+                or "unique (store_id, store_order_no)" in normalized_sql
+            )
+        if not needs_rebuild:
+            return
+
+        self._backup_before_migration()
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            existing = {item[1] for item in conn.execute("PRAGMA table_info(shipments)").fetchall()}
+
+            def old(name: str, fallback: str) -> str:
+                return name if name in existing else fallback
+
+            conn.executescript(
+                """
+                BEGIN IMMEDIATE;
+                DROP TABLE IF EXISTS shipments_new;
+                CREATE TABLE shipments_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_date TEXT NOT NULL,
+                    business_id TEXT NOT NULL UNIQUE,
+                    store_id INTEGER NOT NULL,
+                    store_name_snapshot TEXT NOT NULL,
+                    created_by INTEGER NOT NULL,
+                    recipient_name TEXT NOT NULL,
+                    phone TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    store_order_no TEXT NOT NULL,
+                    remark TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '待处理',
+                    express_company TEXT NOT NULL DEFAULT '',
+                    tracking_no TEXT NOT NULL DEFAULT '',
+                    tracking_provider TEXT NOT NULL DEFAULT '',
+                    tracking_status TEXT NOT NULL DEFAULT '',
+                    tracking_state_code TEXT NOT NULL DEFAULT '',
+                    tracking_last_event TEXT NOT NULL DEFAULT '',
+                    tracking_last_checked_at TEXT NOT NULL DEFAULT '',
+                    tracking_signed_at TEXT NOT NULL DEFAULT '',
+                    tracking_error TEXT NOT NULL DEFAULT '',
+                    tracking_raw TEXT NOT NULL DEFAULT '',
+                    shipping_note TEXT NOT NULL DEFAULT '',
+                    shipped_at TEXT NOT NULL DEFAULT '',
+                    booking_status TEXT NOT NULL DEFAULT '未下单',
+                    booking_task_id TEXT NOT NULL DEFAULT '',
+                    booking_order_id TEXT NOT NULL DEFAULT '',
+                    booking_request_id TEXT NOT NULL DEFAULT '',
+                    booking_poll_token TEXT NOT NULL DEFAULT '',
+                    booking_salt TEXT NOT NULL DEFAULT '',
+                    booking_error TEXT NOT NULL DEFAULT '',
+                    booking_carrier_status TEXT NOT NULL DEFAULT '',
+                    booking_raw TEXT NOT NULL DEFAULT '',
+                    booking_requested_at TEXT NOT NULL DEFAULT '',
+                    booking_updated_at TEXT NOT NULL DEFAULT '',
+                    booking_courier_name TEXT NOT NULL DEFAULT '',
+                    booking_courier_mobile TEXT NOT NULL DEFAULT '',
+                    booking_weight TEXT NOT NULL DEFAULT '',
+                    booking_freight TEXT NOT NULL DEFAULT '',
+                    pickup_day TEXT NOT NULL DEFAULT '',
+                    pickup_start_time TEXT NOT NULL DEFAULT '',
+                    pickup_end_time TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (order_date, store_id, store_order_no),
+                    FOREIGN KEY (store_id) REFERENCES stores(id),
+                    FOREIGN KEY (created_by) REFERENCES users(id)
+                );
+                """
+            )
+            order_date_expr = old("order_date", "substr(created_at, 1, 10)")
+            business_expr = old(
+                "business_id",
+                "replace(substr(created_at, 1, 10), '-', '') || '-S' || printf('%02d', store_id) || '-' || store_order_no",
+            )
+            names = [
+                "id", "order_date", "business_id", "store_id", "store_name_snapshot", "created_by",
+                "recipient_name", "phone", "address", "store_order_no", "remark", "status",
+                "express_company", "tracking_no", "tracking_provider", "tracking_status",
+                "tracking_state_code", "tracking_last_event", "tracking_last_checked_at", "tracking_signed_at",
+                "tracking_error", "tracking_raw", "shipping_note", "shipped_at", "booking_status",
+                "booking_task_id", "booking_order_id", "booking_request_id", "booking_poll_token",
+                "booking_salt", "booking_error", "booking_carrier_status", "booking_raw",
+                "booking_requested_at", "booking_updated_at", "booking_courier_name",
+                "booking_courier_mobile", "booking_weight", "booking_freight", "pickup_day",
+                "pickup_start_time", "pickup_end_time", "created_at", "updated_at",
+            ]
+            defaults = {
+                "order_date": order_date_expr,
+                "business_id": business_expr,
+                "tracking_provider": "''", "tracking_status": "''", "tracking_state_code": "''",
+                "tracking_last_event": "''", "tracking_last_checked_at": "''", "tracking_signed_at": "''",
+                "tracking_error": "''", "tracking_raw": "''", "booking_status": "'未下单'",
+                "booking_task_id": "''", "booking_order_id": "''", "booking_request_id": "''",
+                "booking_poll_token": "''", "booking_salt": "''", "booking_error": "''",
+                "booking_carrier_status": "''", "booking_raw": "''", "booking_requested_at": "''",
+                "booking_updated_at": "''", "booking_courier_name": "''", "booking_courier_mobile": "''",
+                "booking_weight": "''", "booking_freight": "''", "pickup_day": "''",
+                "pickup_start_time": "''", "pickup_end_time": "''",
+            }
+            select_parts = [defaults.get(name, old(name, "''")) for name in names]
+            conn.execute(
+                f"INSERT INTO shipments_new ({', '.join(names)}) SELECT {', '.join(select_parts)} FROM shipments"
+            )
+            conn.execute("DROP TABLE shipments")
+            conn.execute("ALTER TABLE shipments_new RENAME TO shipments")
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            if violations or integrity != "ok":
+                raise RuntimeError("发货表迁移完整性检查失败。")
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def _backup_before_migration(self) -> None:
+        source_path = Path(self.path)
+        if not source_path.exists() or source_path.stat().st_size == 0:
+            return
+        backup_dir = source_path.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(APP_TZ).strftime("%Y%m%d-%H%M%S")
+        target = backup_dir / f"{source_path.stem}-before-order-date-{timestamp}.db"
+        source = sqlite3.connect(self.path)
+        destination = sqlite3.connect(str(target))
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
 
     def _seed_defaults(self, conn: sqlite3.Connection, *, production: bool, admin_password: str) -> None:
         now = now_text()
@@ -297,6 +541,18 @@ class Database:
             """,
             (DEFAULT_EXPRESS_COMPANY, now),
         )
+
+    def _ensure_shipping_batch_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(shipping_batch_items)").fetchall()}
+        columns = {
+            "request_id": "TEXT NOT NULL DEFAULT ''",
+            "callback_salt": "TEXT NOT NULL DEFAULT ''",
+            "task_id": "TEXT NOT NULL DEFAULT ''",
+            "order_id": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE shipping_batch_items ADD COLUMN {name} {definition}")
 
     def database_summary(self) -> Dict[str, int]:
         with self.connect() as conn:
@@ -571,6 +827,8 @@ class Database:
             raise AppError("请至少选择一个货品。")
 
         now = now_text()
+        order_date = now[:10]
+        business_id = shipment_business_id(order_date, store_id, store_order_no)
         with self.connect() as conn:
             store = conn.execute(
                 "SELECT * FROM stores WHERE id = ? AND active = 1", (store_id,)
@@ -579,16 +837,32 @@ class Database:
                 raise AppError("门店不存在或已停用。")
 
             items = self._resolve_items(conn, raw_items)
+            existing = conn.execute(
+                """
+                SELECT id, business_id
+                FROM shipments
+                WHERE order_date = ? AND store_id = ? AND store_order_no = ?
+                """,
+                (order_date, store_id, store_order_no),
+            ).fetchone()
+            if existing:
+                raise AppError(
+                    f"今天的门店订单号 {store_order_no} 已经提交过。",
+                    409,
+                    {"shipment_id": existing["id"], "business_id": existing["business_id"]},
+                )
             try:
                 cursor = conn.execute(
                     """
                     INSERT INTO shipments (
-                        store_id, store_name_snapshot, created_by, recipient_name, phone, address,
+                        order_date, business_id, store_id, store_name_snapshot, created_by, recipient_name, phone, address,
                         store_order_no, remark, status, created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, '待处理', ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '待处理', ?, ?)
                     """,
                     (
+                        order_date,
+                        business_id,
                         store_id,
                         store["name"],
                         user["id"],
@@ -602,7 +876,7 @@ class Database:
                     ),
                 )
             except sqlite3.IntegrityError as exc:
-                raise AppError("这个门店订单号已经提交过。", 409) from exc
+                raise AppError("同一门店同一天的订单号不能重复。", 409) from exc
 
             shipment_id = cursor.lastrowid
             for item in items:
@@ -662,6 +936,8 @@ class Database:
                 raise AppError("无权编辑这个发货单。", 403)
             if shipment["status"] != "待处理":
                 raise AppError("只有待处理订单可以编辑商品。", 409)
+            if shipment["booking_status"] not in BOOKING_EDITABLE_STATUSES:
+                raise AppError("快递下单处理中。如需修改，请先取消快递下单。", 409)
 
             items = self._resolve_items(conn, raw_items)
             conn.execute("DELETE FROM shipment_items WHERE shipment_id = ?", (shipment_id,))
@@ -704,11 +980,11 @@ class Database:
             where.append("shipments.status = ?")
             params.append(filters["status"])
         if filters.get("date_from"):
-            where.append("datetime(shipments.created_at) >= datetime(?)")
-            params.append(local_day_start(str(filters["date_from"])))
+            where.append("shipments.order_date >= ?")
+            params.append(str(filters["date_from"]))
         if filters.get("date_to"):
-            where.append("datetime(shipments.created_at) <= datetime(?)")
-            params.append(local_day_end(str(filters["date_to"])))
+            where.append("shipments.order_date <= ?")
+            params.append(str(filters["date_to"]))
         if filters.get("q"):
             query_text = str(filters["q"]).strip()
             q = f"%{query_text}%"
@@ -719,12 +995,11 @@ class Database:
                     where.append(
                         """
                         (
-                            shipments.store_order_no LIKE ? OR shipments.recipient_name LIKE ? OR
+                            shipments.business_id LIKE ? OR shipments.store_order_no LIKE ? OR shipments.recipient_name LIKE ? OR
                             shipments.phone LIKE ? OR shipments.tracking_no LIKE ? OR
                             shipments.address LIKE ? OR
                             (
-                                datetime(shipments.created_at) >= datetime(?) AND
-                                datetime(shipments.created_at) <= datetime(?) AND
+                                shipments.order_date = ? AND
                                 shipments.store_id = ? AND
                                 shipments.store_order_no LIKE ?
                             )
@@ -738,8 +1013,8 @@ class Database:
                             q,
                             q,
                             q,
-                            local_day_start(date_text),
-                            local_day_end(date_text),
+                            q,
+                            date_text,
                             business_store_id,
                             f"%{order_text}%",
                         ]
@@ -748,29 +1023,28 @@ class Database:
                     where.append(
                         """
                         (
-                            shipments.store_order_no LIKE ? OR shipments.recipient_name LIKE ? OR
+                            shipments.business_id LIKE ? OR shipments.store_order_no LIKE ? OR shipments.recipient_name LIKE ? OR
                             shipments.phone LIKE ? OR shipments.tracking_no LIKE ? OR
                             shipments.address LIKE ? OR
                             (
-                                datetime(shipments.created_at) >= datetime(?) AND
-                                datetime(shipments.created_at) <= datetime(?) AND
+                                shipments.order_date = ? AND
                                 shipments.store_order_no LIKE ?
                             )
                         )
                         """
                     )
-                    params.extend([q, q, q, q, q, local_day_start(date_text), local_day_end(date_text), f"%{order_text}%"])
+                    params.extend([q, q, q, q, q, q, date_text, f"%{order_text}%"])
             else:
                 where.append(
                     """
                     (
-                        shipments.store_order_no LIKE ? OR shipments.recipient_name LIKE ? OR
+                        shipments.business_id LIKE ? OR shipments.store_order_no LIKE ? OR shipments.recipient_name LIKE ? OR
                         shipments.phone LIKE ? OR shipments.tracking_no LIKE ? OR
                         shipments.address LIKE ?
                     )
                     """
                 )
-                params.extend([q, q, q, q, q])
+                params.extend([q, q, q, q, q, q])
 
         sql = "SELECT shipments.* FROM shipments"
         if where:
@@ -799,6 +1073,483 @@ class Database:
                 for item in row["items"]
             )
         return rows
+
+    def get_shipping_settings(self) -> Dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM shipping_settings WHERE id = 1").fetchone()
+        return dict(row) if row else {
+            "id": 1,
+            "sender_name": "",
+            "sender_mobile": "",
+            "sender_address": "",
+            "default_company": DEFAULT_EXPRESS_COMPANY,
+            "cargo_name": "香氛商品",
+            "updated_at": "",
+        }
+
+    def update_shipping_settings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        sender_name = str(payload.get("sender_name") or "").strip()
+        sender_mobile = str(payload.get("sender_mobile") or "").strip()
+        sender_address = str(payload.get("sender_address") or "").strip()
+        default_company = str(payload.get("default_company") or DEFAULT_EXPRESS_COMPANY).strip()
+        cargo_name = str(payload.get("cargo_name") or "香氛商品").strip()
+        if not sender_name:
+            raise AppError("请输入总部寄件人姓名。")
+        if not sender_mobile or not re_phone_ok(sender_mobile):
+            raise AppError("请输入有效的总部寄件联系电话。")
+        if not sender_address:
+            raise AppError("请输入总部完整寄件地址。")
+        if default_company not in EXPRESS_COMPANIES:
+            raise AppError("请选择有效的默认快递公司。")
+        if not cargo_name:
+            raise AppError("请输入物品名称。")
+        now = now_text()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO shipping_settings (
+                    id, sender_name, sender_mobile, sender_address, default_company, cargo_name, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    sender_name = excluded.sender_name,
+                    sender_mobile = excluded.sender_mobile,
+                    sender_address = excluded.sender_address,
+                    default_company = excluded.default_company,
+                    cargo_name = excluded.cargo_name,
+                    updated_at = excluded.updated_at
+                """,
+                (sender_name, sender_mobile, sender_address, default_company, cargo_name, now),
+            )
+        return self.get_shipping_settings()
+
+    @staticmethod
+    def shipment_booking_eligible(row: Dict[str, Any]) -> bool:
+        return (
+            row.get("status") == "待处理"
+            and not str(row.get("tracking_no") or "").strip()
+            and str(row.get("booking_status") or "未下单") in BOOKING_EDITABLE_STATUSES
+        )
+
+    def preview_shipping_batch(self, user: Dict[str, Any], filters: Dict[str, Any]) -> Dict[str, Any]:
+        shipments = self.list_shipments(user, filters)
+        settings = self.get_shipping_settings()
+        default_company = settings.get("default_company") or DEFAULT_EXPRESS_COMPANY
+        eligible = []
+        excluded = []
+        company_counts = {company: 0 for company in EXPRESS_COMPANIES}
+        for shipment in shipments:
+            if self.shipment_booking_eligible(shipment):
+                company = shipment.get("express_company") if shipment.get("express_company") in EXPRESS_COMPANIES else default_company
+                row = {
+                    "id": shipment["id"],
+                    "business_id": shipment["business_id"],
+                    "store_name_snapshot": shipment["store_name_snapshot"],
+                    "store_order_no": shipment["store_order_no"],
+                    "recipient_name": shipment["recipient_name"],
+                    "address": shipment["address"],
+                    "express_company": company,
+                }
+                eligible.append(row)
+                company_counts[company] += 1
+            else:
+                reason = "状态不可下单"
+                if shipment.get("tracking_no"):
+                    reason = "已有快递单号"
+                elif shipment.get("booking_status") not in BOOKING_EDITABLE_STATUSES:
+                    reason = f"下单状态：{shipment.get('booking_status')}"
+                excluded.append({"id": shipment["id"], "business_id": shipment["business_id"], "reason": reason})
+        return {
+            "matched": len(shipments),
+            "eligible": eligible,
+            "excluded": excluded,
+            "company_counts": company_counts,
+            "settings_ready": bool(settings.get("sender_name") and settings.get("sender_mobile") and settings.get("sender_address")),
+        }
+
+    def create_shipping_batch(
+        self,
+        user: Dict[str, Any],
+        shipment_choices: List[Dict[str, Any]],
+        pickup_day: str,
+        pickup_start_time: str,
+        pickup_end_time: str,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if pickup_day not in {"今天", "明天", "后天"}:
+            raise AppError("请选择今天、明天或后天取件。")
+        if not re.fullmatch(r"\d{2}:\d{2}", pickup_start_time) or not re.fullmatch(r"\d{2}:\d{2}", pickup_end_time):
+            raise AppError("请选择有效取件时间段。")
+        start_minutes = int(pickup_start_time[:2]) * 60 + int(pickup_start_time[3:])
+        end_minutes = int(pickup_end_time[:2]) * 60 + int(pickup_end_time[3:])
+        if end_minutes - start_minutes < 60:
+            raise AppError("取件时间段至少需要一小时。")
+        if not shipment_choices:
+            raise AppError("没有可下单的发货单。")
+
+        now = now_text()
+        seen: set[int] = set()
+        normalized: List[tuple[int, str]] = []
+        for choice in shipment_choices:
+            try:
+                shipment_id = int(choice.get("id"))
+            except (TypeError, ValueError):
+                continue
+            company = str(choice.get("express_company") or DEFAULT_EXPRESS_COMPANY).strip()
+            if company not in EXPRESS_COMPANIES:
+                raise AppError(f"不支持这个快递公司：{company}")
+            if shipment_id not in seen:
+                seen.add(shipment_id)
+                normalized.append((shipment_id, company))
+        if not normalized:
+            raise AppError("没有可下单的发货单。")
+
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            valid: List[tuple[sqlite3.Row, str]] = []
+            for shipment_id, company in normalized:
+                row = conn.execute("SELECT * FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
+                if row and self.shipment_booking_eligible(dict(row)):
+                    valid.append((row, company))
+            if not valid:
+                raise AppError("所选订单已被处理，请刷新后重试。", 409)
+            cursor = conn.execute(
+                """
+                INSERT INTO shipping_batches (
+                    created_by, filters_json, pickup_day, pickup_start_time, pickup_end_time,
+                    status, total_count, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, '排队中', ?, ?, ?)
+                """,
+                (user["id"], json.dumps(filters or {}, ensure_ascii=False), pickup_day, pickup_start_time, pickup_end_time, len(valid), now, now),
+            )
+            batch_id = int(cursor.lastrowid)
+            for shipment, company in valid:
+                request_id = str(shipment["booking_request_id"] or f"SP{shipment['order_date'].replace('-', '')}S{int(shipment['store_id']):02d}N{shipment['id']}")[:32]
+                salt = str(shipment["booking_salt"] or secrets.token_hex(12))
+                conn.execute(
+                    """
+                    UPDATE shipments
+                    SET express_company = ?, booking_status = '排队中', booking_request_id = ?,
+                        booking_salt = ?, booking_error = '', booking_requested_at = ?, booking_updated_at = ?,
+                        pickup_day = ?, pickup_start_time = ?, pickup_end_time = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (company, request_id, salt, now, now, pickup_day, pickup_start_time, pickup_end_time, now, shipment["id"]),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO shipping_batch_items (
+                        batch_id, shipment_id, express_company, request_id, callback_salt,
+                        status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, '排队中', ?, ?)
+                    """,
+                    (batch_id, shipment["id"], company, request_id, salt, now, now),
+                )
+        return self.get_shipping_batch(batch_id)
+
+    def claim_next_shipping_job(self) -> Optional[Dict[str, Any]]:
+        now = now_text()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = conn.execute(
+                """
+                SELECT shipping_batch_items.*
+                FROM shipping_batch_items
+                WHERE shipping_batch_items.status = '排队中'
+                ORDER BY shipping_batch_items.id
+                LIMIT 1
+                """
+            ).fetchone()
+            if not job:
+                return None
+            conn.execute(
+                """
+                UPDATE shipping_batch_items
+                SET status = '提交中', attempt_count = attempt_count + 1, error = '', updated_at = ?
+                WHERE id = ?
+                """,
+                (now, job["id"]),
+            )
+            conn.execute(
+                "UPDATE shipments SET booking_status = '提交中', booking_updated_at = ?, updated_at = ? WHERE id = ?",
+                (now, now, job["shipment_id"]),
+            )
+            conn.execute(
+                "UPDATE shipping_batches SET status = '处理中', updated_at = ? WHERE id = ?",
+                (now, job["batch_id"]),
+            )
+            shipment = conn.execute("SELECT * FROM shipments WHERE id = ?", (job["shipment_id"],)).fetchone()
+            items = conn.execute("SELECT * FROM shipment_items WHERE shipment_id = ? ORDER BY id", (job["shipment_id"],)).fetchall()
+        payload = dict(shipment)
+        payload["items"] = [dict(item) for item in items]
+        payload["batch_item_id"] = job["id"]
+        payload["batch_id"] = job["batch_id"]
+        return payload
+
+    def complete_shipping_job(self, item_id: int, result: Dict[str, Any]) -> Dict[str, Any]:
+        now = now_text()
+        success = bool(result.get("success"))
+        tracking_no = str(result.get("tracking_no") or "").strip()
+        item_status = "成功" if success and tracking_no else "待取号" if success else "失败"
+        booking_status = "已出单" if success and tracking_no else "待取号" if success else "下单失败"
+        with self.connect() as conn:
+            item = conn.execute("SELECT * FROM shipping_batch_items WHERE id = ?", (item_id,)).fetchone()
+            if not item:
+                raise AppError("批次任务不存在。", 404)
+            shipment = conn.execute("SELECT * FROM shipments WHERE id = ?", (item["shipment_id"],)).fetchone()
+            if not shipment:
+                raise AppError("发货单不存在。", 404)
+            status = "已发货" if tracking_no else shipment["status"]
+            shipped_at = shipment["shipped_at"] or (now if tracking_no else "")
+            conn.execute(
+                """
+                UPDATE shipping_batch_items
+                SET status = ?, task_id = ?, order_id = ?, error = ?, response_raw = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    item_status, str(result.get("task_id") or ""), str(result.get("order_id") or ""),
+                    str(result.get("error") or ""), str(result.get("raw") or ""), now, item_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE shipments
+                SET status = ?, tracking_no = CASE WHEN ? <> '' THEN ? ELSE tracking_no END,
+                    tracking_status = CASE WHEN ? <> '' THEN '待查询' ELSE tracking_status END,
+                    tracking_provider = CASE WHEN ? <> '' THEN 'kuaidi100' ELSE tracking_provider END,
+                    shipped_at = ?, booking_status = ?, booking_task_id = ?, booking_order_id = ?,
+                    booking_poll_token = ?, booking_error = ?, booking_raw = ?, booking_updated_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status, tracking_no, tracking_no, tracking_no, tracking_no, shipped_at, booking_status,
+                    str(result.get("task_id") or ""), str(result.get("order_id") or ""),
+                    str(result.get("poll_token") or ""), str(result.get("error") or ""),
+                    str(result.get("raw") or ""), now, now, item["shipment_id"],
+                ),
+            )
+            self._refresh_shipping_batch_status(conn, int(item["batch_id"]), now)
+        return {"shipment_id": item["shipment_id"], "tracking_no": tracking_no, "success": success}
+
+    def _refresh_shipping_batch_status(self, conn: sqlite3.Connection, batch_id: int, now: str) -> None:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS count FROM shipping_batch_items WHERE batch_id = ? GROUP BY status",
+            (batch_id,),
+        ).fetchall()
+        counts = {row["status"]: row["count"] for row in rows}
+        if counts.get("排队中") or counts.get("提交中"):
+            status = "处理中"
+            finished_at = ""
+        elif counts.get("待取号"):
+            status = "等待单号"
+            finished_at = now
+        elif counts.get("失败") and not counts.get("成功"):
+            status = "失败"
+            finished_at = now
+        elif counts.get("失败"):
+            status = "部分完成"
+            finished_at = now
+        else:
+            status = "已完成"
+            finished_at = now
+        conn.execute(
+            "UPDATE shipping_batches SET status = ?, updated_at = ?, finished_at = ? WHERE id = ?",
+            (status, now, finished_at, batch_id),
+        )
+
+    def get_shipping_batch(self, batch_id: int) -> Dict[str, Any]:
+        with self.connect() as conn:
+            batch = conn.execute("SELECT * FROM shipping_batches WHERE id = ?", (batch_id,)).fetchone()
+            if not batch:
+                raise AppError("下单批次不存在。", 404)
+            items = conn.execute(
+                """
+                SELECT shipping_batch_items.*, shipments.business_id, shipments.store_order_no,
+                       shipments.store_name_snapshot, shipments.recipient_name, shipments.tracking_no,
+                       shipments.booking_status
+                FROM shipping_batch_items
+                JOIN shipments ON shipments.id = shipping_batch_items.shipment_id
+                WHERE shipping_batch_items.batch_id = ?
+                ORDER BY shipping_batch_items.id
+                """,
+                (batch_id,),
+            ).fetchall()
+        item_list = [dict(item) for item in items]
+        counts: Dict[str, int] = {}
+        for item in item_list:
+            counts[item["status"]] = counts.get(item["status"], 0) + 1
+        return {"batch": dict(batch), "items": item_list, "counts": counts}
+
+    def retry_shipping_batch(self, batch_id: int) -> Dict[str, Any]:
+        now = now_text()
+        with self.connect() as conn:
+            failed = conn.execute(
+                "SELECT shipment_id FROM shipping_batch_items WHERE batch_id = ? AND status = '失败'",
+                (batch_id,),
+            ).fetchall()
+            if not failed:
+                raise AppError("这个批次没有可重试的失败订单。", 409)
+            conn.execute(
+                "UPDATE shipping_batch_items SET status = '排队中', error = '', updated_at = ? WHERE batch_id = ? AND status = '失败'",
+                (now, batch_id),
+            )
+            for row in failed:
+                conn.execute(
+                    "UPDATE shipments SET booking_status = '排队中', booking_error = '', booking_updated_at = ?, updated_at = ? WHERE id = ?",
+                    (now, now, row["shipment_id"]),
+                )
+            conn.execute(
+                "UPDATE shipping_batches SET status = '排队中', finished_at = '', updated_at = ? WHERE id = ?",
+                (now, batch_id),
+            )
+        return self.get_shipping_batch(batch_id)
+
+    def reset_stale_shipping_jobs(self) -> None:
+        now = now_text()
+        stale_before = (datetime.now(APP_TZ) - timedelta(minutes=10)).isoformat(timespec="seconds")
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, shipment_id, batch_id FROM shipping_batch_items WHERE status = '提交中' AND updated_at < ?",
+                (stale_before,),
+            ).fetchall()
+            for row in rows:
+                conn.execute("UPDATE shipping_batch_items SET status = '排队中', updated_at = ? WHERE id = ?", (now, row["id"]))
+                conn.execute(
+                    "UPDATE shipments SET booking_status = '排队中', booking_updated_at = ?, updated_at = ? WHERE id = ?",
+                    (now, now, row["shipment_id"]),
+                )
+                conn.execute("UPDATE shipping_batches SET status = '排队中', updated_at = ? WHERE id = ?", (now, row["batch_id"]))
+
+    def apply_shipping_callback(self, task_id: str, param_raw: str, param: Dict[str, Any]) -> Dict[str, Any]:
+        carrier_status = str((param.get("data") or {}).get("status") or param.get("status") or "")
+        tracking_no = str(param.get("kuaidinum") or "").strip()
+        event_key = hashlib.sha256(f"{task_id}|{carrier_status}|{tracking_no}|{param_raw}".encode("utf-8")).hexdigest()
+        now = now_text()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO shipping_callback_events (task_id, carrier_status, event_key, param_raw, created_at) VALUES (?, ?, ?, ?, ?)",
+                (task_id, carrier_status, event_key, param_raw, now),
+            )
+            if cursor.rowcount == 0:
+                return {"duplicate": True, "should_refresh_tracking": False}
+            batch_item = conn.execute(
+                "SELECT * FROM shipping_batch_items WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if not batch_item:
+                raise AppError("没有找到对应的快递下单任务。", 404)
+            if batch_item["status"] == "已取消":
+                return {"duplicate": False, "ignored": True, "should_refresh_tracking": False}
+            shipment = conn.execute("SELECT * FROM shipments WHERE id = ?", (batch_item["shipment_id"],)).fetchone()
+            if not shipment or shipment["booking_task_id"] != task_id:
+                return {"duplicate": False, "ignored": True, "should_refresh_tracking": False}
+            data = param.get("data") if isinstance(param.get("data"), dict) else {}
+            booking_status = shipment["booking_status"]
+            status = shipment["status"]
+            booking_error = ""
+            if carrier_status in {"11", "201", "610"}:
+                booking_status = "下单失败"
+                status = "待处理"
+                booking_error = str(param.get("message") or data.get("cancelMsg99") or "快递下单失败")
+            elif carrier_status in {"9", "99"}:
+                booking_status = "已取消"
+                status = "待处理"
+                tracking_no = ""
+            elif carrier_status in {"13"}:
+                booking_status = "已出单"
+                status = "已签收"
+            elif tracking_no or carrier_status in {"10", "101", "200", "400"}:
+                booking_status = "已出单" if tracking_no else "待取号"
+                status = "已发货" if tracking_no else status
+            elif carrier_status in {"0", "1", "2"}:
+                booking_status = "已接单" if carrier_status in {"1", "2"} else "待取号"
+
+            poll_token = str(data.get("pollToken") or shipment["booking_poll_token"] or "")
+            final_tracking_no = tracking_no or str(shipment["tracking_no"] or "")
+            shipped_at = shipment["shipped_at"] or (now if final_tracking_no else "")
+            tracking_status = shipment["tracking_status"]
+            tracking_signed_at = shipment["tracking_signed_at"]
+            if status == "已签收":
+                tracking_status = "已签收"
+                tracking_signed_at = tracking_signed_at or now
+            elif final_tracking_no and not tracking_status:
+                tracking_status = "待查询"
+            conn.execute(
+                """
+                UPDATE shipments
+                SET status = ?, tracking_no = ?, tracking_status = ?, tracking_signed_at = ?, shipped_at = ?,
+                    booking_status = ?, booking_poll_token = ?, booking_error = ?, booking_carrier_status = ?,
+                    booking_raw = ?, booking_updated_at = ?, booking_courier_name = ?, booking_courier_mobile = ?,
+                    booking_weight = ?, booking_freight = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status, final_tracking_no, tracking_status, tracking_signed_at, shipped_at, booking_status,
+                    poll_token, booking_error, carrier_status, param_raw, now,
+                    str(data.get("courierName") or shipment["booking_courier_name"] or ""),
+                    str(data.get("courierMobile") or shipment["booking_courier_mobile"] or ""),
+                    str(data.get("weight") or data.get("actualWeight") or shipment["booking_weight"] or ""),
+                    str(data.get("freight") or shipment["booking_freight"] or ""), now, shipment["id"],
+                ),
+            )
+            item_status = "成功" if final_tracking_no else "失败" if booking_status == "下单失败" else "已取消" if booking_status == "已取消" else "待取号"
+            if batch_item:
+                conn.execute(
+                    "UPDATE shipping_batch_items SET status = ?, error = ?, response_raw = ?, updated_at = ? WHERE id = ?",
+                    (item_status, booking_error, param_raw, now, batch_item["id"]),
+                )
+                self._refresh_shipping_batch_status(conn, int(batch_item["batch_id"]), now)
+        return {"duplicate": False, "shipment_id": shipment["id"], "should_refresh_tracking": bool(final_tracking_no and status != "已签收")}
+
+    def booking_salt_for_task(self, task_id: str) -> str:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT callback_salt AS booking_salt FROM shipping_batch_items WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        if not row:
+            raise AppError("没有找到对应的快递下单任务。", 404)
+        return str(row["booking_salt"] or "")
+
+    def booking_for_cancel(self, shipment_id: int) -> Dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
+        if not row:
+            raise AppError("发货单不存在。", 404)
+        if not row["booking_task_id"] or not row["booking_order_id"]:
+            raise AppError("这个订单没有可取消的快递下单。", 409)
+        if row["status"] == "已签收":
+            raise AppError("已签收订单不能取消快递下单。", 409)
+        return dict(row)
+
+    def mark_booking_cancelled(self, shipment_id: int, raw: str = "") -> Dict[str, Any]:
+        now = now_text()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE shipments
+                SET status = '待处理', express_company = '', tracking_no = '', tracking_provider = '',
+                    tracking_status = '', tracking_state_code = '', tracking_last_event = '',
+                    tracking_last_checked_at = '', tracking_signed_at = '', tracking_error = '', tracking_raw = '',
+                    shipped_at = '', booking_status = '已取消', booking_task_id = '', booking_order_id = '',
+                    booking_request_id = '', booking_poll_token = '', booking_salt = '',
+                    booking_error = '', booking_raw = ?,
+                    booking_updated_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (raw, now, now, shipment_id),
+            )
+            item = conn.execute(
+                "SELECT * FROM shipping_batch_items WHERE shipment_id = ? ORDER BY id DESC LIMIT 1",
+                (shipment_id,),
+            ).fetchone()
+            if item:
+                conn.execute(
+                    "UPDATE shipping_batch_items SET status = '已取消', response_raw = ?, updated_at = ? WHERE id = ?",
+                    (raw, now, item["id"]),
+                )
+                self._refresh_shipping_batch_status(conn, int(item["batch_id"]), now)
+        return {"id": shipment_id, "booking_status": "已取消"}
 
     def tracking_candidates(self, stale_before: str = "", limit: int = 20) -> List[Dict[str, Any]]:
         where = [
@@ -881,6 +1632,8 @@ class Database:
             existing = conn.execute("SELECT * FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
             if not existing:
                 raise AppError("发货单不存在。", 404)
+            if existing["booking_status"] not in BOOKING_EDITABLE_STATUSES:
+                raise AppError("快递已下单。如需修改，请先取消快递下单。", 409)
 
         auto_shipped = status == "待处理" and tracking_no
         if auto_shipped:
@@ -954,9 +1707,12 @@ class Database:
 
     def delete_shipment(self, shipment_id: int) -> Dict[str, Any]:
         with self.connect() as conn:
-            cursor = conn.execute("DELETE FROM shipments WHERE id = ?", (shipment_id,))
-            if cursor.rowcount == 0:
+            shipment = conn.execute("SELECT booking_status FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
+            if not shipment:
                 raise AppError("发货单不存在。", 404)
+            if shipment["booking_status"] not in BOOKING_EDITABLE_STATUSES:
+                raise AppError("快递下单处理中，不能直接删除。请先取消快递下单。", 409)
+            cursor = conn.execute("DELETE FROM shipments WHERE id = ?", (shipment_id,))
         return {"id": shipment_id, "deleted": True}
 
     def create_return_order(self, user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:

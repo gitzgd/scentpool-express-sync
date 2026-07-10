@@ -101,13 +101,15 @@ class Kuaidi100Client:
                 request_data["phone"] = phone
 
         param = json.dumps(request_data, ensure_ascii=False, separators=(",", ":"))
-        payload = urllib.parse.urlencode(
-            {
-                "customer": self.customer,
-                "sign": self.sign(param),
-                "param": param,
-            }
-        ).encode("utf-8")
+        form = {
+            "customer": self.customer,
+            "sign": self.sign(param),
+            "param": param,
+        }
+        poll_token = str(shipment.get("booking_poll_token") or "").strip()
+        if poll_token:
+            form["pollToken"] = poll_token
+        payload = urllib.parse.urlencode(form).encode("utf-8")
         request = urllib.request.Request(
             self.endpoint,
             data=payload,

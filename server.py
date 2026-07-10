@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from xml.sax.saxutils import escape as xml_escape
 
 from database import AppError, Database, DEFAULT_PRODUCT_FILE, RETURN_STATUSES, STATUSES, now_text
+from shipping import Kuaidi100OrderClient, order_config_public, order_enabled, verify_callback_signature
 from tracking import manual_refresh_stale_before, query_tracking, tracking_auto_enabled, tracking_config_public, tracking_interval_minutes, tracking_stale_before
 
 
@@ -48,6 +49,7 @@ def format_items_for_export(items: Any) -> str:
 
 
 EXPORT_HEADERS = [
+    "业务ID",
     "发货单ID",
     "提交时间",
     "门店",
@@ -68,7 +70,7 @@ EXPORT_HEADERS = [
     "发货时间",
 ]
 
-EXPORT_COLUMN_WIDTHS = [10, 20, 14, 18, 10, 12, 16, 36, 52, 24, 12, 22, 14, 46, 20, 20, 24, 20]
+EXPORT_COLUMN_WIDTHS = [28, 10, 20, 14, 18, 10, 12, 16, 36, 52, 24, 12, 22, 14, 46, 20, 20, 24, 20]
 
 
 def export_rows(shipments: Any) -> list[list[Any]]:
@@ -76,6 +78,7 @@ def export_rows(shipments: Any) -> list[list[Any]]:
     for row in shipments:
         rows.append(
             [
+                row["business_id"],
                 row["id"],
                 row["created_at"],
                 row["store_name_snapshot"],
@@ -113,13 +116,13 @@ def xlsx_cell(row_index: int, col_index: int, value: Any, style: int) -> str:
     return f'<c r="{ref}" t="inlineStr" s="{style}"><is><t xml:space="preserve">{text}</t></is></c>'
 
 
-def build_shipments_xlsx(shipments: Any) -> bytes:
-    rows = [EXPORT_HEADERS, *export_rows(shipments)]
-    max_col = excel_col(len(EXPORT_HEADERS))
+def build_table_xlsx(headers: list[str], data_rows: list[list[Any]], widths: list[int], sheet_name: str) -> bytes:
+    rows = [headers, *data_rows]
+    max_col = excel_col(len(headers))
     dimension = f"A1:{max_col}{max(len(rows), 1)}"
     cols = "".join(
         f'<col min="{idx}" max="{idx}" width="{width}" customWidth="1"/>'
-        for idx, width in enumerate(EXPORT_COLUMN_WIDTHS, start=1)
+        for idx, width in enumerate(widths, start=1)
     )
     sheet_rows = []
     for row_index, row in enumerate(rows, start=1):
@@ -159,9 +162,9 @@ def build_shipments_xlsx(shipments: Any) -> bytes:
   </cellXfs>
   <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
 </styleSheet>"""
-    workbook_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    workbook_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-  <sheets><sheet name="发货明细" sheetId="1" r:id="rId1"/></sheets>
+  <sheets><sheet name="{xml_escape(sheet_name)}" sheetId="1" r:id="rId1"/></sheets>
 </workbook>"""
     workbook_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
@@ -190,6 +193,38 @@ def build_shipments_xlsx(shipments: Any) -> bytes:
         zf.writestr("xl/styles.xml", styles_xml)
         zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
     return output.getvalue()
+
+
+def build_shipments_xlsx(shipments: Any) -> bytes:
+    return build_table_xlsx(EXPORT_HEADERS, export_rows(shipments), EXPORT_COLUMN_WIDTHS, "发货明细")
+
+
+CAINIAO_HEADERS = [
+    "订单编号", "快递公司", "运单号", "收件人姓名", "收件人手机", "收件人地址",
+    "商品名称", "商品数量", "寄件人姓名", "寄件人手机", "寄件人地址", "备注",
+]
+CAINIAO_WIDTHS = [28, 12, 22, 14, 16, 42, 42, 12, 14, 16, 42, 24]
+
+
+def build_cainiao_xlsx(shipments: Any, settings: Dict[str, Any]) -> bytes:
+    rows: list[list[Any]] = []
+    for shipment in shipments:
+        if not str(shipment.get("tracking_no") or "").strip():
+            continue
+        item_names = "、".join(
+            f"{item.get('product_name') or item.get('product_barcode')} x{item.get('quantity') or 0}"
+            for item in shipment.get("items") or []
+        )
+        total_quantity = sum(int(item.get("quantity") or 0) for item in shipment.get("items") or [])
+        rows.append(
+            [
+                shipment.get("business_id"), shipment.get("express_company"), shipment.get("tracking_no"),
+                shipment.get("recipient_name"), shipment.get("phone"), shipment.get("address"),
+                item_names, total_quantity, settings.get("sender_name"), settings.get("sender_mobile"),
+                settings.get("sender_address"), shipment.get("remark"),
+            ]
+        )
+    return build_table_xlsx(CAINIAO_HEADERS, rows, CAINIAO_WIDTHS, "菜鸟打印数据")
 
 
 def safe_filename_part(value: Any) -> str:
@@ -394,6 +429,40 @@ def start_tracking_worker() -> None:
     thread.start()
 
 
+def process_next_shipping_job() -> bool:
+    job = DB.claim_next_shipping_job()
+    if not job:
+        return False
+    try:
+        result = Kuaidi100OrderClient.from_env().create_order(job, DB.get_shipping_settings())
+    except Exception as exc:
+        result = {"success": False, "error": f"快递下单失败：{exc}", "raw": ""}
+    completed = DB.complete_shipping_job(int(job["batch_item_id"]), result)
+    if completed.get("tracking_no"):
+        try:
+            shipment = DB.get_shipment(int(completed["shipment_id"]), {"role": "admin"})
+            refresh_tracking_for_shipment(shipment)
+        except Exception as exc:
+            print(f"[shipping] 首次物流查询失败：{exc}")
+    return True
+
+
+def shipping_worker() -> None:
+    DB.reset_stale_shipping_jobs()
+    while True:
+        try:
+            if order_enabled() and process_next_shipping_job():
+                continue
+        except Exception as exc:
+            print(f"[shipping] 批量下单任务失败：{exc}")
+        time.sleep(2)
+
+
+def start_shipping_worker() -> None:
+    thread = threading.Thread(target=shipping_worker, name="scentpool-shipping", daemon=True)
+    thread.start()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ScentpoolExpress/1.0"
 
@@ -404,6 +473,9 @@ class Handler(BaseHTTPRequestHandler):
         self.route()
 
     def do_PATCH(self) -> None:
+        self.route()
+
+    def do_PUT(self) -> None:
         self.route()
 
     def do_DELETE(self) -> None:
@@ -425,12 +497,12 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/static/"):
                 self.serve_static(path)
                 return
-            if path in {"/", "/login", "/submit", "/shipments", "/returns/new", "/returns", "/admin", "/admin/returns", "/admin/stores", "/admin/products"}:
+            if path in {"/", "/login", "/submit", "/shipments", "/returns/new", "/returns", "/admin", "/admin/returns", "/admin/stores", "/admin/products", "/admin/shipping"}:
                 self.serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
                 return
             self.error_json("页面不存在。", 404)
         except AppError as exc:
-            self.error_json(exc.message, exc.status)
+            self.error_json(exc.message, exc.status, exc.details)
         except Exception as exc:  # pragma: no cover - final safety net for local prototype
             self.error_json(f"服务器错误：{exc}", 500)
 
@@ -453,6 +525,30 @@ class Handler(BaseHTTPRequestHandler):
             if token:
                 DB.delete_session(token)
             self.send_json({"ok": True}, headers={"Set-Cookie": self.expired_session_cookie()})
+            return
+
+        if path == "/api/integrations/kuaidi100/order-callback" and self.command == "POST":
+            form = self.read_form()
+            task_id = str(form.get("taskId") or "").strip()
+            param_raw = str(form.get("param") or "")
+            sign = str(form.get("sign") or "")
+            if not task_id or not param_raw:
+                raise AppError("快递回调参数不完整。")
+            salt = DB.booking_salt_for_task(task_id)
+            if not verify_callback_signature(param_raw, sign, salt):
+                raise AppError("快递回调签名不正确。", 403)
+            try:
+                callback_param = json.loads(param_raw)
+            except json.JSONDecodeError as exc:
+                raise AppError("快递回调内容不是有效 JSON。") from exc
+            result = DB.apply_shipping_callback(task_id, param_raw, callback_param)
+            if result.get("should_refresh_tracking"):
+                try:
+                    shipment = DB.get_shipment(int(result["shipment_id"]), {"role": "admin"})
+                    refresh_tracking_for_shipment(shipment)
+                except Exception as exc:
+                    print(f"[shipping] 回调后的物流查询失败：{exc}")
+            self.send_json({"result": True, "returnCode": "200", "message": "成功"})
             return
 
         user = self.require_user()
@@ -547,7 +643,57 @@ class Handler(BaseHTTPRequestHandler):
             self.require_admin(user)
             config = tracking_config_public()
             config["return_interval_minutes"] = return_tracking_interval_minutes()
-            self.send_json({"tracking": config})
+            self.send_json({"tracking": config, "shipping": order_config_public()})
+            return
+
+        if path == "/api/admin/shipping-settings" and self.command == "GET":
+            self.require_admin(user)
+            self.send_json({"settings": DB.get_shipping_settings(), "shipping": order_config_public()})
+            return
+
+        if path == "/api/admin/shipping-settings" and self.command == "PUT":
+            self.require_admin(user)
+            self.send_json({"settings": DB.update_shipping_settings(self.read_json()), "shipping": order_config_public()})
+            return
+
+        if path == "/api/admin/shipping-batches/preview" and self.command == "POST":
+            self.require_admin(user)
+            body = self.read_json()
+            filters = body.get("filters") if isinstance(body.get("filters"), dict) else {}
+            self.send_json({"preview": DB.preview_shipping_batch(user, filters)})
+            return
+
+        if path == "/api/admin/shipping-batches" and self.command == "POST":
+            self.require_admin(user)
+            shipping_config = order_config_public()
+            if not shipping_config.get("enabled") or not shipping_config.get("configured"):
+                raise AppError("快递100下单尚未启用或配置不完整，请先检查发货设置和 Render 环境变量。", 503)
+            settings = DB.get_shipping_settings()
+            if not settings.get("sender_name") or not settings.get("sender_mobile") or not settings.get("sender_address"):
+                raise AppError("请先完成总部发货设置。", 409)
+            body = self.read_json()
+            choices = body.get("shipments") if isinstance(body.get("shipments"), list) else []
+            batch = DB.create_shipping_batch(
+                user,
+                choices,
+                str(body.get("pickup_day") or ""),
+                str(body.get("pickup_start_time") or ""),
+                str(body.get("pickup_end_time") or ""),
+                body.get("filters") if isinstance(body.get("filters"), dict) else {},
+            )
+            self.send_json(batch, status=202)
+            return
+
+        if path.startswith("/api/admin/shipping-batches/") and path.endswith("/retry") and self.command == "POST":
+            self.require_admin(user)
+            batch_id = int(path.split("/")[4])
+            self.send_json(DB.retry_shipping_batch(batch_id))
+            return
+
+        if path.startswith("/api/admin/shipping-batches/") and self.command == "GET":
+            self.require_admin(user)
+            batch_id = int(path.rsplit("/", 1)[-1])
+            self.send_json(DB.get_shipping_batch(batch_id))
             return
 
         if path == "/api/admin/tracking/sync" and self.command == "POST":
@@ -579,6 +725,20 @@ class Handler(BaseHTTPRequestHandler):
             shipment = DB.get_shipment(shipment_id, user)
             require_manual_tracking_allowed(shipment)
             refresh_tracking_for_shipment(shipment)
+            self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
+            return
+
+        if path.startswith("/api/shipments/") and path.endswith("/booking/cancel") and self.command == "POST":
+            self.require_admin(user)
+            shipment_id = int(path.split("/")[3])
+            booking = DB.booking_for_cancel(shipment_id)
+            result = Kuaidi100OrderClient.from_env().cancel_order(
+                str(booking.get("booking_task_id") or ""),
+                str(booking.get("booking_order_id") or ""),
+            )
+            if not result.get("success"):
+                raise AppError(str(result.get("error") or "取消快递下单失败。"), 502)
+            DB.mark_booking_cancelled(shipment_id, str(result.get("raw") or ""))
             self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
             return
 
@@ -632,6 +792,20 @@ class Handler(BaseHTTPRequestHandler):
             self.require_admin(user)
             shipments = DB.list_shipments(user, query)
             self.send_xlsx(shipments, export_filename(query, shipments, "xlsx"))
+            return
+
+        if path == "/api/export/cainiao.xlsx" and self.command == "GET":
+            self.require_admin(user)
+            shipments = [row for row in DB.list_shipments(user, query) if str(row.get("tracking_no") or "").strip()]
+            if not shipments:
+                raise AppError("当前筛选结果中没有已取得快递单号的订单。", 409)
+            payload = build_cainiao_xlsx(shipments, DB.get_shipping_settings())
+            filename = f"总部_{export_date_part(query)}_菜鸟打印数据.xlsx"
+            self.send_bytes(
+                payload,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                attachment_header(filename, "scentpool-cainiao.xlsx"),
+            )
             return
 
         self.error_json("接口不存在。", 404)
@@ -712,8 +886,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.send_json({"ok": False, "database": False, "error": str(exc)}, status=503)
 
-    def error_json(self, message: str, status: int) -> None:
-        self.send_json({"error": message}, status=status)
+    def error_json(self, message: str, status: int, details: Optional[Dict[str, Any]] = None) -> None:
+        payload: Dict[str, Any] = {"error": message}
+        if details:
+            payload.update(details)
+        self.send_json(payload, status=status)
 
     def is_multipart(self) -> bool:
         return self.headers.get("Content-Type", "").lower().startswith("multipart/form-data")
@@ -754,6 +931,11 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(data, dict):
             raise AppError("请求内容必须是对象。")
         return data
+
+    def read_form(self) -> Dict[str, str]:
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length).decode("utf-8") if length > 0 else ""
+        return {key: values[-1] for key, values in parse_qs(raw, keep_blank_values=True).items()}
 
     def cookie_attributes(self, max_age: int) -> str:
         attrs = f"Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"
@@ -824,6 +1006,7 @@ def main() -> None:
     if not production:
         print("本地开发默认账号：admin / scentpool2026、store01 / scentpool2026")
     start_tracking_worker()
+    start_shipping_worker()
     server.serve_forever()
 
 
