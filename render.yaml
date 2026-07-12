@@ -34,11 +34,15 @@ services:
         sync: false
       - key: SCENTPOOL_KUAIDI100_KEY
         sync: false
-      - key: SCENTPOOL_KUAIDI100_ORDER_ENABLED
+      - key: SCENTPOOL_KUAIDI100_LABEL_ENABLED
         value: "0"
-      - key: SCENTPOOL_KUAIDI100_ORDER_ENDPOINT
-        value: https://order.kuaidi100.com/order/corderapi.do
-      - key: SCENTPOOL_KUAIDI100_ORDER_SECRET
+      - key: SCENTPOOL_KUAIDI100_LABEL_ENDPOINT
+        value: https://api.kuaidi100.com/label/order
+      - key: SCENTPOOL_KUAIDI100_AUTH_ENDPOINT
+        value: https://poll.kuaidi100.com/printapi/authThird.do
+      - key: SCENTPOOL_KUAIDI100_THIRD_INFO_ENDPOINT
+        value: https://poll.kuaidi100.com/eorderapi.do
+      - key: SCENTPOOL_KUAIDI100_LABEL_SECRET
         sync: false
       - key: SCENTPOOL_PUBLIC_BASE_URL
         value: https://scentpool-express-sync-ec7c.onrender.com

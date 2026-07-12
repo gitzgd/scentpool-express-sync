@@ -21,7 +21,13 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from xml.sax.saxutils import escape as xml_escape
 
 from database import AppError, Database, DEFAULT_PRODUCT_FILE, RETURN_STATUSES, STATUSES, now_text
-from shipping import Kuaidi100OrderClient, order_config_public, order_enabled, verify_callback_signature
+from shipping import (
+    Kuaidi100LabelClient,
+    label_config_public,
+    label_enabled,
+    parse_auth_callback,
+    verify_callback_signature,
+)
 from tracking import manual_refresh_stale_before, query_tracking, tracking_auto_enabled, tracking_config_public, tracking_interval_minutes, tracking_stale_before
 
 
@@ -434,9 +440,11 @@ def process_next_shipping_job() -> bool:
     if not job:
         return False
     try:
-        result = Kuaidi100OrderClient.from_env().create_order(job, DB.get_shipping_settings())
+        result = Kuaidi100LabelClient.from_env().create_label(
+            job, DB.shipping_settings_for_company(str(job.get("express_company") or ""))
+        )
     except Exception as exc:
-        result = {"success": False, "error": f"快递下单失败：{exc}", "raw": ""}
+        result = {"success": False, "error": f"电子面单下单失败：{exc}", "raw": ""}
     completed = DB.complete_shipping_job(int(job["batch_item_id"]), result)
     if completed.get("tracking_no"):
         try:
@@ -451,7 +459,7 @@ def shipping_worker() -> None:
     DB.reset_stale_shipping_jobs()
     while True:
         try:
-            if order_enabled() and process_next_shipping_job():
+            if label_enabled() and process_next_shipping_job():
                 continue
         except Exception as exc:
             print(f"[shipping] 批量下单任务失败：{exc}")
@@ -527,27 +535,32 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True}, headers={"Set-Cookie": self.expired_session_cookie()})
             return
 
-        if path == "/api/integrations/kuaidi100/order-callback" and self.command == "POST":
+        if path == "/api/integrations/kuaidi100/label-auth-callback" and self.command == "POST":
+            state = str(query.get("state") or "")
+            DB.consume_label_auth_session(state)
+            credentials = parse_auth_callback(str(self.read_form().get("param") or ""))
+            DB.save_label_authorization(credentials)
+            html = """<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><title>菜鸟授权成功</title>
+            <style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:48px;background:#f5f5f7;color:#1d1d1f}main{max-width:520px;margin:auto;background:white;padding:32px;border-radius:12px}a{color:#06c}</style>
+            <main><h1>菜鸟电子面单授权成功</h1><p>授权信息已经写入万物香铺快递系统。</p><a href=\"/admin/shipping\">返回面单设置</a></main></html>"""
+            self.send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
+            return
+
+        if path == "/api/integrations/kuaidi100/label-print-callback" and self.command == "POST":
             form = self.read_form()
             task_id = str(form.get("taskId") or "").strip()
             param_raw = str(form.get("param") or "")
             sign = str(form.get("sign") or "")
             if not task_id or not param_raw:
-                raise AppError("快递回调参数不完整。")
+                raise AppError("打印回调参数不完整。")
             salt = DB.booking_salt_for_task(task_id)
             if not verify_callback_signature(param_raw, sign, salt):
-                raise AppError("快递回调签名不正确。", 403)
+                raise AppError("打印回调签名不正确。", 403)
             try:
                 callback_param = json.loads(param_raw)
             except json.JSONDecodeError as exc:
-                raise AppError("快递回调内容不是有效 JSON。") from exc
-            result = DB.apply_shipping_callback(task_id, param_raw, callback_param)
-            if result.get("should_refresh_tracking"):
-                try:
-                    shipment = DB.get_shipment(int(result["shipment_id"]), {"role": "admin"})
-                    refresh_tracking_for_shipment(shipment)
-                except Exception as exc:
-                    print(f"[shipping] 回调后的物流查询失败：{exc}")
+                raise AppError("打印回调内容不是有效 JSON。") from exc
+            DB.apply_label_print_callback(task_id, param_raw, callback_param)
             self.send_json({"result": True, "returnCode": "200", "message": "成功"})
             return
 
@@ -643,17 +656,46 @@ class Handler(BaseHTTPRequestHandler):
             self.require_admin(user)
             config = tracking_config_public()
             config["return_interval_minutes"] = return_tracking_interval_minutes()
-            self.send_json({"tracking": config, "shipping": order_config_public()})
+            self.send_json({"tracking": config, "shipping": label_config_public()})
             return
 
         if path == "/api/admin/shipping-settings" and self.command == "GET":
             self.require_admin(user)
-            self.send_json({"settings": DB.get_shipping_settings(), "shipping": order_config_public()})
+            self.send_json({"settings": DB.get_shipping_settings(public=True), "shipping": label_config_public()})
             return
 
         if path == "/api/admin/shipping-settings" and self.command == "PUT":
             self.require_admin(user)
-            self.send_json({"settings": DB.update_shipping_settings(self.read_json()), "shipping": order_config_public()})
+            self.send_json({"settings": DB.update_shipping_settings(self.read_json()), "shipping": label_config_public()})
+            return
+
+        if path == "/api/admin/label-auth/cainiao" and self.command == "POST":
+            self.require_admin(user)
+            state = DB.create_label_auth_session()
+            current = DB.get_shipping_settings()
+            result = Kuaidi100LabelClient.from_env().begin_cainiao_authorization(
+                state, str(current.get("partner_id") or "")
+            )
+            if not result.get("success"):
+                raise AppError(str(result.get("error") or "无法创建菜鸟授权链接。"), 502)
+            if result.get("authorized") and result.get("credentials"):
+                DB.save_label_authorization(result["credentials"])
+            self.send_json({"authorization": result, "settings": DB.get_shipping_settings(public=True)})
+            return
+
+        if path == "/api/admin/label-branches/refresh" and self.command == "POST":
+            self.require_admin(user)
+            current = DB.get_shipping_settings()
+            result = Kuaidi100LabelClient.from_env().get_third_info(
+                {
+                    "partnerId": current.get("partner_id"),
+                    "partnerKey": current.get("partner_key"),
+                    "net": current.get("partner_net"),
+                }
+            )
+            if not result.get("success"):
+                raise AppError(str(result.get("error") or "刷新面单余额失败。"), 502)
+            self.send_json({"settings": DB.save_label_branches(result.get("branches") or [])})
             return
 
         if path == "/api/admin/shipping-batches/preview" and self.command == "POST":
@@ -665,20 +707,19 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/admin/shipping-batches" and self.command == "POST":
             self.require_admin(user)
-            shipping_config = order_config_public()
+            shipping_config = label_config_public()
             if not shipping_config.get("enabled") or not shipping_config.get("configured"):
                 raise AppError("快递100下单尚未启用或配置不完整，请先检查发货设置和 Render 环境变量。", 503)
             settings = DB.get_shipping_settings()
             if not settings.get("sender_name") or not settings.get("sender_mobile") or not settings.get("sender_address"):
                 raise AppError("请先完成总部发货设置。", 409)
+            if not settings.get("partner_id") or not settings.get("partner_key"):
+                raise AppError("请先在电子面单设置中完成菜鸟账号授权。", 409)
             body = self.read_json()
             choices = body.get("shipments") if isinstance(body.get("shipments"), list) else []
             batch = DB.create_shipping_batch(
                 user,
                 choices,
-                str(body.get("pickup_day") or ""),
-                str(body.get("pickup_start_time") or ""),
-                str(body.get("pickup_end_time") or ""),
                 body.get("filters") if isinstance(body.get("filters"), dict) else {},
             )
             self.send_json(batch, status=202)
@@ -728,17 +769,39 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
             return
 
-        if path.startswith("/api/shipments/") and path.endswith("/booking/cancel") and self.command == "POST":
+        if path.startswith("/api/shipments/") and path.endswith("/label/cancel") and self.command == "POST":
             self.require_admin(user)
             shipment_id = int(path.split("/")[3])
             booking = DB.booking_for_cancel(shipment_id)
-            result = Kuaidi100OrderClient.from_env().cancel_order(
-                str(booking.get("booking_task_id") or ""),
-                str(booking.get("booking_order_id") or ""),
+            result = Kuaidi100LabelClient.from_env().cancel_label(
+                booking, DB.shipping_settings_for_company(str(booking.get("express_company") or ""))
             )
             if not result.get("success"):
-                raise AppError(str(result.get("error") or "取消快递下单失败。"), 502)
+                raise AppError(str(result.get("error") or "取消电子面单失败。"), 502)
             DB.mark_booking_cancelled(shipment_id, str(result.get("raw") or ""))
+            self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
+            return
+
+        if path.startswith("/api/shipments/") and path.endswith("/label/reprint") and self.command == "POST":
+            self.require_admin(user)
+            shipment_id = int(path.split("/")[3])
+            shipment = DB.get_shipment(shipment_id, user)
+            if not shipment.get("booking_task_id"):
+                raise AppError("这个订单没有可复打的电子面单。", 409)
+            settings = DB.get_shipping_settings()
+            result = Kuaidi100LabelClient.from_env().reprint(
+                str(shipment.get("booking_task_id") or ""), str(settings.get("printer_siid") or "")
+            )
+            if not result.get("success"):
+                raise AppError(str(result.get("error") or "电子面单复打失败。"), 502)
+            DB.mark_label_reprint(shipment_id, str(result.get("raw") or ""))
+            self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
+            return
+
+        if path.startswith("/api/shipments/") and path.endswith("/label/printed") and self.command == "POST":
+            self.require_admin(user)
+            shipment_id = int(path.split("/")[3])
+            DB.mark_label_printed(shipment_id)
             self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
             return
 

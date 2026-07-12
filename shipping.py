@@ -13,133 +13,281 @@ from database import AppError
 from tracking import EXPRESS_COMPANY_CODES, mask_secret
 
 
-KUAIDI100_ORDER_ENDPOINT = "https://order.kuaidi100.com/order/corderapi.do"
+KUAIDI100_LABEL_ENDPOINT = "https://api.kuaidi100.com/label/order"
+KUAIDI100_AUTH_ENDPOINT = "https://poll.kuaidi100.com/printapi/authThird.do"
+KUAIDI100_THIRD_INFO_ENDPOINT = "https://poll.kuaidi100.com/eorderapi.do"
+THIRD_PARTY_NETS = {"taobao", "cainiao", "jdalpha", "pinduoduoWx", "douyin", "kuaishou", "weipinhui", "xiaohongshu"}
 
 
 def env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def order_enabled() -> bool:
-    return env_flag("SCENTPOOL_KUAIDI100_ORDER_ENABLED")
+def label_enabled() -> bool:
+    return env_flag("SCENTPOOL_KUAIDI100_LABEL_ENABLED")
 
 
-def callback_url() -> str:
+def public_url(path: str) -> str:
     base = os.environ.get("SCENTPOOL_PUBLIC_BASE_URL", "").strip().rstrip("/")
-    return f"{base}/api/integrations/kuaidi100/order-callback" if base else ""
+    return f"{base}{path}" if base else ""
 
 
-class Kuaidi100OrderClient:
-    def __init__(self, key: str, secret: str, endpoint: str = KUAIDI100_ORDER_ENDPOINT):
+def print_callback_url() -> str:
+    return public_url("/api/integrations/kuaidi100/label-print-callback")
+
+
+def auth_callback_url(state: str) -> str:
+    return public_url(f"/api/integrations/kuaidi100/label-auth-callback?state={urllib.parse.quote(state)}")
+
+
+class Kuaidi100LabelClient:
+    def __init__(
+        self,
+        key: str,
+        secret: str,
+        endpoint: str = KUAIDI100_LABEL_ENDPOINT,
+        auth_endpoint: str = KUAIDI100_AUTH_ENDPOINT,
+        third_info_endpoint: str = KUAIDI100_THIRD_INFO_ENDPOINT,
+    ):
         self.key = key.strip()
         self.secret = secret.strip()
-        self.endpoint = endpoint.strip() or KUAIDI100_ORDER_ENDPOINT
+        self.endpoint = endpoint.strip() or KUAIDI100_LABEL_ENDPOINT
+        self.auth_endpoint = auth_endpoint.strip() or KUAIDI100_AUTH_ENDPOINT
+        self.third_info_endpoint = third_info_endpoint.strip() or KUAIDI100_THIRD_INFO_ENDPOINT
 
     @classmethod
-    def from_env(cls) -> "Kuaidi100OrderClient":
+    def from_env(cls) -> "Kuaidi100LabelClient":
         return cls(
             os.environ.get("SCENTPOOL_KUAIDI100_KEY", ""),
-            os.environ.get("SCENTPOOL_KUAIDI100_ORDER_SECRET", ""),
-            os.environ.get("SCENTPOOL_KUAIDI100_ORDER_ENDPOINT", KUAIDI100_ORDER_ENDPOINT),
+            os.environ.get("SCENTPOOL_KUAIDI100_LABEL_SECRET", ""),
+            os.environ.get("SCENTPOOL_KUAIDI100_LABEL_ENDPOINT", KUAIDI100_LABEL_ENDPOINT),
+            os.environ.get("SCENTPOOL_KUAIDI100_AUTH_ENDPOINT", KUAIDI100_AUTH_ENDPOINT),
+            os.environ.get("SCENTPOOL_KUAIDI100_THIRD_INFO_ENDPOINT", KUAIDI100_THIRD_INFO_ENDPOINT),
         )
 
     def is_configured(self) -> bool:
-        return bool(self.key and self.secret and callback_url())
+        return bool(self.key and self.secret and public_url("/"))
 
-    def _request(self, method: str, param: Dict[str, Any]) -> Dict[str, Any]:
-        if not order_enabled():
-            raise AppError("快递一键下单尚未开启。请先完成测试并设置 SCENTPOOL_KUAIDI100_ORDER_ENABLED=1。", 503)
+    def _post(self, endpoint: str, method: str, param: Dict[str, Any], *, require_enabled: bool = True) -> Dict[str, Any]:
+        if require_enabled and not label_enabled():
+            raise AppError("电子面单尚未开启。请先完成测试并设置 SCENTPOOL_KUAIDI100_LABEL_ENABLED=1。", 503)
         if not self.is_configured():
-            raise AppError("快递100下单未配置，请检查 KEY、ORDER_SECRET 和 PUBLIC_BASE_URL。", 503)
+            raise AppError("快递100电子面单未配置，请检查 KEY、LABEL_SECRET 和 PUBLIC_BASE_URL。", 503)
         param_text = json.dumps(param, ensure_ascii=False, separators=(",", ":"))
         timestamp = str(int(time.time() * 1000))
         sign = hashlib.md5(f"{param_text}{timestamp}{self.key}{self.secret}".encode("utf-8")).hexdigest().upper()
-        payload = urllib.parse.urlencode(
-            {"method": method, "key": self.key, "sign": sign, "t": timestamp, "param": param_text}
-        ).encode("utf-8")
+        body = {"key": self.key, "sign": sign, "t": timestamp, "param": param_text}
+        if method:
+            body["method"] = method
+        payload = urllib.parse.urlencode(body).encode("utf-8")
         request = urllib.request.Request(
-            self.endpoint,
+            endpoint,
             data=payload,
             method="POST",
             headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
         )
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with urllib.request.urlopen(request, timeout=25) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            return {"success": False, "error": f"快递100下单请求失败：{exc}", "raw": ""}
+            return {"success": False, "error": f"快递100请求失败：{exc}", "raw": ""}
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            return {"success": False, "error": "快递100下单返回内容不是有效 JSON。", "raw": raw}
-        if not bool(data.get("result")):
-            message = str(data.get("message") or data.get("returnCode") or "快递100下单失败")
-            return {"success": False, "error": message, "raw": raw}
-        result = data.get("data") if isinstance(data.get("data"), dict) else {}
-        if method == "cancel":
-            return {"success": True, "raw": raw, "error": ""}
-        task_id = str(result.get("taskId") or "")
-        order_id = str(result.get("orderId") or result.get("orderId ") or "")
-        if not task_id or not order_id:
-            return {"success": False, "error": "快递100下单成功响应缺少 taskId 或 orderId。", "raw": raw}
+            return {"success": False, "error": "快递100返回内容不是有效 JSON。", "raw": raw}
+        return {"success": True, "data": data, "raw": raw, "param": param_text}
+
+    @staticmethod
+    def _account_param(settings: Dict[str, Any]) -> Dict[str, Any]:
         return {
-            "success": True,
-            "task_id": task_id,
-            "order_id": order_id,
-            "tracking_no": str(result.get("kuaidinum") or ""),
-            "poll_token": str(result.get("pollToken") or ""),
-            "raw": raw,
-            "error": "",
+            key: str(settings.get(key) or "").strip()
+            for key in ("partnerId", "partnerKey", "partnerSecret", "partnerName", "net", "tbNet", "code", "checkMan")
+            if str(settings.get(key) or "").strip()
         }
 
-    def create_order(self, shipment: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+    def create_label(self, shipment: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
         company = str(shipment.get("express_company") or "").strip()
         company_code = EXPRESS_COMPANY_CODES.get(company)
         if not company_code:
             return {"success": False, "error": f"暂不支持这个快递公司：{company}", "raw": ""}
+        if not settings.get("partnerId") or not settings.get("partnerKey"):
+            return {"success": False, "error": "请先在发货设置中完成菜鸟电子面单授权。", "raw": ""}
+
+        print_mode = str(settings.get("print_mode") or "PDF")
+        account_net = str(settings.get("net") or "")
+        api_print_type = "CLOUD" if print_mode == "CLOUD" and account_net not in THIRD_PARTY_NETS else "IMAGE"
         param: Dict[str, Any] = {
+            **self._account_param(settings),
+            "printType": api_print_type,
             "kuaidicom": company_code,
-            "recManName": str(shipment.get("recipient_name") or ""),
-            "recManMobile": str(shipment.get("phone") or ""),
-            "recManPrintAddr": str(shipment.get("address") or ""),
-            "sendManName": str(settings.get("sender_name") or ""),
-            "sendManMobile": str(settings.get("sender_mobile") or ""),
-            "sendManPrintAddr": str(settings.get("sender_address") or ""),
-            "callBackUrl": callback_url(),
+            "recMan": {
+                "name": str(shipment.get("recipient_name") or ""),
+                "mobile": str(shipment.get("phone") or ""),
+                "printAddr": str(shipment.get("address") or ""),
+            },
+            "sendMan": {
+                "name": str(settings.get("sender_name") or ""),
+                "mobile": str(settings.get("sender_mobile") or ""),
+                "printAddr": str(settings.get("sender_address") or ""),
+                "company": str(settings.get("sender_company") or ""),
+            },
             "cargo": str(settings.get("cargo_name") or "香氛商品"),
-            "payment": "SHIPPER",
-            "dayType": str(shipment.get("pickup_day") or "今天"),
-            "pickupStartTime": str(shipment.get("pickup_start_time") or ""),
-            "pickupEndTime": str(shipment.get("pickup_end_time") or ""),
+            "count": 1,
+            "payType": str(settings.get("pay_type") or "MONTHLY"),
+            "expType": str(settings.get("exp_type") or "标准快递"),
             "remark": str(shipment.get("remark") or "")[:100],
+            "orderId": str(shipment.get("booking_request_id") or shipment.get("business_id") or "")[:32],
+            "reorder": False,
+            "callBackUrl": print_callback_url(),
             "salt": str(shipment.get("booking_salt") or ""),
-            "thirdOrderId": str(shipment.get("booking_request_id") or "")[:32],
-            "op": "0",
-            "resultv2": "0",
+            "needSubscribe": False,
+            "needDesensitization": bool(settings.get("need_desensitization")),
+            "needLogo": bool(settings.get("need_logo")),
         }
-        if company == "顺丰":
-            param["serviceType"] = "顺丰标快"
-        return self._request("cOrder", param)
+        if settings.get("printer_siid"):
+            param["siid"] = str(settings["printer_siid"])
+        if settings.get("template_id") and account_net not in THIRD_PARTY_NETS:
+            param["tempId"] = str(settings["template_id"])
+        if api_print_type == "CLOUD":
+            param["width"] = str(settings.get("paper_width") or "100")
+            param["height"] = str(settings.get("paper_height") or "180")
 
-    def cancel_order(self, task_id: str, order_id: str, reason: str = "订单信息需要修改") -> Dict[str, Any]:
-        return self._request(
-            "cancel",
-            {"taskId": task_id, "orderId": order_id, "cancelMsg": reason[:30]},
-        )
+        response = self._post(self.endpoint, "order", param)
+        if not response.get("success"):
+            return response
+        payload = response["data"]
+        if not bool(payload.get("success")) or str(payload.get("code")) not in {"200", "30011"}:
+            return {
+                "success": False,
+                "error": str(payload.get("message") or payload.get("code") or "电子面单下单失败"),
+                "raw": response["raw"],
+            }
+        result = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        tracking_no = str(result.get("kuaidinum") or "").strip()
+        task_id = str(result.get("taskId") or "").strip()
+        if not tracking_no or not task_id:
+            return {"success": False, "error": "电子面单响应缺少快递单号或 taskId。", "raw": response["raw"]}
+        return {
+            "success": True,
+            "task_id": task_id,
+            "tracking_no": tracking_no,
+            "label_url": str(result.get("label") or ""),
+            "child_no": str(result.get("childNum") or ""),
+            "return_no": str(result.get("returnNum") or ""),
+            "carrier_order_no": str(result.get("kdComOrderNum") or ""),
+            "print_type": api_print_type,
+            "print_status": "打印中" if api_print_type == "CLOUD" else "待打印",
+            "raw": response["raw"],
+            "error": "",
+        }
+
+    def cancel_label(self, shipment: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+        company_code = EXPRESS_COMPANY_CODES.get(str(shipment.get("express_company") or ""))
+        param = {
+            **self._account_param(settings),
+            "kuaidicom": company_code or "",
+            "kuaidinum": str(shipment.get("tracking_no") or ""),
+            "orderId": str(shipment.get("label_carrier_order_no") or ""),
+            "reason": "订单信息需要修改",
+            "expType": str(settings.get("exp_type") or "标准快递"),
+        }
+        response = self._post(self.endpoint, "cancel", {key: value for key, value in param.items() if value})
+        if not response.get("success"):
+            return response
+        payload = response["data"]
+        if not bool(payload.get("success")):
+            return {"success": False, "error": str(payload.get("message") or "电子面单取消失败"), "raw": response["raw"]}
+        return {"success": True, "raw": response["raw"], "error": ""}
+
+    def reprint(self, task_id: str, siid: str = "") -> Dict[str, Any]:
+        param = {"taskId": task_id}
+        if siid:
+            param["siid"] = siid
+        response = self._post(self.endpoint, "printOld", param)
+        if not response.get("success"):
+            return response
+        payload = response["data"]
+        if not bool(payload.get("success")):
+            return {"success": False, "error": str(payload.get("message") or "电子面单复打失败"), "raw": response["raw"]}
+        return {"success": True, "raw": response["raw"], "error": ""}
+
+    def begin_cainiao_authorization(self, state: str, partner_id: str = "") -> Dict[str, Any]:
+        param = {"net": "cainiao", "callBackUrl": auth_callback_url(state), "view": "web"}
+        if partner_id:
+            param["partnerId"] = partner_id
+        response = self._post(self.auth_endpoint, "", param, require_enabled=False)
+        if not response.get("success"):
+            return response
+        payload = response["data"]
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        code = str(payload.get("returnCode") or "")
+        if code == "201" and data.get("url"):
+            return {"success": True, "authorized": False, "url": str(data["url"]), "raw": response["raw"]}
+        if code == "200":
+            return {"success": True, "authorized": True, "credentials": normalize_auth_credentials(data), "raw": response["raw"]}
+        return {"success": False, "error": str(payload.get("message") or "无法创建菜鸟授权链接"), "raw": response["raw"]}
+
+    def get_third_info(self, credentials: Dict[str, Any]) -> Dict[str, Any]:
+        param = {
+            "partnerId": str(credentials.get("partnerId") or ""),
+            "partnerKey": str(credentials.get("partnerKey") or ""),
+            "net": str(credentials.get("net") or "cainiao"),
+        }
+        response = self._post(self.third_info_endpoint, "getThirdInfo", param, require_enabled=False)
+        if not response.get("success"):
+            return response
+        payload = response["data"]
+        if not bool(payload.get("result")) or str(payload.get("status")) != "200":
+            return {"success": False, "error": str(payload.get("message") or "查询面单余额失败"), "raw": response["raw"]}
+        return {"success": True, "branches": payload.get("data") or [], "raw": response["raw"]}
 
 
-def order_config_public() -> Dict[str, Any]:
-    client = Kuaidi100OrderClient.from_env()
+def normalize_auth_credentials(data: Dict[str, Any]) -> Dict[str, str]:
     return {
-        "enabled": order_enabled(),
+        "partnerId": str(data.get("partnerId") or data.get("parterId") or ""),
+        "partnerKey": str(data.get("partnerKey") or ""),
+        "partnerSecret": str(data.get("partnerSecret") or ""),
+        "partnerName": str(data.get("partnerName") or ""),
+        "net": str(data.get("net") or "cainiao"),
+        "code": str(data.get("code") or ""),
+        "checkMan": str(data.get("checkMan") or ""),
+    }
+
+
+def parse_auth_callback(param_raw: str) -> Dict[str, Any]:
+    try:
+        outer = json.loads(param_raw)
+    except json.JSONDecodeError as exc:
+        raise AppError("菜鸟授权回调不是有效 JSON。") from exc
+    if not bool(outer.get("result")) or str(outer.get("returnCode")) != "200":
+        raise AppError(str(outer.get("message") or "菜鸟授权失败。"), 400)
+    message = outer.get("message")
+    if isinstance(message, str):
+        try:
+            message = json.loads(message)
+        except json.JSONDecodeError as exc:
+            raise AppError("菜鸟授权凭证格式不正确。") from exc
+    if not isinstance(message, dict):
+        raise AppError("菜鸟授权回调缺少凭证。")
+    credentials = normalize_auth_credentials(message)
+    if not credentials["partnerId"] or not credentials["partnerKey"]:
+        raise AppError("菜鸟授权回调缺少 partnerId 或 partnerKey。")
+    return credentials
+
+
+def label_config_public() -> Dict[str, Any]:
+    client = Kuaidi100LabelClient.from_env()
+    return {
+        "enabled": label_enabled(),
         "configured": client.is_configured(),
         "endpoint": client.endpoint,
         "key": mask_secret(client.key),
         "secret": mask_secret(client.secret),
-        "callback_url": callback_url(),
+        "public_base_url": public_url(""),
+        "supports": {"cainiao_pdf": True, "kuaidi100_cloud": True, "reprint": True},
     }
 
 
 def verify_callback_signature(param_raw: str, sign: str, salt: str) -> bool:
     expected = hashlib.md5(f"{param_raw}{salt}".encode("utf-8")).hexdigest()
-    return bool(sign) and expected.lower() == sign.strip().lower()
+    return bool(sign and salt) and expected.lower() == sign.strip().lower()

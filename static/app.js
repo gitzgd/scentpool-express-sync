@@ -123,9 +123,10 @@ function renderBookingStatus(row) {
   if (status === "未下单") return "";
   return `
     <div class="booking-status-block">
-      <span class="status ${bookingStatusClass(status)}">${escapeHtml(status === "待取号" ? "等待快递单号" : status === "排队中" || status === "提交中" ? "总部下单中" : status)}</span>
+      <span class="status ${bookingStatusClass(status)}">${escapeHtml(status === "排队中" || status === "提交中" ? "面单处理中" : status)}</span>
+      ${row.label_print_status ? `<span class="status ${row.label_print_status === "打印成功" ? "signed" : row.label_print_status === "打印失败" ? "exception" : "pending"}">${escapeHtml(row.label_print_status)}</span>` : ""}
       ${row.booking_error ? `<div class="tracking-error">${escapeHtml(row.booking_error)}</div>` : ""}
-      ${row.booking_courier_mobile ? `<div class="muted mini">取件员 ${escapeHtml(row.booking_courier_name || "")} ${escapeHtml(row.booking_courier_mobile)}</div>` : ""}
+      ${row.label_print_error ? `<div class="tracking-error">${escapeHtml(row.label_print_error)}</div>` : ""}
     </div>
   `;
 }
@@ -349,7 +350,7 @@ function shell(content) {
         <a class="${isActive("/admin/returns")}" href="/admin/returns" data-route>退货看板</a>
         <a class="${isActive("/admin/stores")}" href="/admin/stores" data-route>门店</a>
         <a class="${isActive("/admin/products")}" href="/admin/products" data-route>商品</a>
-        <a class="${isActive("/admin/shipping")}" href="/admin/shipping" data-route>发货设置</a>
+        <a class="${isActive("/admin/shipping")}" href="/admin/shipping" data-route>面单设置</a>
       `
       : "";
   const storeLinks =
@@ -435,7 +436,7 @@ async function loadActiveShippingBatch() {
 function scheduleShippingBatchPoll() {
   if (state.shippingBatchPollTimer) clearTimeout(state.shippingBatchPollTimer);
   const status = state.activeShippingBatch?.batch?.status;
-  if (!status || !["排队中", "处理中", "等待单号"].includes(status) || location.pathname !== "/admin") return;
+  if (!status || !["排队中", "处理中"].includes(status) || location.pathname !== "/admin") return;
   state.shippingBatchPollTimer = setTimeout(() => render(), 2500);
 }
 
@@ -1519,26 +1520,16 @@ function renderShippingBatchPreview() {
         <button class="btn ghost small" id="closeBatchPreview" type="button">关闭</button>
       </div>
       ${!preview.settings_ready ? `<div class="notice danger-notice">总部寄件信息未完成，请先进入“发货设置”。</div>` : ""}
+      ${!preview.label_ready ? `<div class="notice danger-notice">菜鸟电子面单账号尚未授权。</div>` : ""}
       ${!state.shippingConfig?.enabled || !state.shippingConfig?.configured ? `<div class="notice">快递100下单开关未开启或密钥未配置，目前只能预览，不能正式提交。</div>` : ""}
-      <div class="batch-controls">
+      <div class="batch-controls label-batch-controls">
         <div class="field">
           <label>整批快递公司</label>
           <select class="select" id="batchBulkCompany">${expressCompanyOptions(DEFAULT_EXPRESS_COMPANY)}</select>
         </div>
-        <div class="field">
-          <label>取件日期</label>
-          <select class="select" id="batchPickupDay"><option>今天</option><option>明天</option><option>后天</option></select>
-        </div>
-        <div class="field">
-          <label>开始时间</label>
-          <input class="input" id="batchPickupStart" type="time" value="09:00" />
-        </div>
-        <div class="field">
-          <label>结束时间</label>
-          <input class="input" id="batchPickupEnd" type="time" value="11:00" />
-        </div>
-        <button class="btn primary" id="createShippingBatch" type="button" ${eligible.length && preview.settings_ready && state.shippingConfig?.enabled && state.shippingConfig?.configured ? "" : "disabled"}>确认提交 ${eligible.length} 单</button>
+        <button class="btn primary" id="createShippingBatch" type="button" ${eligible.length && preview.settings_ready && preview.label_ready && state.shippingConfig?.enabled && state.shippingConfig?.configured ? "" : "disabled"}>确认提交 ${eligible.length} 单</button>
       </div>
+      <div class="notice">提交后将立即获取快递单号并生成电子面单，不再创建上门取件预约。</div>
       <div class="batch-order-list">
         ${eligible.map((row) => `
           <div class="batch-order-row" data-batch-shipment="${row.id}">
@@ -1561,14 +1552,13 @@ function renderShippingBatchProgress() {
   return `
     <section class="panel panel-pad shipping-batch-panel">
       <div class="section-title">
-        <div><h2>下单批次 #${batch.id}</h2><div class="muted mini">${escapeHtml(batch.pickup_day)} ${escapeHtml(batch.pickup_start_time)}-${escapeHtml(batch.pickup_end_time)}</div></div>
+        <div><h2>电子面单批次 #${batch.id}</h2><div class="muted mini">后台按顺序取号并生成面单</div></div>
         <span class="status ${failed ? "exception" : batch.status === "已完成" ? "shipped" : "pending"}">${escapeHtml(batch.status)}</span>
       </div>
       <div class="status-overview">
         <span class="count-pill">总数 ${batch.total_count || 0}</span>
         <span class="count-pill">排队 ${counts["排队中"] || 0}</span>
         <span class="count-pill">提交中 ${counts["提交中"] || 0}</span>
-        <span class="count-pill">待取号 ${counts["待取号"] || 0}</span>
         <span class="count-pill">成功 ${counts["成功"] || 0}</span>
         <span class="count-pill">失败 ${failed}</span>
       </div>
@@ -1600,7 +1590,7 @@ async function renderAdmin() {
       "发货后台",
       "总部统一处理门店提交的发货需求。",
       `<div class="actions">
-        <button class="btn primary" id="previewShippingBatch" type="button">批量下单</button>
+        <button class="btn primary" id="previewShippingBatch" type="button">批量打单</button>
         <button class="btn secondary" id="syncTracking" type="button">同步物流</button>
         <a class="btn secondary" href="/api/export/cainiao.xlsx?${exportParams.toString()}">菜鸟打印数据</a>
         <a class="btn primary" href="/api/export/shipments.xlsx?${exportParams.toString()}">导出 XLSX</a>
@@ -1739,10 +1729,13 @@ function renderShipmentActions(row) {
   const editing = shipmentShippingEditing(row);
   const shippedAt = row.shipped_at ? `<div class="muted mini action-time">${escapeHtml(formatDate(row.shipped_at))}</div>` : "";
   if (!bookingEditable(row)) {
-    const canCancel = row.booking_task_id && row.booking_order_id && row.status !== "已签收";
+    const canCancel = row.booking_task_id && row.tracking_no && row.status !== "已签收";
     return `
       <div class="shipment-actions">
-        ${canCancel ? `<button class="btn danger small" data-cancel-booking="${row.id}" type="button">取消下单</button>` : `<span class="muted mini">快递处理中</span>`}
+        ${row.label_url ? `<a class="btn secondary small" href="${escapeHtml(row.label_url)}" target="_blank" rel="noopener">查看面单</a>` : ""}
+        ${row.label_url && row.label_print_status !== "打印成功" ? `<button class="btn secondary small" data-label-printed="${row.id}" type="button">标记已打印</button>` : ""}
+        ${row.label_print_type === "CLOUD" && row.booking_task_id ? `<button class="btn secondary small" data-reprint-label="${row.id}" type="button">复打面单</button>` : ""}
+        ${canCancel ? `<button class="btn danger small" data-cancel-label="${row.id}" type="button">取消面单</button>` : `<span class="muted mini">面单处理中</span>`}
         ${row.tracking_no ? `<button class="btn secondary small" data-refresh-tracking="${row.id}" type="button">查物流</button>` : ""}
         ${shippedAt}
       </div>
@@ -1863,22 +1856,19 @@ function bindAdmin() {
       id: Number(row.dataset.batchShipment),
       express_company: row.querySelector("[data-batch-company]").value,
     }));
-    if (!confirm(`确认向快递100提交 ${shipments.length} 张寄件订单？`)) return;
+    if (!confirm(`确认向快递100提交 ${shipments.length} 张电子面单？成功后将立即取得快递单号。`)) return;
     try {
       const data = await api("/api/admin/shipping-batches", {
         method: "POST",
         body: JSON.stringify({
           filters: state.adminFilters,
           shipments,
-          pickup_day: document.getElementById("batchPickupDay").value,
-          pickup_start_time: document.getElementById("batchPickupStart").value,
-          pickup_end_time: document.getElementById("batchPickupEnd").value,
         }),
       });
       state.batchPreview = null;
       state.activeShippingBatch = data;
       sessionStorage.setItem("scentpool_shipping_batch_id", String(data.batch.id));
-      toast("批量下单任务已创建。即使关闭页面，后台也会继续处理。");
+      toast("电子面单任务已创建。即使关闭页面，后台也会继续处理。");
       render();
     } catch (error) {
       toast(error.message);
@@ -1966,13 +1956,37 @@ function bindAdmin() {
       }
     });
   });
-  document.querySelectorAll("[data-cancel-booking]").forEach((node) => {
+  document.querySelectorAll("[data-cancel-label]").forEach((node) => {
     node.addEventListener("click", async (event) => {
-      const id = event.currentTarget.dataset.cancelBooking;
-      if (!confirm("确认取消这张快递下单？取消成功后订单会恢复为待处理，可重新编辑和下单。")) return;
+      const id = event.currentTarget.dataset.cancelLabel;
+      if (!confirm("确认取消并回收这张电子面单？只有快递公司确认成功后订单才会解锁。")) return;
       try {
-        await api(`/api/shipments/${id}/booking/cancel`, { method: "POST", body: JSON.stringify({}) });
-        toast("快递下单已取消。");
+        await api(`/api/shipments/${id}/label/cancel`, { method: "POST", body: JSON.stringify({}) });
+        toast("电子面单已取消。");
+        render();
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+  });
+  document.querySelectorAll("[data-reprint-label]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const id = event.currentTarget.dataset.reprintLabel;
+      try {
+        await api(`/api/shipments/${id}/label/reprint`, { method: "POST", body: JSON.stringify({}) });
+        toast("复打任务已发送到快递100云打印机。");
+        render();
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+  });
+  document.querySelectorAll("[data-label-printed]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const id = event.currentTarget.dataset.labelPrinted;
+      try {
+        await api(`/api/shipments/${id}/label/printed`, { method: "POST", body: JSON.stringify({}) });
+        toast("面单已标记为打印成功。");
         render();
       } catch (error) {
         toast(error.message);
@@ -2066,12 +2080,23 @@ async function renderShippingSettings() {
   await loadShippingSettings();
   const settings = state.shippingSettings || {};
   const config = state.shippingConfig || {};
+  const carrierSettings = settings.carrier_settings || {};
+  const branchOptions = settings.branch_options || [];
+  const branchSelect = (company) => {
+    const current = carrierSettings[company]?.tbNet || "";
+    const options = branchOptions.filter((item) => item.company === company);
+    return `<select class="select" data-carrier-branch="${company}">
+      <option value="">${options.length ? "选择授权网点" : "授权后刷新网点"}</option>
+      ${options.map((item) => `<option value="${escapeHtml(item.tbNet)}" ${item.tbNet === current ? "selected" : ""}>${escapeHtml(item.branchName || item.tbNet)} · 余 ${item.quantity}</option>`).join("")}
+    </select>`;
+  };
   const content = `
-    ${pageHead("发货设置", "维护总部寄件信息和快递100下单配置状态。")}
-    <div class="grid-2">
+    ${pageHead("电子面单设置", "在系统内完成菜鸟授权、快递取号、面单生成与打印。")}
+    <form id="shippingSettingsForm">
+    <div class="grid-2 shipping-settings-grid">
       <section class="panel panel-pad">
         <div class="section-title"><h2>总部寄件信息</h2></div>
-        <form id="shippingSettingsForm" class="form-grid">
+        <div class="form-grid">
           <div class="field">
             <label for="senderName">寄件人姓名</label>
             <input class="input" id="senderName" name="sender_name" value="${escapeHtml(settings.sender_name || "")}" required />
@@ -2079,6 +2104,10 @@ async function renderShippingSettings() {
           <div class="field">
             <label for="senderMobile">联系电话</label>
             <input class="input" id="senderMobile" name="sender_mobile" value="${escapeHtml(settings.sender_mobile || "")}" required />
+          </div>
+          <div class="field full">
+            <label for="senderCompany">寄件公司</label>
+            <input class="input" id="senderCompany" name="sender_company" value="${escapeHtml(settings.sender_company || "万物香铺")}" />
           </div>
           <div class="field full">
             <label for="senderAddress">完整寄件地址</label>
@@ -2092,35 +2121,104 @@ async function renderShippingSettings() {
             <label for="cargoName">物品名称</label>
             <input class="input" id="cargoName" name="cargo_name" value="${escapeHtml(settings.cargo_name || "香氛商品")}" required />
           </div>
-          <div class="field full"><button class="btn primary" type="submit">保存发货设置</button></div>
-        </form>
+          <div class="field">
+            <label for="payType">付款方式</label>
+            <select class="select" id="payType" name="pay_type"><option value="MONTHLY" ${settings.pay_type === "MONTHLY" ? "selected" : ""}>月结</option><option value="SHIPPER" ${settings.pay_type === "SHIPPER" ? "selected" : ""}>寄方付</option></select>
+          </div>
+        </div>
       </section>
       <section class="panel panel-pad">
-        <div class="section-title"><h2>快递100下单</h2></div>
+        <div class="section-title"><h2>菜鸟电子面单授权</h2></div>
         <ul class="summary-list">
           <li><span>功能开关</span><span class="status ${config.enabled ? "shipped" : "pending"}">${config.enabled ? "已开启" : "未开启"}</span></li>
           <li><span>鉴权配置</span><span class="status ${config.configured ? "shipped" : "exception"}">${config.configured ? "完整" : "缺少配置"}</span></li>
+          <li><span>菜鸟账号</span><span class="status ${settings.partner_authorized ? "signed" : "pending"}">${settings.partner_authorized ? "已授权" : "未授权"}</span></li>
           <li><span>KEY</span><strong>${escapeHtml(config.key || "未设置")}</strong></li>
-          <li><span>ORDER SECRET</span><strong>${escapeHtml(config.secret || "未设置")}</strong></li>
+          <li><span>LABEL SECRET</span><strong>${escapeHtml(config.secret || "未设置")}</strong></li>
+          ${settings.partner_authorized ? `<li><span>partnerId</span><strong>${escapeHtml(settings.partner_id_masked || "已保存")}</strong></li>` : ""}
         </ul>
-        <div class="config-detail"><span class="muted mini">回调地址</span><code>${escapeHtml(config.callback_url || "请设置 SCENTPOOL_PUBLIC_BASE_URL")}</code></div>
-        <div class="notice">密钥只在 Render Environment 中维护，页面不会保存或显示完整内容。测试通过后再把 SCENTPOOL_KUAIDI100_ORDER_ENABLED 改为 1。</div>
+        <div class="inline-actions">
+          <button class="btn primary" id="authorizeCainiao" type="button">${settings.partner_authorized ? "重新授权菜鸟" : "授权菜鸟账号"}</button>
+          <button class="btn secondary" id="refreshLabelBranches" type="button" ${settings.partner_authorized ? "" : "disabled"}>刷新网点与面单余额</button>
+        </div>
+        <div class="notice">企业 KEY 与 LABEL SECRET 只放在 Render Environment；菜鸟授权凭证由回调写入数据库，页面只显示脱敏结果。</div>
       </section>
     </div>
+    <section class="panel panel-pad label-carrier-settings">
+      <div class="section-title"><div><h2>快递公司与授权网点</h2><div class="muted mini">每家公司选择菜鸟授权网点和默认产品类型。</div></div></div>
+      <div class="carrier-setting-grid">
+        ${EXPRESS_COMPANIES.map((company) => `
+          <div class="carrier-setting-row">
+            <strong>${company}</strong>
+            ${branchSelect(company)}
+            <input class="input" data-carrier-exp="${company}" value="${escapeHtml(carrierSettings[company]?.expType || (company === "顺丰" ? "顺丰标快" : "标准快递"))}" aria-label="${company}产品类型" />
+          </div>
+        `).join("")}
+      </div>
+    </section>
+    <section class="panel panel-pad label-print-settings">
+      <div class="section-title"><div><h2>面单打印</h2><div class="muted mini">菜鸟授权默认返回 PDF；快递100云打印需要云打印设备码。</div></div></div>
+      <div class="form-grid">
+        <div class="field"><label for="printMode">打印方式</label><select class="select" id="printMode" name="print_mode"><option value="PDF" ${settings.print_mode !== "CLOUD" ? "selected" : ""}>菜鸟 PDF 面单</option><option value="CLOUD" ${settings.print_mode === "CLOUD" ? "selected" : ""}>快递100云打印</option></select></div>
+        <div class="field"><label for="printerSiid">云打印设备码 siid</label><input class="input" id="printerSiid" name="printer_siid" value="${escapeHtml(settings.printer_siid || "")}" /></div>
+        <div class="field"><label for="templateId">网点面单模板 tempId</label><input class="input" id="templateId" name="template_id" value="${escapeHtml(settings.template_id || "")}" /></div>
+        <div class="field"><label>纸张尺寸（毫米）</label><div class="tracking-input-row"><input class="input" name="paper_width" value="${escapeHtml(settings.paper_width || "100")}" aria-label="纸张宽度" /><input class="input" name="paper_height" value="${escapeHtml(settings.paper_height || "180")}" aria-label="纸张高度" /></div></div>
+        <label class="check-row"><input type="checkbox" name="need_desensitization" ${settings.need_desensitization ? "checked" : ""} /> 电话号码脱敏</label>
+        <label class="check-row"><input type="checkbox" name="need_logo" ${settings.need_logo ? "checked" : ""} /> 面单显示 Logo</label>
+      </div>
+      <div class="inline-actions settings-save-actions"><button class="btn primary" type="submit">保存电子面单设置</button></div>
+    </section>
+    </form>
   `;
   document.getElementById("app").innerHTML = shell(content);
   bindCommon();
   document.getElementById("shippingSettingsForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
+    const carrier_settings = {};
+    EXPRESS_COMPANIES.forEach((company) => {
+      carrier_settings[company] = {
+        tbNet: document.querySelector(`[data-carrier-branch="${company}"]`)?.value || "",
+        expType: document.querySelector(`[data-carrier-exp="${company}"]`)?.value.trim() || (company === "顺丰" ? "顺丰标快" : "标准快递"),
+      };
+    });
     try {
       const data = await api("/api/admin/shipping-settings", {
         method: "PUT",
-        body: JSON.stringify(Object.fromEntries(form.entries())),
+        body: JSON.stringify({
+          ...Object.fromEntries(form.entries()),
+          need_desensitization: form.has("need_desensitization"),
+          need_logo: form.has("need_logo"),
+          carrier_settings,
+        }),
       });
       state.shippingSettings = data.settings;
       state.shippingConfig = data.shipping;
-      toast("发货设置已保存。");
+      toast("电子面单设置已保存。");
+      render();
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+  document.getElementById("authorizeCainiao")?.addEventListener("click", async () => {
+    try {
+      const data = await api("/api/admin/label-auth/cainiao", { method: "POST", body: JSON.stringify({}) });
+      const authorization = data.authorization || {};
+      if (authorization.authorized) {
+        toast("菜鸟账号已授权。");
+        render();
+      } else if (authorization.url) {
+        window.location.href = authorization.url;
+      }
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+  document.getElementById("refreshLabelBranches")?.addEventListener("click", async () => {
+    try {
+      const data = await api("/api/admin/label-branches/refresh", { method: "POST", body: JSON.stringify({}) });
+      state.shippingSettings = data.settings;
+      toast("授权网点和面单余额已刷新。");
       render();
     } catch (error) {
       toast(error.message);

@@ -1004,6 +1004,48 @@ tr:last-child td {
   margin: 16px 0;
 }
 
+.label-batch-controls {
+  grid-template-columns: minmax(190px, 280px) auto;
+}
+
+.shipping-settings-grid {
+  align-items: stretch;
+}
+
+.label-carrier-settings,
+.label-print-settings {
+  margin-top: 16px;
+}
+
+.carrier-setting-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.carrier-setting-row {
+  display: grid;
+  grid-template-columns: 80px minmax(260px, 1.4fr) minmax(180px, 0.8fr);
+  gap: 12px;
+  align-items: center;
+  padding: 10px 0;
+  border-bottom: 1px solid #ededf2;
+}
+
+.carrier-setting-row:last-child {
+  border-bottom: 0;
+}
+
+.check-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+}
+
+.settings-save-actions {
+  margin-top: 16px;
+}
+
 .batch-order-list {
   display: grid;
   max-height: 420px;
@@ -1102,7 +1144,8 @@ tr:last-child td {
   }
 
   .batch-controls,
-  .batch-order-row {
+  .batch-order-row,
+  .carrier-setting-row {
     grid-template-columns: 1fr;
   }
 

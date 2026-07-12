@@ -103,8 +103,8 @@ def main() -> None:
         os.environ["SCENTPOOL_TRACKING_PROVIDER"] = "kuaidi100"
         os.environ["SCENTPOOL_KUAIDI100_CUSTOMER"] = " test-customer "
         os.environ["SCENTPOOL_KUAIDI100_KEY"] = " test-key "
-        os.environ["SCENTPOOL_KUAIDI100_ORDER_SECRET"] = " test-order-secret "
-        os.environ["SCENTPOOL_KUAIDI100_ORDER_ENABLED"] = "1"
+        os.environ["SCENTPOOL_KUAIDI100_LABEL_SECRET"] = " test-label-secret "
+        os.environ["SCENTPOOL_KUAIDI100_LABEL_ENABLED"] = "1"
         os.environ["SCENTPOOL_PUBLIC_BASE_URL"] = "https://example.test"
         assert tracking.KUAIDI100_ENDPOINT == "https://poll.kuaidi100.com/poll/query.do"
         original_urlopen = tracking.urllib.request.urlopen
@@ -149,7 +149,7 @@ def main() -> None:
 
         shipping_captured = {}
 
-        class FakeOrderResponse:
+        class FakeLabelResponse:
             def __enter__(self):
                 return self
 
@@ -159,32 +159,39 @@ def main() -> None:
             def read(self):
                 return json.dumps(
                     {
-                        "result": True,
-                        "returnCode": "200",
-                        "message": "提交成功",
-                        "data": {"taskId": "TASK-SMOKE", "orderId": "ORDER-SMOKE", "kuaidinum": ""},
+                        "success": True,
+                        "code": 200,
+                        "message": "success",
+                        "data": {
+                            "taskId": "TASK-SMOKE", "kuaidinum": "YT-SMOKE-BOOKING-001",
+                            "label": "https://example.test/label/smoke.pdf", "kdComOrderNum": "KD-SMOKE",
+                        },
                     },
                     ensure_ascii=False,
                 ).encode("utf-8")
 
-        def fake_order_urlopen(request, timeout=0):
+        def fake_label_urlopen(request, timeout=0):
             shipping_captured["url"] = request.full_url
             shipping_captured["payload"] = request.data.decode("utf-8")
             shipping_captured["timeout"] = timeout
-            return FakeOrderResponse()
+            form = urllib.parse.parse_qs(shipping_captured["payload"])
+            method = form.get("method", [""])[0]
+            if method in {"cancel", "printOld"}:
+                class SimpleSuccess(FakeLabelResponse):
+                    def read(self):
+                        return json.dumps({"success": True, "code": 200, "message": "success"}).encode("utf-8")
+                return SimpleSuccess()
+            return FakeLabelResponse()
 
         original_shipping_urlopen = shipping.urllib.request.urlopen
         try:
-            shipping.urllib.request.urlopen = fake_order_urlopen
-            order_result = shipping.Kuaidi100OrderClient("test-key", "test-order-secret").create_order(
+            shipping.urllib.request.urlopen = fake_label_urlopen
+            order_result = shipping.Kuaidi100LabelClient("test-key", "test-label-secret").create_label(
                 {
                     "express_company": "圆通",
                     "recipient_name": "测试收件人",
                     "phone": "13800138000",
                     "address": "上海市测试路1号",
-                    "pickup_day": "今天",
-                    "pickup_start_time": "09:00",
-                    "pickup_end_time": "11:00",
                     "booking_salt": "salt-smoke",
                     "booking_request_id": "SP20260710S01N1",
                     "remark": "烟测",
@@ -194,6 +201,12 @@ def main() -> None:
                     "sender_mobile": "13900139000",
                     "sender_address": "云南省昆明市测试路1号",
                     "cargo_name": "香氛商品",
+                    "partnerId": "CAINIAO-ID",
+                    "partnerKey": "CAINIAO-KEY",
+                    "net": "cainiao",
+                    "tbNet": "测试网点,001",
+                    "pay_type": "MONTHLY",
+                    "print_mode": "PDF",
                 },
             )
         finally:
@@ -202,11 +215,28 @@ def main() -> None:
         order_form = urllib.parse.parse_qs(shipping_captured["payload"])
         order_param = order_form["param"][0]
         expected_order_sign = hashlib.md5(
-            f"{order_param}{order_form['t'][0]}test-keytest-order-secret".encode("utf-8")
+            f"{order_param}{order_form['t'][0]}test-keytest-label-secret".encode("utf-8")
         ).hexdigest().upper()
-        assert order_form["method"][0] == "cOrder"
+        assert shipping_captured["url"] == "https://api.kuaidi100.com/label/order"
+        assert order_form["method"][0] == "order"
         assert order_form["sign"][0] == expected_order_sign
-        assert json.loads(order_param)["thirdOrderId"] == "SP20260710S01N1"
+        assert json.loads(order_param)["orderId"] == "SP20260710S01N1"
+        assert json.loads(order_param)["reorder"] is False
+        auth_credentials = shipping.parse_auth_callback(
+            json.dumps(
+                {
+                    "result": True,
+                    "returnCode": "200",
+                    "message": json.dumps(
+                        {"parterId": "CAINIAO-ID", "partnerKey": "CAINIAO-KEY", "net": "cainiao"},
+                        ensure_ascii=False,
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        assert auth_credentials["partnerId"] == "CAINIAO-ID"
+        assert auth_credentials["net"] == "cainiao"
 
         legacy_path = Path(tmp) / "legacy.db"
         with sqlite3.connect(legacy_path) as legacy_conn:
@@ -276,9 +306,6 @@ def main() -> None:
         large_batch = legacy_db.create_shipping_batch(
             {"id": 1, "role": "admin"},
             [{"id": row["id"], "express_company": "圆通"} for row in batch_preview["eligible"]],
-            "今天",
-            "09:00",
-            "11:00",
             {"q": "BATCH-"},
         )
         assert large_batch["batch"]["total_count"] == 51
@@ -297,6 +324,9 @@ def main() -> None:
         server.SESSION_SECURE = False
         server.ALLOW_DB_RESTORE = False
         server.DB.initialize(DEFAULT_PRODUCT_FILE)
+        server.DB.save_label_authorization(
+            {"partnerId": "CAINIAO-ID", "partnerKey": "CAINIAO-KEY", "net": "cainiao"}
+        )
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
@@ -327,6 +357,13 @@ def main() -> None:
         assert body["tracking"]["configured"] is True
         assert body["tracking"]["customer"] == "test...omer"
         assert body["tracking"]["endpoint"] == "https://poll.kuaidi100.com/poll/query.do"
+        assert body["shipping"]["endpoint"] == "https://api.kuaidi100.com/label/order"
+
+        status, body = request(admin, base, "GET", "/api/admin/shipping-settings")
+        assert status == 200, body
+        assert body["settings"]["partner_authorized"] is True
+        assert "partner_key" not in body["settings"]
+        assert body["settings"]["partner_key_masked"]
 
         status, body = request(admin, base, "GET", "/api/products?all=1")
         assert status == 200, body
@@ -437,8 +474,16 @@ def main() -> None:
                 "sender_name": "总部",
                 "sender_mobile": "13900139000",
                 "sender_address": "云南省昆明市测试路1号",
+                "sender_company": "万物香铺",
                 "default_company": "圆通",
                 "cargo_name": "香氛商品",
+                "pay_type": "MONTHLY",
+                "print_mode": "PDF",
+                "carrier_settings": {
+                    "圆通": {"tbNet": "测试网点,001", "expType": "标准快递"},
+                    "京东": {"tbNet": "", "expType": "标准快递"},
+                    "顺丰": {"tbNet": "", "expType": "顺丰标快"},
+                },
             },
         )
         assert status == 200, body
@@ -463,38 +508,10 @@ def main() -> None:
             {
                 "filters": {"q": "ORDER-SMOKE-001", "status": "待处理"},
                 "shipments": [{"id": shipment_id, "express_company": "圆通"}],
-                "pickup_day": "今天",
-                "pickup_start_time": "09:00",
-                "pickup_end_time": "11:00",
             },
         )
         assert status == 202, body
         batch_id = body["batch"]["id"]
-
-        original_shipping_urlopen = shipping.urllib.request.urlopen
-        try:
-            shipping.urllib.request.urlopen = fake_order_urlopen
-            assert server.process_next_shipping_job() is True
-        finally:
-            shipping.urllib.request.urlopen = original_shipping_urlopen
-        status, body = request(admin, base, "GET", f"/api/admin/shipping-batches/{batch_id}")
-        assert status == 200, body
-        assert body["counts"]["待取号"] == 1
-        assert body["items"][0]["booking_status"] == "待取号"
-
-        callback_param = json.dumps(
-            {
-                "kuaidicom": "yuantong",
-                "kuaidinum": "YT-SMOKE-BOOKING-001",
-                "status": "10",
-                "message": "已取件",
-                "data": {"orderId": "ORDER-SMOKE", "status": 10, "pollToken": "POLL-SMOKE"},
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        callback_salt = server.DB.booking_salt_for_task("TASK-SMOKE")
-        callback_sign = hashlib.md5(f"{callback_param}{callback_salt}".encode("utf-8")).hexdigest()
 
         def fake_batch_tracking(_shipment):
             return {
@@ -504,11 +521,31 @@ def main() -> None:
             }
 
         server.query_tracking = fake_batch_tracking
+
+        original_shipping_urlopen = shipping.urllib.request.urlopen
+        try:
+            shipping.urllib.request.urlopen = fake_label_urlopen
+            assert server.process_next_shipping_job() is True
+        finally:
+            shipping.urllib.request.urlopen = original_shipping_urlopen
+        status, body = request(admin, base, "GET", f"/api/admin/shipping-batches/{batch_id}")
+        assert status == 200, body
+        assert body["counts"]["成功"] == 1
+        assert body["items"][0]["booking_status"] == "已出单"
+
+        callback_param = json.dumps(
+            {"status": "200", "message": "打印成功"},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        callback_salt = server.DB.booking_salt_for_task("TASK-SMOKE")
+        callback_sign = hashlib.md5(f"{callback_param}{callback_salt}".encode("utf-8")).hexdigest()
+
         status, body = request_form(
             admin,
             base,
             "POST",
-            "/api/integrations/kuaidi100/order-callback",
+            "/api/integrations/kuaidi100/label-print-callback",
             {"taskId": "TASK-SMOKE", "param": callback_param, "sign": callback_sign},
         )
         assert status == 200, body
@@ -516,7 +553,7 @@ def main() -> None:
             admin,
             base,
             "POST",
-            "/api/integrations/kuaidi100/order-callback",
+            "/api/integrations/kuaidi100/label-print-callback",
             {"taskId": "TASK-SMOKE", "param": callback_param, "sign": callback_sign},
         )
         assert status == 200, duplicate_body
@@ -524,14 +561,18 @@ def main() -> None:
             admin,
             base,
             "POST",
-            "/api/integrations/kuaidi100/order-callback",
+            "/api/integrations/kuaidi100/label-print-callback",
             {"taskId": "TASK-SMOKE", "param": callback_param, "sign": "invalid"},
         )
         assert status == 403, invalid_body
         status, body = request(admin, base, "GET", "/api/shipments?q=YT-SMOKE-BOOKING-001")
         assert status == 200, body
         assert body["shipments"][0]["status"] == "已发货"
-        assert body["shipments"][0]["booking_poll_token"] == "POLL-SMOKE"
+        assert body["shipments"][0]["label_print_status"] == "打印成功"
+        assert body["shipments"][0]["label_url"].endswith("smoke.pdf")
+        status, body = request(admin, base, "POST", f"/api/shipments/{shipment_id}/label/printed", {})
+        assert status == 200, body
+        assert body["shipment"]["label_print_status"] == "打印成功"
 
         status, export_body, headers = request_full(
             admin,
@@ -544,8 +585,8 @@ def main() -> None:
         assert "scentpool-cainiao.xlsx" in headers.get("Content-Disposition", "")
 
         try:
-            shipping.urllib.request.urlopen = fake_order_urlopen
-            status, body = request(admin, base, "POST", f"/api/shipments/{shipment_id}/booking/cancel", {})
+            shipping.urllib.request.urlopen = fake_label_urlopen
+            status, body = request(admin, base, "POST", f"/api/shipments/{shipment_id}/label/cancel", {})
         finally:
             shipping.urllib.request.urlopen = original_shipping_urlopen
         assert status == 200, body

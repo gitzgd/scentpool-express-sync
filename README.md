@@ -35,10 +35,12 @@ python3 server.py --host 0.0.0.0 --port 8765
 - `SCENTPOOL_KUAIDI100_ENDPOINT=https://poll.kuaidi100.com/poll/query.do`：快递100实时查询接口地址。
 - `SCENTPOOL_KUAIDI100_CUSTOMER`：快递100 customer，只放 Render 环境变量。
 - `SCENTPOOL_KUAIDI100_KEY`：快递100 key，只放 Render 环境变量。
-- `SCENTPOOL_KUAIDI100_ORDER_ENABLED=0`：快递100寄件下单开关，测试完成前保持 `0`。
-- `SCENTPOOL_KUAIDI100_ORDER_ENDPOINT=https://order.kuaidi100.com/order/corderapi.do`：上门取件线下支付下单接口。
-- `SCENTPOOL_KUAIDI100_ORDER_SECRET`：寄件下单 secret，只放 Render 环境变量。
-- `SCENTPOOL_PUBLIC_BASE_URL`：网站公网根地址，用于生成快递100订单回调地址。
+- `SCENTPOOL_KUAIDI100_LABEL_ENABLED=0`：快递100电子面单开关，测试完成前保持 `0`。
+- `SCENTPOOL_KUAIDI100_LABEL_ENDPOINT=https://api.kuaidi100.com/label/order`：电子面单下单、取消和复打接口。
+- `SCENTPOOL_KUAIDI100_AUTH_ENDPOINT=https://poll.kuaidi100.com/printapi/authThird.do`：菜鸟账号授权接口。
+- `SCENTPOOL_KUAIDI100_THIRD_INFO_ENDPOINT=https://poll.kuaidi100.com/eorderapi.do`：授权网点与面单余额接口。
+- `SCENTPOOL_KUAIDI100_LABEL_SECRET`：企业电子面单 secret，只放 Render 环境变量。
+- `SCENTPOOL_PUBLIC_BASE_URL`：网站公网根地址，用于生成菜鸟授权和打印状态回调地址。
 
 ## 发布到 Render
 
@@ -100,15 +102,20 @@ curl -b cookie.txt -c cookie.txt \
 
 问题件只会显示为“问题件”，不会自动改成“异常”，避免误判影响订单。
 
-## 快递一键下单
+## 电子面单下单与打印
 
-总部先进入“发货设置”，填写固定寄件人、联系电话和完整寄件地址。发货后台的“批量下单”会读取当前筛选条件下的全部可下单订单，不受每页 50 条限制；确认圆通、京东或顺丰及取件时间后，系统在后台逐单提交快递100。
+系统使用快递100电子面单接口，不再调用“上门取件线下支付”接口。总部先进入“电子面单设置”，填写固定寄件信息，然后点击“授权菜鸟账号”。授权成功后刷新网点与面单余额，为圆通、京东、顺丰分别选择授权网点和产品类型。
 
-圆通可能在首次响应中不返回单号，此时显示“等待快递单号”。快递100回调取得单号后，系统自动写入单号并改为“已发货”。失败订单可以按批次单独重试；已经接单的订单如需修改，应先取消快递下单。
+发货后台的“批量下单”读取当前筛选条件下的全部可下单订单，不受每页 50 条限制。系统按持久化队列逐单取号并生成面单；成功后保存快递单号、任务 ID、面单地址和打印状态，订单改为“已发货”，随后立即查询一次物流。
 
-正式启用前需要在快递100企业后台开通“上门取件线下支付”并取得 `ORDER_SECRET`。配置完成并完成一张测试单后，将 Render 中的 `SCENTPOOL_KUAIDI100_ORDER_ENABLED` 改为 `1`。
+打印方式：
 
-“菜鸟打印数据”目前导出标准收寄件和商品字段。拿到菜鸟商家后台的实际空白导入模板后，应再按模板列名和工作表结构做精确对齐。
+- `PDF`：菜鸟授权模式返回 PDF 面单，在发货后台点击“查看面单”后使用本地打印机打印。
+- `CLOUD`：快递100云打印，需要网点电子面单账号和设备码 `siid`；打印状态通过回调更新，支持两天内复打。菜鸟第三方授权通道会固定返回 PDF，不执行云打印。
+
+电子面单取消只有在快递公司接口确认成功后才会清空单号并解锁订单。部分快递公司或授权通道不支持接口取消时，需要在菜鸟后台或合作网点人工回收面单。
+
+正式启用前需要在快递100企业后台开通“电子面单”并取得 `LABEL_SECRET`。配置完成、菜鸟授权成功并完成一张测试单后，将 Render 中的 `SCENTPOOL_KUAIDI100_LABEL_ENABLED` 改为 `1`。
 
 ## 备份与回滚
 

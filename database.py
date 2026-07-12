@@ -25,7 +25,7 @@ DEFAULT_STORE_USERNAME = "store01"
 DEFAULT_STORE_PASSWORD = "scentpool2026"
 APP_TZ = ZoneInfo("Asia/Shanghai")
 BOOKING_EDITABLE_STATUSES = ("未下单", "下单失败", "已取消")
-BOOKING_ACTIVE_STATUSES = ("排队中", "提交中", "已接单", "待取号")
+BOOKING_ACTIVE_STATUSES = ("排队中", "提交中")
 
 
 class AppError(Exception):
@@ -178,6 +178,13 @@ class Database:
                     booking_courier_mobile TEXT NOT NULL DEFAULT '',
                     booking_weight TEXT NOT NULL DEFAULT '',
                     booking_freight TEXT NOT NULL DEFAULT '',
+                    label_url TEXT NOT NULL DEFAULT '',
+                    label_print_status TEXT NOT NULL DEFAULT '',
+                    label_print_error TEXT NOT NULL DEFAULT '',
+                    label_print_type TEXT NOT NULL DEFAULT '',
+                    label_carrier_order_no TEXT NOT NULL DEFAULT '',
+                    label_child_no TEXT NOT NULL DEFAULT '',
+                    label_return_no TEXT NOT NULL DEFAULT '',
                     pickup_day TEXT NOT NULL DEFAULT '',
                     pickup_start_time TEXT NOT NULL DEFAULT '',
                     pickup_end_time TEXT NOT NULL DEFAULT '',
@@ -240,8 +247,27 @@ class Database:
                     sender_name TEXT NOT NULL DEFAULT '',
                     sender_mobile TEXT NOT NULL DEFAULT '',
                     sender_address TEXT NOT NULL DEFAULT '',
+                    sender_company TEXT NOT NULL DEFAULT '万物香铺',
                     default_company TEXT NOT NULL DEFAULT '圆通',
                     cargo_name TEXT NOT NULL DEFAULT '香氛商品',
+                    pay_type TEXT NOT NULL DEFAULT 'MONTHLY',
+                    print_mode TEXT NOT NULL DEFAULT 'PDF',
+                    printer_siid TEXT NOT NULL DEFAULT '',
+                    template_id TEXT NOT NULL DEFAULT '',
+                    paper_width TEXT NOT NULL DEFAULT '100',
+                    paper_height TEXT NOT NULL DEFAULT '180',
+                    need_desensitization INTEGER NOT NULL DEFAULT 0,
+                    need_logo INTEGER NOT NULL DEFAULT 0,
+                    partner_id TEXT NOT NULL DEFAULT '',
+                    partner_key TEXT NOT NULL DEFAULT '',
+                    partner_secret TEXT NOT NULL DEFAULT '',
+                    partner_name TEXT NOT NULL DEFAULT '',
+                    partner_net TEXT NOT NULL DEFAULT '',
+                    partner_code TEXT NOT NULL DEFAULT '',
+                    partner_check_man TEXT NOT NULL DEFAULT '',
+                    carrier_settings_json TEXT NOT NULL DEFAULT '{}',
+                    branch_options_json TEXT NOT NULL DEFAULT '[]',
+                    authorized_at TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 );
 
@@ -288,6 +314,13 @@ class Database:
                     param_raw TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS label_auth_sessions (
+                    state TEXT PRIMARY KEY,
+                    expires_at TEXT NOT NULL,
+                    used_at TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -305,6 +338,7 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_return_orders_created ON return_orders(created_at)")
             self._ensure_shipment_tracking_columns(conn)
             self._ensure_shipping_batch_columns(conn)
+            self._ensure_label_columns(conn)
             self._normalize_shipments_with_tracking(conn)
             conn.execute(
                 """
@@ -553,6 +587,47 @@ class Database:
         for name, definition in columns.items():
             if name not in existing:
                 conn.execute(f"ALTER TABLE shipping_batch_items ADD COLUMN {name} {definition}")
+
+    def _ensure_label_columns(self, conn: sqlite3.Connection) -> None:
+        shipment_existing = {row["name"] for row in conn.execute("PRAGMA table_info(shipments)").fetchall()}
+        shipment_columns = {
+            "label_url": "TEXT NOT NULL DEFAULT ''",
+            "label_print_status": "TEXT NOT NULL DEFAULT ''",
+            "label_print_error": "TEXT NOT NULL DEFAULT ''",
+            "label_print_type": "TEXT NOT NULL DEFAULT ''",
+            "label_carrier_order_no": "TEXT NOT NULL DEFAULT ''",
+            "label_child_no": "TEXT NOT NULL DEFAULT ''",
+            "label_return_no": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in shipment_columns.items():
+            if name not in shipment_existing:
+                conn.execute(f"ALTER TABLE shipments ADD COLUMN {name} {definition}")
+
+        settings_existing = {row["name"] for row in conn.execute("PRAGMA table_info(shipping_settings)").fetchall()}
+        settings_columns = {
+            "sender_company": "TEXT NOT NULL DEFAULT '万物香铺'",
+            "pay_type": "TEXT NOT NULL DEFAULT 'MONTHLY'",
+            "print_mode": "TEXT NOT NULL DEFAULT 'PDF'",
+            "printer_siid": "TEXT NOT NULL DEFAULT ''",
+            "template_id": "TEXT NOT NULL DEFAULT ''",
+            "paper_width": "TEXT NOT NULL DEFAULT '100'",
+            "paper_height": "TEXT NOT NULL DEFAULT '180'",
+            "need_desensitization": "INTEGER NOT NULL DEFAULT 0",
+            "need_logo": "INTEGER NOT NULL DEFAULT 0",
+            "partner_id": "TEXT NOT NULL DEFAULT ''",
+            "partner_key": "TEXT NOT NULL DEFAULT ''",
+            "partner_secret": "TEXT NOT NULL DEFAULT ''",
+            "partner_name": "TEXT NOT NULL DEFAULT ''",
+            "partner_net": "TEXT NOT NULL DEFAULT ''",
+            "partner_code": "TEXT NOT NULL DEFAULT ''",
+            "partner_check_man": "TEXT NOT NULL DEFAULT ''",
+            "carrier_settings_json": "TEXT NOT NULL DEFAULT '{}'",
+            "branch_options_json": "TEXT NOT NULL DEFAULT '[]'",
+            "authorized_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in settings_columns.items():
+            if name not in settings_existing:
+                conn.execute(f"ALTER TABLE shipping_settings ADD COLUMN {name} {definition}")
 
     def database_summary(self) -> Dict[str, int]:
         with self.connect() as conn:
@@ -1074,25 +1149,62 @@ class Database:
             )
         return rows
 
-    def get_shipping_settings(self) -> Dict[str, Any]:
+    def get_shipping_settings(self, *, public: bool = False) -> Dict[str, Any]:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM shipping_settings WHERE id = 1").fetchone()
-        return dict(row) if row else {
+        settings = dict(row) if row else {
             "id": 1,
             "sender_name": "",
             "sender_mobile": "",
             "sender_address": "",
+            "sender_company": "万物香铺",
             "default_company": DEFAULT_EXPRESS_COMPANY,
             "cargo_name": "香氛商品",
+            "pay_type": "MONTHLY",
+            "print_mode": "PDF",
+            "carrier_settings_json": "{}",
+            "branch_options_json": "[]",
             "updated_at": "",
         }
+        try:
+            settings["carrier_settings"] = json.loads(settings.get("carrier_settings_json") or "{}")
+        except json.JSONDecodeError:
+            settings["carrier_settings"] = {}
+        try:
+            settings["branch_options"] = json.loads(settings.get("branch_options_json") or "[]")
+        except json.JSONDecodeError:
+            settings["branch_options"] = []
+        settings["partner_authorized"] = bool(settings.get("partner_id") and settings.get("partner_key"))
+        if public:
+            settings["partner_id_masked"] = self._mask_value(settings.get("partner_id"))
+            settings["partner_key_masked"] = self._mask_value(settings.get("partner_key"))
+            for key in ("partner_id", "partner_key", "partner_secret"):
+                settings.pop(key, None)
+        return settings
+
+    @staticmethod
+    def _mask_value(value: Any) -> str:
+        text = str(value or "")
+        if not text:
+            return ""
+        if len(text) <= 6:
+            return "*" * len(text)
+        return f"{text[:3]}***{text[-3:]}"
 
     def update_shipping_settings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         sender_name = str(payload.get("sender_name") or "").strip()
         sender_mobile = str(payload.get("sender_mobile") or "").strip()
         sender_address = str(payload.get("sender_address") or "").strip()
+        sender_company = str(payload.get("sender_company") or "万物香铺").strip()
         default_company = str(payload.get("default_company") or DEFAULT_EXPRESS_COMPANY).strip()
         cargo_name = str(payload.get("cargo_name") or "香氛商品").strip()
+        pay_type = str(payload.get("pay_type") or "MONTHLY").strip()
+        print_mode = str(payload.get("print_mode") or "PDF").strip().upper()
+        printer_siid = str(payload.get("printer_siid") or "").strip()
+        template_id = str(payload.get("template_id") or "").strip()
+        paper_width = str(payload.get("paper_width") or "100").strip()
+        paper_height = str(payload.get("paper_height") or "180").strip()
+        carrier_settings = payload.get("carrier_settings") if isinstance(payload.get("carrier_settings"), dict) else {}
         if not sender_name:
             raise AppError("请输入总部寄件人姓名。")
         if not sender_mobile or not re_phone_ok(sender_mobile):
@@ -1103,24 +1215,148 @@ class Database:
             raise AppError("请选择有效的默认快递公司。")
         if not cargo_name:
             raise AppError("请输入物品名称。")
+        if pay_type not in {"SHIPPER", "MONTHLY"}:
+            raise AppError("请选择寄方付或月结。")
+        if print_mode not in {"PDF", "CLOUD"}:
+            raise AppError("请选择 PDF 面单或快递100云打印。")
+        if print_mode == "CLOUD" and not printer_siid:
+            raise AppError("云打印需要填写打印设备码 siid。")
+        if not paper_width.isdigit() or not paper_height.isdigit():
+            raise AppError("面单纸宽度和高度必须是正整数。")
+        normalized_carriers: Dict[str, Dict[str, str]] = {}
+        for company in EXPRESS_COMPANIES:
+            value = carrier_settings.get(company) if isinstance(carrier_settings.get(company), dict) else {}
+            normalized_carriers[company] = {
+                "tbNet": str(value.get("tbNet") or "").strip(),
+                "expType": str(value.get("expType") or ("顺丰标快" if company == "顺丰" else "标准快递")).strip(),
+            }
         now = now_text()
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO shipping_settings (
-                    id, sender_name, sender_mobile, sender_address, default_company, cargo_name, updated_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?)
+                    id, sender_name, sender_mobile, sender_address, sender_company, default_company, cargo_name,
+                    pay_type, print_mode, printer_siid, template_id, paper_width, paper_height,
+                    need_desensitization, need_logo, carrier_settings_json, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     sender_name = excluded.sender_name,
                     sender_mobile = excluded.sender_mobile,
                     sender_address = excluded.sender_address,
+                    sender_company = excluded.sender_company,
                     default_company = excluded.default_company,
                     cargo_name = excluded.cargo_name,
+                    pay_type = excluded.pay_type,
+                    print_mode = excluded.print_mode,
+                    printer_siid = excluded.printer_siid,
+                    template_id = excluded.template_id,
+                    paper_width = excluded.paper_width,
+                    paper_height = excluded.paper_height,
+                    need_desensitization = excluded.need_desensitization,
+                    need_logo = excluded.need_logo,
+                    carrier_settings_json = excluded.carrier_settings_json,
                     updated_at = excluded.updated_at
                 """,
-                (sender_name, sender_mobile, sender_address, default_company, cargo_name, now),
+                (
+                    sender_name, sender_mobile, sender_address, sender_company, default_company, cargo_name,
+                    pay_type, print_mode, printer_siid, template_id, paper_width, paper_height,
+                    1 if payload.get("need_desensitization") else 0,
+                    1 if payload.get("need_logo") else 0,
+                    json.dumps(normalized_carriers, ensure_ascii=False), now,
+                ),
             )
-        return self.get_shipping_settings()
+        return self.get_shipping_settings(public=True)
+
+    def shipping_settings_for_company(self, company: str) -> Dict[str, Any]:
+        settings = self.get_shipping_settings()
+        carrier = settings.get("carrier_settings", {}).get(company, {})
+        settings.update(
+            {
+                "partnerId": settings.get("partner_id", ""),
+                "partnerKey": settings.get("partner_key", ""),
+                "partnerSecret": settings.get("partner_secret", ""),
+                "partnerName": settings.get("partner_name", ""),
+                "net": settings.get("partner_net", ""),
+                "code": settings.get("partner_code", ""),
+                "checkMan": settings.get("partner_check_man", ""),
+                "tbNet": carrier.get("tbNet", ""),
+                "exp_type": carrier.get("expType", "顺丰标快" if company == "顺丰" else "标准快递"),
+            }
+        )
+        return settings
+
+    def create_label_auth_session(self) -> str:
+        state = secrets.token_urlsafe(24)
+        now = now_text()
+        expires = (datetime.now(APP_TZ) + timedelta(minutes=30)).isoformat(timespec="seconds")
+        with self.connect() as conn:
+            conn.execute("DELETE FROM label_auth_sessions WHERE expires_at < ? OR used_at <> ''", (now,))
+            conn.execute(
+                "INSERT INTO label_auth_sessions (state, expires_at, created_at) VALUES (?, ?, ?)",
+                (state, expires, now),
+            )
+        return state
+
+    def consume_label_auth_session(self, state: str) -> None:
+        now = now_text()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM label_auth_sessions WHERE state = ? AND used_at = '' AND expires_at >= ?",
+                (state, now),
+            ).fetchone()
+            if not row:
+                raise AppError("菜鸟授权链接无效或已过期。", 403)
+            conn.execute("UPDATE label_auth_sessions SET used_at = ? WHERE state = ?", (now, state))
+
+    def save_label_authorization(self, credentials: Dict[str, Any]) -> Dict[str, Any]:
+        now = now_text()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE shipping_settings
+                SET partner_id = ?, partner_key = ?, partner_secret = ?, partner_name = ?, partner_net = ?,
+                    partner_code = ?, partner_check_man = ?, authorized_at = ?, updated_at = ?
+                WHERE id = 1
+                """,
+                (
+                    str(credentials.get("partnerId") or ""), str(credentials.get("partnerKey") or ""),
+                    str(credentials.get("partnerSecret") or ""), str(credentials.get("partnerName") or ""),
+                    str(credentials.get("net") or "cainiao"), str(credentials.get("code") or ""),
+                    str(credentials.get("checkMan") or ""), now, now,
+                ),
+            )
+        return self.get_shipping_settings(public=True)
+
+    def save_label_branches(self, branches: List[Dict[str, Any]]) -> Dict[str, Any]:
+        settings = self.get_shipping_settings()
+        carriers = settings.get("carrier_settings", {})
+        options: List[Dict[str, Any]] = []
+        code_to_company = {"yuantong": "圆通", "jd": "京东", "shunfeng": "顺丰"}
+        for entry in branches:
+            company = code_to_company.get(str(entry.get("kuaidicom") or ""))
+            if not company:
+                continue
+            company_options = []
+            for branch in entry.get("branchAccounts") or []:
+                option = {
+                    "company": company,
+                    "tbNet": str(branch.get("tbNet") or ""),
+                    "branchName": str(branch.get("branchName") or ""),
+                    "quantity": int(branch.get("quantity") or 0),
+                }
+                options.append(option)
+                company_options.append(option)
+            current = carriers.get(company) if isinstance(carriers.get(company), dict) else {}
+            if company_options and not current.get("tbNet"):
+                current["tbNet"] = company_options[0]["tbNet"]
+            current.setdefault("expType", "顺丰标快" if company == "顺丰" else "标准快递")
+            carriers[company] = current
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE shipping_settings SET carrier_settings_json = ?, branch_options_json = ?, updated_at = ? WHERE id = 1",
+                (json.dumps(carriers, ensure_ascii=False), json.dumps(options, ensure_ascii=False), now_text()),
+            )
+        return self.get_shipping_settings(public=True)
 
     @staticmethod
     def shipment_booking_eligible(row: Dict[str, Any]) -> bool:
@@ -1164,25 +1400,15 @@ class Database:
             "excluded": excluded,
             "company_counts": company_counts,
             "settings_ready": bool(settings.get("sender_name") and settings.get("sender_mobile") and settings.get("sender_address")),
+            "label_ready": bool(settings.get("partner_id") and settings.get("partner_key")),
         }
 
     def create_shipping_batch(
         self,
         user: Dict[str, Any],
         shipment_choices: List[Dict[str, Any]],
-        pickup_day: str,
-        pickup_start_time: str,
-        pickup_end_time: str,
         filters: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        if pickup_day not in {"今天", "明天", "后天"}:
-            raise AppError("请选择今天、明天或后天取件。")
-        if not re.fullmatch(r"\d{2}:\d{2}", pickup_start_time) or not re.fullmatch(r"\d{2}:\d{2}", pickup_end_time):
-            raise AppError("请选择有效取件时间段。")
-        start_minutes = int(pickup_start_time[:2]) * 60 + int(pickup_start_time[3:])
-        end_minutes = int(pickup_end_time[:2]) * 60 + int(pickup_end_time[3:])
-        if end_minutes - start_minutes < 60:
-            raise AppError("取件时间段至少需要一小时。")
         if not shipment_choices:
             raise AppError("没有可下单的发货单。")
 
@@ -1219,7 +1445,7 @@ class Database:
                     status, total_count, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, '排队中', ?, ?, ?)
                 """,
-                (user["id"], json.dumps(filters or {}, ensure_ascii=False), pickup_day, pickup_start_time, pickup_end_time, len(valid), now, now),
+                (user["id"], json.dumps(filters or {}, ensure_ascii=False), "", "", "", len(valid), now, now),
             )
             batch_id = int(cursor.lastrowid)
             for shipment, company in valid:
@@ -1230,10 +1456,10 @@ class Database:
                     UPDATE shipments
                     SET express_company = ?, booking_status = '排队中', booking_request_id = ?,
                         booking_salt = ?, booking_error = '', booking_requested_at = ?, booking_updated_at = ?,
-                        pickup_day = ?, pickup_start_time = ?, pickup_end_time = ?, updated_at = ?
+                        pickup_day = '', pickup_start_time = '', pickup_end_time = '', updated_at = ?
                     WHERE id = ?
                     """,
-                    (company, request_id, salt, now, now, pickup_day, pickup_start_time, pickup_end_time, now, shipment["id"]),
+                    (company, request_id, salt, now, now, now, shipment["id"]),
                 )
                 conn.execute(
                     """
@@ -1289,8 +1515,8 @@ class Database:
         now = now_text()
         success = bool(result.get("success"))
         tracking_no = str(result.get("tracking_no") or "").strip()
-        item_status = "成功" if success and tracking_no else "待取号" if success else "失败"
-        booking_status = "已出单" if success and tracking_no else "待取号" if success else "下单失败"
+        item_status = "成功" if success and tracking_no else "失败"
+        booking_status = "已出单" if success and tracking_no else "下单失败"
         with self.connect() as conn:
             item = conn.execute("SELECT * FROM shipping_batch_items WHERE id = ?", (item_id,)).fetchone()
             if not item:
@@ -1307,7 +1533,7 @@ class Database:
                 WHERE id = ?
                 """,
                 (
-                    item_status, str(result.get("task_id") or ""), str(result.get("order_id") or ""),
+                    item_status, str(result.get("task_id") or ""), str(result.get("carrier_order_no") or ""),
                     str(result.get("error") or ""), str(result.get("raw") or ""), now, item_id,
                 ),
             )
@@ -1318,14 +1544,19 @@ class Database:
                     tracking_status = CASE WHEN ? <> '' THEN '待查询' ELSE tracking_status END,
                     tracking_provider = CASE WHEN ? <> '' THEN 'kuaidi100' ELSE tracking_provider END,
                     shipped_at = ?, booking_status = ?, booking_task_id = ?, booking_order_id = ?,
-                    booking_poll_token = ?, booking_error = ?, booking_raw = ?, booking_updated_at = ?, updated_at = ?
+                    booking_poll_token = '', booking_error = ?, booking_raw = ?, booking_updated_at = ?,
+                    label_url = ?, label_print_status = ?, label_print_error = '', label_print_type = ?,
+                    label_carrier_order_no = ?, label_child_no = ?, label_return_no = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
                     status, tracking_no, tracking_no, tracking_no, tracking_no, shipped_at, booking_status,
-                    str(result.get("task_id") or ""), str(result.get("order_id") or ""),
-                    str(result.get("poll_token") or ""), str(result.get("error") or ""),
-                    str(result.get("raw") or ""), now, now, item["shipment_id"],
+                    str(result.get("task_id") or ""), str(result.get("carrier_order_no") or ""),
+                    str(result.get("error") or ""), str(result.get("raw") or ""), now,
+                    str(result.get("label_url") or ""), str(result.get("print_status") or ""),
+                    str(result.get("print_type") or ""), str(result.get("carrier_order_no") or ""),
+                    str(result.get("child_no") or ""), str(result.get("return_no") or ""), now,
+                    item["shipment_id"],
                 ),
             )
             self._refresh_shipping_batch_status(conn, int(item["batch_id"]), now)
@@ -1340,9 +1571,6 @@ class Database:
         if counts.get("排队中") or counts.get("提交中"):
             status = "处理中"
             finished_at = ""
-        elif counts.get("待取号"):
-            status = "等待单号"
-            finished_at = now
         elif counts.get("失败") and not counts.get("成功"):
             status = "失败"
             finished_at = now
@@ -1420,86 +1648,38 @@ class Database:
                 )
                 conn.execute("UPDATE shipping_batches SET status = '排队中', updated_at = ? WHERE id = ?", (now, row["batch_id"]))
 
-    def apply_shipping_callback(self, task_id: str, param_raw: str, param: Dict[str, Any]) -> Dict[str, Any]:
-        carrier_status = str((param.get("data") or {}).get("status") or param.get("status") or "")
-        tracking_no = str(param.get("kuaidinum") or "").strip()
-        event_key = hashlib.sha256(f"{task_id}|{carrier_status}|{tracking_no}|{param_raw}".encode("utf-8")).hexdigest()
+    def apply_label_print_callback(self, task_id: str, param_raw: str, param: Dict[str, Any]) -> Dict[str, Any]:
+        print_status_code = str(param.get("status") or "")
+        event_key = hashlib.sha256(f"print|{task_id}|{print_status_code}|{param_raw}".encode("utf-8")).hexdigest()
         now = now_text()
         with self.connect() as conn:
             cursor = conn.execute(
                 "INSERT OR IGNORE INTO shipping_callback_events (task_id, carrier_status, event_key, param_raw, created_at) VALUES (?, ?, ?, ?, ?)",
-                (task_id, carrier_status, event_key, param_raw, now),
+                (task_id, print_status_code, event_key, param_raw, now),
             )
             if cursor.rowcount == 0:
-                return {"duplicate": True, "should_refresh_tracking": False}
+                return {"duplicate": True}
             batch_item = conn.execute(
                 "SELECT * FROM shipping_batch_items WHERE task_id = ? ORDER BY id DESC LIMIT 1",
                 (task_id,),
             ).fetchone()
             if not batch_item:
-                raise AppError("没有找到对应的快递下单任务。", 404)
-            if batch_item["status"] == "已取消":
-                return {"duplicate": False, "ignored": True, "should_refresh_tracking": False}
+                raise AppError("没有找到对应的电子面单任务。", 404)
             shipment = conn.execute("SELECT * FROM shipments WHERE id = ?", (batch_item["shipment_id"],)).fetchone()
             if not shipment or shipment["booking_task_id"] != task_id:
-                return {"duplicate": False, "ignored": True, "should_refresh_tracking": False}
-            data = param.get("data") if isinstance(param.get("data"), dict) else {}
-            booking_status = shipment["booking_status"]
-            status = shipment["status"]
-            booking_error = ""
-            if carrier_status in {"11", "201", "610"}:
-                booking_status = "下单失败"
-                status = "待处理"
-                booking_error = str(param.get("message") or data.get("cancelMsg99") or "快递下单失败")
-            elif carrier_status in {"9", "99"}:
-                booking_status = "已取消"
-                status = "待处理"
-                tracking_no = ""
-            elif carrier_status in {"13"}:
-                booking_status = "已出单"
-                status = "已签收"
-            elif tracking_no or carrier_status in {"10", "101", "200", "400"}:
-                booking_status = "已出单" if tracking_no else "待取号"
-                status = "已发货" if tracking_no else status
-            elif carrier_status in {"0", "1", "2"}:
-                booking_status = "已接单" if carrier_status in {"1", "2"} else "待取号"
-
-            poll_token = str(data.get("pollToken") or shipment["booking_poll_token"] or "")
-            final_tracking_no = tracking_no or str(shipment["tracking_no"] or "")
-            shipped_at = shipment["shipped_at"] or (now if final_tracking_no else "")
-            tracking_status = shipment["tracking_status"]
-            tracking_signed_at = shipment["tracking_signed_at"]
-            if status == "已签收":
-                tracking_status = "已签收"
-                tracking_signed_at = tracking_signed_at or now
-            elif final_tracking_no and not tracking_status:
-                tracking_status = "待查询"
+                return {"duplicate": False, "ignored": True}
+            succeeded = print_status_code == "200"
+            print_status = "打印成功" if succeeded else "打印失败"
+            print_error = "" if succeeded else str(param.get("message") or "打印机未完成面单打印")
             conn.execute(
                 """
                 UPDATE shipments
-                SET status = ?, tracking_no = ?, tracking_status = ?, tracking_signed_at = ?, shipped_at = ?,
-                    booking_status = ?, booking_poll_token = ?, booking_error = ?, booking_carrier_status = ?,
-                    booking_raw = ?, booking_updated_at = ?, booking_courier_name = ?, booking_courier_mobile = ?,
-                    booking_weight = ?, booking_freight = ?, updated_at = ?
+                SET label_print_status = ?, label_print_error = ?, booking_raw = ?, booking_updated_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (
-                    status, final_tracking_no, tracking_status, tracking_signed_at, shipped_at, booking_status,
-                    poll_token, booking_error, carrier_status, param_raw, now,
-                    str(data.get("courierName") or shipment["booking_courier_name"] or ""),
-                    str(data.get("courierMobile") or shipment["booking_courier_mobile"] or ""),
-                    str(data.get("weight") or data.get("actualWeight") or shipment["booking_weight"] or ""),
-                    str(data.get("freight") or shipment["booking_freight"] or ""), now, shipment["id"],
-                ),
+                (print_status, print_error, param_raw, now, now, shipment["id"]),
             )
-            item_status = "成功" if final_tracking_no else "失败" if booking_status == "下单失败" else "已取消" if booking_status == "已取消" else "待取号"
-            if batch_item:
-                conn.execute(
-                    "UPDATE shipping_batch_items SET status = ?, error = ?, response_raw = ?, updated_at = ? WHERE id = ?",
-                    (item_status, booking_error, param_raw, now, batch_item["id"]),
-                )
-                self._refresh_shipping_batch_status(conn, int(batch_item["batch_id"]), now)
-        return {"duplicate": False, "shipment_id": shipment["id"], "should_refresh_tracking": bool(final_tracking_no and status != "已签收")}
+        return {"duplicate": False, "shipment_id": shipment["id"], "print_status": print_status}
 
     def booking_salt_for_task(self, task_id: str) -> str:
         with self.connect() as conn:
@@ -1508,7 +1688,7 @@ class Database:
                 (task_id,),
             ).fetchone()
         if not row:
-            raise AppError("没有找到对应的快递下单任务。", 404)
+            raise AppError("没有找到对应的电子面单任务。", 404)
         return str(row["booking_salt"] or "")
 
     def booking_for_cancel(self, shipment_id: int) -> Dict[str, Any]:
@@ -1516,11 +1696,37 @@ class Database:
             row = conn.execute("SELECT * FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
         if not row:
             raise AppError("发货单不存在。", 404)
-        if not row["booking_task_id"] or not row["booking_order_id"]:
-            raise AppError("这个订单没有可取消的快递下单。", 409)
+        if not row["booking_task_id"] or not row["tracking_no"]:
+            raise AppError("这个订单没有可取消的电子面单。", 409)
         if row["status"] == "已签收":
             raise AppError("已签收订单不能取消快递下单。", 409)
         return dict(row)
+
+    def mark_label_reprint(self, shipment_id: int, raw: str = "") -> None:
+        now = now_text()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE shipments
+                SET label_print_status = '打印中', label_print_error = '', booking_raw = ?,
+                    booking_updated_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (raw, now, now, shipment_id),
+            )
+
+    def mark_label_printed(self, shipment_id: int) -> None:
+        now = now_text()
+        with self.connect() as conn:
+            row = conn.execute("SELECT label_url, booking_task_id FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
+            if not row:
+                raise AppError("发货单不存在。", 404)
+            if not row["label_url"] and not row["booking_task_id"]:
+                raise AppError("这个订单还没有可打印的电子面单。", 409)
+            conn.execute(
+                "UPDATE shipments SET label_print_status = '打印成功', label_print_error = '', updated_at = ? WHERE id = ?",
+                (now, shipment_id),
+            )
 
     def mark_booking_cancelled(self, shipment_id: int, raw: str = "") -> Dict[str, Any]:
         now = now_text()
@@ -1534,6 +1740,8 @@ class Database:
                     shipped_at = '', booking_status = '已取消', booking_task_id = '', booking_order_id = '',
                     booking_request_id = '', booking_poll_token = '', booking_salt = '',
                     booking_error = '', booking_raw = ?,
+                    label_url = '', label_print_status = '', label_print_error = '', label_print_type = '',
+                    label_carrier_order_no = '', label_child_no = '', label_return_no = '',
                     booking_updated_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
