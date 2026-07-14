@@ -27,6 +27,8 @@ const state = {
   shippingSettings: null,
   shippingConfig: null,
   batchPreview: null,
+  batchFilters: { store_id: "", status: "待处理", date_from: "", date_to: "", q: "" },
+  batchSelectedIds: [],
   activeShippingBatch: null,
   shippingBatchPollTimer: null,
 };
@@ -420,6 +422,15 @@ async function loadShippingSettings() {
   const data = await api("/api/admin/shipping-settings");
   state.shippingSettings = data.settings || {};
   state.shippingConfig = data.shipping || {};
+}
+
+async function loadShippingBatchPreview(filters) {
+  const data = await api("/api/admin/shipping-batches/preview", {
+    method: "POST",
+    body: JSON.stringify({ filters }),
+  });
+  state.batchPreview = data.preview || null;
+  state.batchSelectedIds = (state.batchPreview?.eligible || []).map((row) => Number(row.id));
 }
 
 async function loadActiveShippingBatch() {
@@ -1513,26 +1524,51 @@ function renderShippingBatchPreview() {
   const preview = state.batchPreview;
   if (!preview) return "";
   const eligible = preview.eligible || [];
+  const eligibleIds = new Set(eligible.map((row) => Number(row.id)));
+  const selectedIds = new Set(state.batchSelectedIds.filter((id) => eligibleIds.has(Number(id))).map(Number));
+  const config = state.shippingConfig || {};
+  const configReady = Boolean(config.enabled && config.configured);
+  const missingConfig = Array.isArray(config.missing) ? config.missing : [];
   return `
     <section class="panel panel-pad shipping-batch-panel">
       <div class="section-title">
-        <div><h2>确认批量下单</h2><div class="muted mini">当前筛选匹配 ${preview.matched || 0} 单，可下单 ${eligible.length} 单，排除 ${(preview.excluded || []).length} 单</div></div>
+        <div><h2>选择需要打单的订单</h2><div class="muted mini">筛选匹配 ${preview.matched || 0} 单，可打单 ${eligible.length} 单，已选择 <span id="batchSelectedCount">${selectedIds.size}</span> 单</div></div>
         <button class="btn ghost small" id="closeBatchPreview" type="button">关闭</button>
       </div>
-      ${!preview.settings_ready ? `<div class="notice danger-notice">总部寄件信息未完成，请先进入“发货设置”。</div>` : ""}
+      <div class="batch-filter-grid">
+        <div class="field">
+          <label for="batchFilterStore">门店</label>
+          <select class="select" id="batchFilterStore">
+            <option value="">全部门店</option>
+            ${state.stores.map((store) => `<option value="${store.id}" ${String(store.id) === String(state.batchFilters.store_id) ? "selected" : ""}>${escapeHtml(store.name)}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field"><label for="batchFilterFrom">开始日期</label><input class="input" id="batchFilterFrom" type="date" value="${escapeHtml(state.batchFilters.date_from)}" /></div>
+        <div class="field"><label for="batchFilterTo">结束日期</label><input class="input" id="batchFilterTo" type="date" value="${escapeHtml(state.batchFilters.date_to)}" /></div>
+        <div class="field"><label for="batchFilterQ">搜索订单</label><input class="input" id="batchFilterQ" value="${escapeHtml(state.batchFilters.q)}" placeholder="业务ID / 门店订单号 / 收件人" /></div>
+        <button class="btn primary" id="applyBatchFilters" type="button">筛选</button>
+        <button class="btn secondary" id="resetBatchFilters" type="button">清空</button>
+      </div>
+      ${!preview.settings_ready ? `<div class="notice danger-notice">总部寄件信息未完成，请先进入“面单设置”。</div>` : ""}
       ${!preview.label_ready ? `<div class="notice danger-notice">菜鸟电子面单账号尚未授权。</div>` : ""}
-      ${!state.shippingConfig?.enabled || !state.shippingConfig?.configured ? `<div class="notice">快递100下单开关未开启或密钥未配置，目前只能预览，不能正式提交。</div>` : ""}
+      ${!config.enabled ? `<div class="notice danger-notice">电子面单服务开关未开启：请在 Render 将 <strong>SCENTPOOL_KUAIDI100_LABEL_ENABLED</strong> 设置为 <strong>1</strong>。</div>` : ""}
+      ${missingConfig.length ? `<div class="notice danger-notice">Render 还缺少：<strong>${missingConfig.map(escapeHtml).join("、")}</strong>。补齐并重新部署后即可正式提交。</div>` : ""}
       <div class="batch-controls label-batch-controls">
         <div class="field">
-          <label>整批快递公司</label>
+          <label>已选订单统一改为</label>
           <select class="select" id="batchBulkCompany">${expressCompanyOptions(DEFAULT_EXPRESS_COMPANY)}</select>
         </div>
-        <button class="btn primary" id="createShippingBatch" type="button" ${eligible.length && preview.settings_ready && preview.label_ready && state.shippingConfig?.enabled && state.shippingConfig?.configured ? "" : "disabled"}>确认提交 ${eligible.length} 单</button>
+        <div class="inline-actions batch-selection-actions">
+          <button class="btn secondary small" id="selectAllBatchOrders" type="button">全选筛选结果</button>
+          <button class="btn ghost small" id="clearBatchOrders" type="button">取消全选</button>
+        </div>
+        <button class="btn primary" id="createShippingBatch" data-ready="${preview.settings_ready && preview.label_ready && configReady ? "1" : "0"}" type="button" ${selectedIds.size && preview.settings_ready && preview.label_ready && configReady ? "" : "disabled"}>确认提交 ${selectedIds.size} 单</button>
       </div>
       <div class="notice">提交后将立即获取快递单号并生成电子面单，不再创建上门取件预约。</div>
       <div class="batch-order-list">
         ${eligible.map((row) => `
           <div class="batch-order-row" data-batch-shipment="${row.id}">
+            <input class="batch-order-checkbox" type="checkbox" data-batch-select value="${row.id}" aria-label="选择订单 ${escapeHtml(row.business_id)}" ${selectedIds.has(Number(row.id)) ? "checked" : ""} />
             <div><strong>${escapeHtml(row.business_id)}</strong><div class="muted mini">${escapeHtml(row.store_name_snapshot)} · ${escapeHtml(row.recipient_name)} · ${escapeHtml(row.address)}</div></div>
             <select class="select" data-batch-company>${expressCompanyOptions(row.express_company)}</select>
           </div>
@@ -1831,11 +1867,14 @@ function bindAdmin() {
   if (previewButton) {
     previewButton.addEventListener("click", async () => {
       try {
-        const data = await api("/api/admin/shipping-batches/preview", {
-          method: "POST",
-          body: JSON.stringify({ filters: state.adminFilters }),
-        });
-        state.batchPreview = data.preview || null;
+        state.batchFilters = {
+          store_id: state.adminFilters.store_id,
+          status: "待处理",
+          date_from: state.adminFilters.date_from,
+          date_to: state.adminFilters.date_to,
+          q: state.adminFilters.q,
+        };
+        await loadShippingBatchPreview(state.batchFilters);
         render();
       } catch (error) {
         toast(error.message);
@@ -1844,24 +1883,75 @@ function bindAdmin() {
   }
   document.getElementById("closeBatchPreview")?.addEventListener("click", () => {
     state.batchPreview = null;
+    state.batchSelectedIds = [];
     render();
   });
+  const updateBatchSelection = () => {
+    const selected = Array.from(document.querySelectorAll("[data-batch-select]:checked")).map((node) => Number(node.value));
+    state.batchSelectedIds = selected;
+    const count = document.getElementById("batchSelectedCount");
+    if (count) count.textContent = String(selected.length);
+    const submit = document.getElementById("createShippingBatch");
+    if (submit) {
+      submit.textContent = `确认提交 ${selected.length} 单`;
+      submit.disabled = !selected.length || submit.dataset.ready !== "1";
+    }
+  };
+  document.querySelectorAll("[data-batch-select]").forEach((node) => node.addEventListener("change", updateBatchSelection));
+  document.getElementById("selectAllBatchOrders")?.addEventListener("click", () => {
+    document.querySelectorAll("[data-batch-select]").forEach((node) => { node.checked = true; });
+    updateBatchSelection();
+  });
+  document.getElementById("clearBatchOrders")?.addEventListener("click", () => {
+    document.querySelectorAll("[data-batch-select]").forEach((node) => { node.checked = false; });
+    updateBatchSelection();
+  });
+  document.getElementById("applyBatchFilters")?.addEventListener("click", async () => {
+    state.batchFilters = {
+      store_id: document.getElementById("batchFilterStore").value,
+      status: "待处理",
+      date_from: document.getElementById("batchFilterFrom").value,
+      date_to: document.getElementById("batchFilterTo").value,
+      q: document.getElementById("batchFilterQ").value.trim(),
+    };
+    try {
+      await loadShippingBatchPreview(state.batchFilters);
+      render();
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+  document.getElementById("resetBatchFilters")?.addEventListener("click", async () => {
+    state.batchFilters = { store_id: "", status: "待处理", date_from: "", date_to: "", q: "" };
+    try {
+      await loadShippingBatchPreview(state.batchFilters);
+      render();
+    } catch (error) {
+      toast(error.message);
+    }
+  });
   document.getElementById("batchBulkCompany")?.addEventListener("change", (event) => {
-    document.querySelectorAll("[data-batch-company]").forEach((select) => {
-      select.value = event.currentTarget.value;
+    document.querySelectorAll("[data-batch-shipment]").forEach((row) => {
+      if (row.querySelector("[data-batch-select]")?.checked) row.querySelector("[data-batch-company]").value = event.currentTarget.value;
     });
   });
   document.getElementById("createShippingBatch")?.addEventListener("click", async () => {
-    const shipments = Array.from(document.querySelectorAll("[data-batch-shipment]")).map((row) => ({
-      id: Number(row.dataset.batchShipment),
-      express_company: row.querySelector("[data-batch-company]").value,
-    }));
+    const shipments = Array.from(document.querySelectorAll("[data-batch-shipment]"))
+      .filter((row) => row.querySelector("[data-batch-select]")?.checked)
+      .map((row) => ({
+        id: Number(row.dataset.batchShipment),
+        express_company: row.querySelector("[data-batch-company]").value,
+      }));
+    if (!shipments.length) {
+      toast("请至少选择一个需要打单的订单。");
+      return;
+    }
     if (!confirm(`确认向快递100提交 ${shipments.length} 张电子面单？成功后将立即取得快递单号。`)) return;
     try {
       const data = await api("/api/admin/shipping-batches", {
         method: "POST",
         body: JSON.stringify({
-          filters: state.adminFilters,
+          filters: state.batchFilters,
           shipments,
         }),
       });
@@ -2131,10 +2221,11 @@ async function renderShippingSettings() {
         <div class="section-title"><h2>菜鸟电子面单授权</h2></div>
         <ul class="summary-list">
           <li><span>功能开关</span><span class="status ${config.enabled ? "shipped" : "pending"}">${config.enabled ? "已开启" : "未开启"}</span></li>
-          <li><span>鉴权配置</span><span class="status ${config.configured ? "shipped" : "exception"}">${config.configured ? "完整" : "缺少配置"}</span></li>
+          <li><span>企业 KEY</span><span class="status ${config.key_configured ? "shipped" : "exception"}">${config.key_configured ? "已配置" : "未配置"}</span></li>
+          <li><span>LABEL SECRET</span><span class="status ${config.secret_configured ? "shipped" : "exception"}">${config.secret_configured ? "已配置" : "未配置"}</span></li>
+          <li><span>公网回调地址</span><span class="status ${config.public_base_url_configured ? "shipped" : "exception"}">${config.public_base_url_configured ? "已配置" : "未配置"}</span></li>
           <li><span>菜鸟账号</span><span class="status ${settings.partner_authorized ? "signed" : "pending"}">${settings.partner_authorized ? "已授权" : "未授权"}</span></li>
-          <li><span>KEY</span><strong>${escapeHtml(config.key || "未设置")}</strong></li>
-          <li><span>LABEL SECRET</span><strong>${escapeHtml(config.secret || "未设置")}</strong></li>
+          ${config.missing?.length ? `<li><span>Render 缺少</span><strong>${config.missing.map(escapeHtml).join("、")}</strong></li>` : ""}
           ${settings.partner_authorized ? `<li><span>partnerId</span><strong>${escapeHtml(settings.partner_id_masked || "已保存")}</strong></li>` : ""}
         </ul>
         <div class="inline-actions">

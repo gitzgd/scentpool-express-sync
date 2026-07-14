@@ -1005,7 +1005,20 @@ tr:last-child td {
 }
 
 .label-batch-controls {
-  grid-template-columns: minmax(190px, 280px) auto;
+  grid-template-columns: minmax(190px, 280px) minmax(220px, auto) auto;
+}
+
+.batch-filter-grid {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) 150px 150px minmax(220px, 1.4fr) auto auto;
+  gap: 10px;
+  align-items: end;
+  margin: 16px 0 4px;
+}
+
+.batch-selection-actions {
+  align-self: end;
+  min-height: 42px;
 }
 
 .shipping-settings-grid {
@@ -1055,11 +1068,18 @@ tr:last-child td {
 
 .batch-order-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 150px;
+  grid-template-columns: 24px minmax(0, 1fr) 150px;
   gap: 14px;
   align-items: center;
   padding: 12px 0;
   border-bottom: 1px solid #ededf2;
+}
+
+.batch-order-checkbox {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--accent);
 }
 
 .batch-errors {
@@ -1144,6 +1164,7 @@ tr:last-child td {
   }
 
   .batch-controls,
+  .batch-filter-grid,
   .batch-order-row,
   .carrier-setting-row {
     grid-template-columns: 1fr;

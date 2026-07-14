@@ -106,6 +106,14 @@ def main() -> None:
         os.environ["SCENTPOOL_KUAIDI100_LABEL_SECRET"] = " test-label-secret "
         os.environ["SCENTPOOL_KUAIDI100_LABEL_ENABLED"] = "1"
         os.environ["SCENTPOOL_PUBLIC_BASE_URL"] = "https://example.test"
+        label_config = shipping.label_config_public()
+        assert label_config["ready"] is True
+        assert label_config["missing"] == []
+        del os.environ["SCENTPOOL_KUAIDI100_LABEL_SECRET"]
+        label_config = shipping.label_config_public()
+        assert label_config["configured"] is False
+        assert label_config["missing"] == ["SCENTPOOL_KUAIDI100_LABEL_SECRET"]
+        os.environ["SCENTPOOL_KUAIDI100_LABEL_SECRET"] = " test-label-secret "
         assert tracking.KUAIDI100_ENDPOINT == "https://poll.kuaidi100.com/poll/query.do"
         original_urlopen = tracking.urllib.request.urlopen
         captured = {}

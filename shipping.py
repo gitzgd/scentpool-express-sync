@@ -277,13 +277,26 @@ def parse_auth_callback(param_raw: str) -> Dict[str, Any]:
 
 def label_config_public() -> Dict[str, Any]:
     client = Kuaidi100LabelClient.from_env()
+    base_url = public_url("")
+    missing = []
+    if not client.key:
+        missing.append("SCENTPOOL_KUAIDI100_KEY")
+    if not client.secret:
+        missing.append("SCENTPOOL_KUAIDI100_LABEL_SECRET")
+    if not base_url:
+        missing.append("SCENTPOOL_PUBLIC_BASE_URL")
     return {
         "enabled": label_enabled(),
-        "configured": client.is_configured(),
+        "configured": not missing,
+        "ready": label_enabled() and not missing,
+        "missing": missing,
+        "key_configured": bool(client.key),
+        "secret_configured": bool(client.secret),
+        "public_base_url_configured": bool(base_url),
         "endpoint": client.endpoint,
         "key": mask_secret(client.key),
         "secret": mask_secret(client.secret),
-        "public_base_url": public_url(""),
+        "public_base_url": base_url,
         "supports": {"cainiao_pdf": True, "kuaidi100_cloud": True, "reprint": True},
     }
 

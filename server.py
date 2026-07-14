@@ -708,8 +708,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/admin/shipping-batches" and self.command == "POST":
             self.require_admin(user)
             shipping_config = label_config_public()
-            if not shipping_config.get("enabled") or not shipping_config.get("configured"):
-                raise AppError("快递100下单尚未启用或配置不完整，请先检查发货设置和 Render 环境变量。", 503)
+            if not shipping_config.get("enabled"):
+                raise AppError("电子面单服务未开启，请在 Render 设置 SCENTPOOL_KUAIDI100_LABEL_ENABLED=1。", 503)
+            if not shipping_config.get("configured"):
+                missing = "、".join(shipping_config.get("missing") or [])
+                raise AppError(f"电子面单配置不完整，Render 缺少：{missing or '必要环境变量'}。", 503)
             settings = DB.get_shipping_settings()
             if not settings.get("sender_name") or not settings.get("sender_mobile") or not settings.get("sender_address"):
                 raise AppError("请先完成总部发货设置。", 409)
