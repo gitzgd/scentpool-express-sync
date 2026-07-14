@@ -59,7 +59,7 @@ function statusClass(status) {
 function trackingClass(status) {
   if (status === "已签收") return "signed";
   if (status === "查询失败" || status === "问题件" || status === "退签" || status === "退回" || status === "拒签") return "exception";
-  if (status === "待查询" || status === "无轨迹") return "pending";
+  if (status === "待查询" || status === "等待揽收" || status === "无轨迹") return "pending";
   if (status === "已揽收" || status === "运输中" || status === "转寄" || status === "转投" || status === "派件中" || status === "清关") return "shipped";
   return "";
 }
@@ -2013,10 +2013,12 @@ function bindAdmin() {
     try {
       const data = await api("/api/admin/tracking/sync", {
         method: "POST",
-        body: JSON.stringify({ limit: 50 }),
+        body: JSON.stringify({ force: true, limit: 0 }),
       });
       const result = data.result || {};
-      toast(`已同步 ${result.checked || 0} 单，签收 ${result.signed || 0} 单。`);
+      const skipped = result.skipped_recent || 0;
+      const failed = result.errors || 0;
+      toast(`已同步 ${result.checked || 0} 单，签收 ${result.signed || 0} 单${failed ? `，失败 ${failed} 单` : ""}${skipped ? `；另有 ${skipped} 单在 30 分钟保护期内` : ""}。`);
       render();
     } catch (error) {
       toast(error.message);

@@ -32,6 +32,7 @@ python3 server.py --host 0.0.0.0 --port 8765
 - `SCENTPOOL_TRACKING_AUTO=1`：开启自动物流查询。
 - `SCENTPOOL_TRACKING_INTERVAL_MINUTES=360`：发货单自动查询间隔，默认 6 小时。
 - `SCENTPOOL_RETURN_TRACKING_INTERVAL_MINUTES=720`：退货单自动查询间隔，默认 12 小时。
+- 总部“同步物流”会刷新全部超过 30 分钟未查询的已发货、未签收订单；30 分钟内已查询的订单会按快递100要求跳过。
 - `SCENTPOOL_KUAIDI100_ENDPOINT=https://poll.kuaidi100.com/poll/query.do`：快递100实时查询接口地址。
 - `SCENTPOOL_KUAIDI100_CUSTOMER`：快递100 customer，只放 Render 环境变量。
 - `SCENTPOOL_KUAIDI100_KEY`：快递100 key，只放 Render 环境变量。

@@ -575,6 +575,18 @@ class Database:
             """,
             (DEFAULT_EXPRESS_COMPANY, now),
         )
+        conn.execute(
+            """
+            UPDATE shipments
+            SET tracking_status = '等待揽收', tracking_error = ''
+            WHERE tracking_status = '查询失败'
+              AND (
+                tracking_error LIKE '%查询无结果%' OR tracking_error LIKE '%暂无轨迹%'
+                OR tracking_error LIKE '%暂无物流%' OR tracking_error LIKE '%未查询到物流%'
+                OR tracking_error LIKE '%没有物流信息%'
+              )
+            """
+        )
 
     def _ensure_shipping_batch_columns(self, conn: sqlite3.Connection) -> None:
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(shipping_batch_items)").fetchall()}
@@ -1541,7 +1553,7 @@ class Database:
                 """
                 UPDATE shipments
                 SET status = ?, tracking_no = CASE WHEN ? <> '' THEN ? ELSE tracking_no END,
-                    tracking_status = CASE WHEN ? <> '' THEN '待查询' ELSE tracking_status END,
+                    tracking_status = CASE WHEN ? <> '' THEN '等待揽收' ELSE tracking_status END,
                     tracking_provider = CASE WHEN ? <> '' THEN 'kuaidi100' ELSE tracking_provider END,
                     shipped_at = ?, booking_status = ?, booking_task_id = ?, booking_order_id = ?,
                     booking_poll_token = '', booking_error = ?, booking_raw = ?, booking_updated_at = ?,
@@ -1778,11 +1790,29 @@ class Database:
                 shipments.tracking_last_checked_at,
                 shipments.shipped_at,
                 shipments.id
-            LIMIT ?
         """
-        params.append(max(1, min(int(limit or 20), 100)))
+        if int(limit or 0) > 0:
+            sql += " LIMIT ?"
+            params.append(max(1, min(int(limit), 5000)))
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    def tracking_candidate_count(self, stale_before: str = "") -> int:
+        where = [
+            "shipments.status = '已发货'",
+            "shipments.tracking_no <> ''",
+            "shipments.tracking_signed_at = ''",
+        ]
+        params: List[Any] = []
+        if stale_before:
+            where.append("(shipments.tracking_last_checked_at = '' OR shipments.tracking_last_checked_at <= ?)")
+            params.append(stale_before)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM shipments WHERE {' AND '.join(where)}",
+                params,
+            ).fetchone()
+        return int(row["count"] or 0)
 
     def apply_tracking_result(self, shipment_id: int, result: Dict[str, Any]) -> Dict[str, Any]:
         checked_at = str(result.get("checked_at") or now_text())

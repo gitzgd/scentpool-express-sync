@@ -392,7 +392,10 @@ def require_manual_tracking_allowed(row: Dict[str, Any]) -> None:
 
 
 def sync_tracking_batch(*, force: bool = False, limit: int = 20) -> Dict[str, Any]:
-    candidates = DB.tracking_candidates(stale_before="" if force else tracking_stale_before(), limit=limit)
+    stale_before = manual_refresh_stale_before() if force else tracking_stale_before()
+    total = DB.tracking_candidate_count()
+    eligible = DB.tracking_candidate_count(stale_before=stale_before)
+    candidates = DB.tracking_candidates(stale_before=stale_before, limit=limit)
     results = []
     signed = 0
     errors = 0
@@ -401,7 +404,14 @@ def sync_tracking_batch(*, force: bool = False, limit: int = 20) -> Dict[str, An
         signed += 1 if result.get("status") == "已签收" else 0
         errors += 1 if result.get("tracking_status") == "查询失败" else 0
         results.append(result)
-    return {"checked": len(results), "signed": signed, "errors": errors, "results": results}
+    return {
+        "checked": len(results),
+        "signed": signed,
+        "errors": errors,
+        "skipped_recent": max(0, total - eligible),
+        "remaining": max(0, eligible - len(results)),
+        "results": results,
+    }
 
 
 def sync_return_tracking_batch(*, force: bool = False, limit: int = 20) -> Dict[str, Any]:
@@ -743,7 +753,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/admin/tracking/sync" and self.command == "POST":
             self.require_admin(user)
             body = self.read_json()
-            result = sync_tracking_batch(force=bool(body.get("force")), limit=int(body.get("limit") or 20))
+            result = sync_tracking_batch(force=bool(body.get("force")), limit=int(body.get("limit") or 0))
             self.send_json({"result": result})
             return
 

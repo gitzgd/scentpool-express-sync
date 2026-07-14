@@ -155,6 +155,19 @@ def main() -> None:
         assert params["sign"][0] == expected_sign
         assert request_data == {"com": "yuantong", "num": "YT123456", "resultv2": "1", "show": "0", "order": "desc"}
 
+        pending = tracking.normalize_kuaidi100_response(
+            {"status": "500", "message": "查询无结果，请隔段时间再查", "state": "0", "data": []},
+            '{"status":"500"}',
+        )
+        assert pending["tracking_status"] == "等待揽收"
+        assert pending["error"] == ""
+        assert pending["is_signed"] is False
+        pending = tracking.normalize_kuaidi100_response(
+            {"status": "200", "message": "ok", "state": "0", "data": []},
+            '{"status":"200"}',
+        )
+        assert pending["tracking_status"] == "等待揽收"
+
         shipping_captured = {}
 
         class FakeLabelResponse:
@@ -523,8 +536,8 @@ def main() -> None:
 
         def fake_batch_tracking(_shipment):
             return {
-                "provider": "kuaidi100", "tracking_status": "已揽收", "state_code": "1",
-                "last_event": "已揽收", "checked_at": "2026-07-10T12:05:00+08:00", "signed_at": "",
+                "provider": "kuaidi100", "tracking_status": "等待揽收", "state_code": "0",
+                "last_event": "", "checked_at": "2026-07-10T12:05:00+08:00", "signed_at": "",
                 "error": "", "raw": "{}", "is_signed": False,
             }
 
@@ -540,6 +553,9 @@ def main() -> None:
         assert status == 200, body
         assert body["counts"]["成功"] == 1
         assert body["items"][0]["booking_status"] == "已出单"
+        status, body = request(admin, base, "GET", "/api/shipments?q=ORDER-SMOKE-001")
+        assert status == 200, body
+        assert body["shipments"][0]["tracking_status"] == "等待揽收"
 
         callback_param = json.dumps(
             {"status": "200", "message": "打印成功"},
@@ -669,6 +685,7 @@ def main() -> None:
         status, body = request(admin, base, "POST", "/api/admin/tracking/sync", {"force": True, "limit": 5})
         assert status == 200, body
         assert body["result"]["signed"] == 1
+        assert body["result"]["remaining"] == 0
         status, body = request(admin, base, "GET", "/api/shipments?q=ORDER-SMOKE-001")
         assert status == 200, body
         assert body["shipments"][0]["status"] == "已签收"

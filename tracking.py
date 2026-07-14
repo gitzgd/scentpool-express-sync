@@ -15,6 +15,7 @@ from database import AppError, now_text
 KUAIDI100_ENDPOINT = "https://poll.kuaidi100.com/poll/query.do"
 SIGNED_STATE = "3"
 PROBLEM_STATE = "2"
+PENDING_TRACE_MESSAGES = ("查询无结果", "暂无轨迹", "暂无物流", "未查询到物流", "没有物流信息")
 EXPRESS_COMPANY_CODES = {
     "圆通": "yuantong",
     "顺丰": "shunfeng",
@@ -145,7 +146,12 @@ def normalize_kuaidi100_response(data: Dict[str, Any], raw: str) -> Dict[str, An
 
     if status != "200":
         message = str(data.get("message") or data.get("result") or data.get("returnCode") or "快递100查询失败。")
+        if status == "500" and any(text in message for text in PENDING_TRACE_MESSAGES):
+            return tracking_pending_result(raw=raw, state=state)
         return tracking_error_result(message, provider="kuaidi100", raw=raw, state=state, last_event=last_event)
+
+    if not traces and state in {"", "0"}:
+        return tracking_pending_result(raw=raw, state=state)
 
     return {
         "provider": "kuaidi100",
@@ -157,6 +163,20 @@ def normalize_kuaidi100_response(data: Dict[str, Any], raw: str) -> Dict[str, An
         "error": "",
         "raw": raw[:5000],
         "is_signed": is_signed,
+    }
+
+
+def tracking_pending_result(*, raw: str = "", state: str = "") -> Dict[str, Any]:
+    return {
+        "provider": "kuaidi100",
+        "tracking_status": "等待揽收",
+        "state_code": state,
+        "last_event": "",
+        "checked_at": now_text(),
+        "signed_at": "",
+        "error": "",
+        "raw": raw[:5000],
+        "is_signed": False,
     }
 
 
