@@ -2174,6 +2174,9 @@ async function renderShippingSettings() {
   const config = state.shippingConfig || {};
   const carrierSettings = settings.carrier_settings || {};
   const branchOptions = settings.branch_options || [];
+  const defaultTemplateUrls = {
+    "圆通": "https://cloudprint.cainiao.com/template/standard/850338",
+  };
   const branchSelect = (company) => {
     const current = carrierSettings[company]?.tbNet || "";
     const options = branchOptions.filter((item) => item.company === company);
@@ -2245,17 +2248,17 @@ async function renderShippingSettings() {
             <strong>${company}</strong>
             ${branchSelect(company)}
             <input class="input" data-carrier-exp="${company}" value="${escapeHtml(carrierSettings[company]?.expType || (company === "顺丰" ? "顺丰标快" : "标准快递"))}" aria-label="${company}产品类型" />
+            <input class="input" data-carrier-template="${company}" value="${escapeHtml(carrierSettings[company]?.thirdTemplateURL || defaultTemplateUrls[company] || "")}" placeholder="菜鸟一联单模板 URL" aria-label="${company}菜鸟一联单模板 URL" />
           </div>
         `).join("")}
       </div>
     </section>
     <section class="panel panel-pad label-print-settings">
-      <div class="section-title"><div><h2>面单打印</h2><div class="muted mini">菜鸟授权默认返回 PDF；快递100云打印需要云打印设备码。</div></div></div>
+      <div class="section-title"><div><h2>面单打印</h2><div class="muted mini">圆通已配置菜鸟一联单模板；菜鸟授权返回 PDF，快递100云打印需要云打印设备码。</div></div></div>
       <div class="form-grid">
         <div class="field"><label for="printMode">打印方式</label><select class="select" id="printMode" name="print_mode"><option value="PDF" ${settings.print_mode !== "CLOUD" ? "selected" : ""}>菜鸟 PDF 面单</option><option value="CLOUD" ${settings.print_mode === "CLOUD" ? "selected" : ""}>快递100云打印</option></select></div>
         <div class="field"><label for="printerSiid">云打印设备码 siid</label><input class="input" id="printerSiid" name="printer_siid" value="${escapeHtml(settings.printer_siid || "")}" /></div>
-        <div class="field"><label for="templateId">网点面单模板 tempId</label><input class="input" id="templateId" name="template_id" value="${escapeHtml(settings.template_id || "")}" /></div>
-        <div class="field"><label>纸张尺寸（毫米）</label><div class="tracking-input-row"><input class="input" name="paper_width" value="${escapeHtml(settings.paper_width || "100")}" aria-label="纸张宽度" /><input class="input" name="paper_height" value="${escapeHtml(settings.paper_height || "180")}" aria-label="纸张高度" /></div></div>
+        <div class="field"><label>云打印纸张尺寸（毫米）</label><div class="tracking-input-row"><input class="input" name="paper_width" value="${escapeHtml(settings.paper_width || "100")}" aria-label="纸张宽度" /><input class="input" name="paper_height" value="${escapeHtml(settings.paper_height || "180")}" aria-label="纸张高度" /></div></div>
         <label class="check-row"><input type="checkbox" name="need_desensitization" ${settings.need_desensitization ? "checked" : ""} /> 电话号码脱敏</label>
         <label class="check-row"><input type="checkbox" name="need_logo" ${settings.need_logo ? "checked" : ""} /> 面单显示 Logo</label>
       </div>
@@ -2273,6 +2276,7 @@ async function renderShippingSettings() {
       carrier_settings[company] = {
         tbNet: document.querySelector(`[data-carrier-branch="${company}"]`)?.value || "",
         expType: document.querySelector(`[data-carrier-exp="${company}"]`)?.value.trim() || (company === "顺丰" ? "顺丰标快" : "标准快递"),
+        thirdTemplateURL: document.querySelector(`[data-carrier-template="${company}"]`)?.value.trim() || "",
       };
     });
     try {

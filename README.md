@@ -42,6 +42,7 @@ python3 server.py --host 0.0.0.0 --port 8765
 - `SCENTPOOL_KUAIDI100_THIRD_INFO_ENDPOINT=https://poll.kuaidi100.com/eorderapi.do`：授权网点与面单余额接口。
 - `SCENTPOOL_KUAIDI100_LABEL_SECRET`：企业电子面单 secret，只放 Render 环境变量。
 - `SCENTPOOL_PUBLIC_BASE_URL`：网站公网根地址，用于生成菜鸟授权和打印状态回调地址。
+- 菜鸟授权面单使用每家快递公司自己的 `thirdTemplateURL`。圆通当前配置为一联单模板 `https://cloudprint.cainiao.com/template/standard/850338`；京东和顺丰暂不配置模板。
 
 ## 发布到 Render
 

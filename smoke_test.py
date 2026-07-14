@@ -226,6 +226,7 @@ def main() -> None:
                     "partnerKey": "CAINIAO-KEY",
                     "net": "cainiao",
                     "tbNet": "测试网点,001",
+                    "third_template_url": "https://cloudprint.cainiao.com/template/standard/850338",
                     "pay_type": "MONTHLY",
                     "print_mode": "PDF",
                 },
@@ -243,6 +244,8 @@ def main() -> None:
         assert order_form["sign"][0] == expected_order_sign
         assert json.loads(order_param)["orderId"] == "SP20260710S01N1"
         assert json.loads(order_param)["reorder"] is False
+        assert json.loads(order_param)["thirdTemplateURL"] == "https://cloudprint.cainiao.com/template/standard/850338"
+        assert "tempId" not in json.loads(order_param)
         auth_credentials = shipping.parse_auth_callback(
             json.dumps(
                 {
@@ -385,6 +388,11 @@ def main() -> None:
         assert body["settings"]["partner_authorized"] is True
         assert "partner_key" not in body["settings"]
         assert body["settings"]["partner_key_masked"]
+        assert body["settings"]["carrier_settings"]["圆通"]["thirdTemplateURL"] == (
+            "https://cloudprint.cainiao.com/template/standard/850338"
+        )
+        assert body["settings"]["carrier_settings"]["京东"]["thirdTemplateURL"] == ""
+        assert body["settings"]["carrier_settings"]["顺丰"]["thirdTemplateURL"] == ""
 
         status, body = request(admin, base, "GET", "/api/products?all=1")
         assert status == 200, body
@@ -509,6 +517,9 @@ def main() -> None:
         )
         assert status == 200, body
         assert body["settings"]["sender_name"] == "总部"
+        assert body["settings"]["carrier_settings"]["圆通"]["thirdTemplateURL"] == (
+            "https://cloudprint.cainiao.com/template/standard/850338"
+        )
 
         status, body = request(
             admin,

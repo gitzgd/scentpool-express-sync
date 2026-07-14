@@ -146,7 +146,9 @@ class Kuaidi100LabelClient:
         }
         if settings.get("printer_siid"):
             param["siid"] = str(settings["printer_siid"])
-        if settings.get("template_id") and account_net not in THIRD_PARTY_NETS:
+        if settings.get("third_template_url") and account_net in THIRD_PARTY_NETS:
+            param["thirdTemplateURL"] = str(settings["third_template_url"])
+        elif settings.get("template_id") and account_net not in THIRD_PARTY_NETS:
             param["tempId"] = str(settings["template_id"])
         if api_print_type == "CLOUD":
             param["width"] = str(settings.get("paper_width") or "100")

@@ -19,6 +19,9 @@ STATUSES = ("待处理", "已发货", "已签收", "异常", "已取消")
 RETURN_STATUSES = ("待查询", "运输中", "已签收", "异常", "已取消")
 EXPRESS_COMPANIES = ("圆通", "京东", "顺丰")
 DEFAULT_EXPRESS_COMPANY = "圆通"
+DEFAULT_CAINIAO_TEMPLATE_URLS = {
+    "圆通": "https://cloudprint.cainiao.com/template/standard/850338",
+}
 DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "scentpool2026"
 DEFAULT_STORE_USERNAME = "store01"
@@ -1182,6 +1185,14 @@ class Database:
             settings["carrier_settings"] = json.loads(settings.get("carrier_settings_json") or "{}")
         except json.JSONDecodeError:
             settings["carrier_settings"] = {}
+        if not isinstance(settings["carrier_settings"], dict):
+            settings["carrier_settings"] = {}
+        for company in EXPRESS_COMPANIES:
+            carrier = settings["carrier_settings"].get(company)
+            if not isinstance(carrier, dict):
+                carrier = {}
+                settings["carrier_settings"][company] = carrier
+            carrier.setdefault("thirdTemplateURL", DEFAULT_CAINIAO_TEMPLATE_URLS.get(company, ""))
         try:
             settings["branch_options"] = json.loads(settings.get("branch_options_json") or "[]")
         except json.JSONDecodeError:
@@ -1238,9 +1249,15 @@ class Database:
         normalized_carriers: Dict[str, Dict[str, str]] = {}
         for company in EXPRESS_COMPANIES:
             value = carrier_settings.get(company) if isinstance(carrier_settings.get(company), dict) else {}
+            template_url = str(
+                value.get("thirdTemplateURL") or DEFAULT_CAINIAO_TEMPLATE_URLS.get(company, "")
+            ).strip()
+            if template_url and not template_url.startswith("https://cloudprint.cainiao.com/template/"):
+                raise AppError(f"{company}的菜鸟面单模板 URL 无效。")
             normalized_carriers[company] = {
                 "tbNet": str(value.get("tbNet") or "").strip(),
                 "expType": str(value.get("expType") or ("顺丰标快" if company == "顺丰" else "标准快递")).strip(),
+                "thirdTemplateURL": template_url,
             }
         now = now_text()
         with self.connect() as conn:
@@ -1293,6 +1310,7 @@ class Database:
                 "checkMan": settings.get("partner_check_man", ""),
                 "tbNet": carrier.get("tbNet", ""),
                 "exp_type": carrier.get("expType", "顺丰标快" if company == "顺丰" else "标准快递"),
+                "third_template_url": carrier.get("thirdTemplateURL", ""),
             }
         )
         return settings

@@ -1037,7 +1037,7 @@ tr:last-child td {
 
 .carrier-setting-row {
   display: grid;
-  grid-template-columns: 80px minmax(260px, 1.4fr) minmax(180px, 0.8fr);
+  grid-template-columns: 80px minmax(220px, 1fr) minmax(160px, 0.65fr) minmax(320px, 1.35fr);
   gap: 12px;
   align-items: center;
   padding: 10px 0;
