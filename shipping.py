@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -17,6 +18,9 @@ KUAIDI100_LABEL_ENDPOINT = "https://api.kuaidi100.com/label/order"
 KUAIDI100_AUTH_ENDPOINT = "https://poll.kuaidi100.com/printapi/authThird.do"
 KUAIDI100_THIRD_INFO_ENDPOINT = "https://poll.kuaidi100.com/eorderapi.do"
 THIRD_PARTY_NETS = {"taobao", "cainiao", "jdalpha", "pinduoduoWx", "douyin", "kuaishou", "weipinhui", "xiaohongshu"}
+LABEL_CARGO_MAX_CHARS = 50
+LABEL_REMARK_MAX_CHARS = 100
+LABEL_ITEM_KEYWORD_MAX_CHARS = 8
 
 
 def env_flag(name: str) -> bool:
@@ -38,6 +42,98 @@ def print_callback_url() -> str:
 
 def auth_callback_url(state: str) -> str:
     return public_url(f"/api/integrations/kuaidi100/label-auth-callback?state={urllib.parse.quote(state)}")
+
+
+def compact_label_text(value: Any, max_chars: int) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 1:
+        return text[:max_chars]
+    return f"{text[:max_chars - 1]}…"
+
+
+def clean_label_product_name(value: Any, category: Any) -> str:
+    name = " ".join(str(value or "").split()).strip()
+    category_text = " ".join(str(category or "商品").split()).strip() or "商品"
+    while True:
+        match = re.match(r"^[（(]\s*([^）)]+)\s*[）)]\s*", name)
+        if not match:
+            break
+        prefix = match.group(1).strip()
+        if prefix in category_text or category_text in prefix:
+            name = name[match.end():].strip()
+            continue
+        break
+    line_incense = re.fullmatch(r"(?:灵气)?线香[（(](.+)[）)]", name)
+    if category_text == "线香" and line_incense:
+        name = line_incense.group(1).strip()
+    return name or category_text
+
+
+def abbreviate_label_product_name(name: str, category: str, max_chars: int = LABEL_ITEM_KEYWORD_MAX_CHARS) -> str:
+    keyword = re.split(r"\s*(?:与|和|及|&|＋|\+|/|、)\s*", name, maxsplit=1)[0].strip()
+    suffixes = [category, "睡眠喷雾", "喷雾", "香氛蜡烛", "蜡烛", "手串", "项链", "香包", "线香", "系列"]
+    for suffix in suffixes:
+        if suffix and keyword.endswith(suffix) and len(keyword) > len(suffix):
+            keyword = keyword[:-len(suffix)].strip()
+            break
+    return (keyword or name)[:max_chars]
+
+
+def format_grouped_label_items(products: list[tuple[str, str, int]], keyword_chars: int | None = None) -> str:
+    grouped: Dict[str, list[str]] = {}
+    for category, name, quantity in products:
+        display_name = name if keyword_chars is None else abbreviate_label_product_name(name, category, keyword_chars)
+        grouped.setdefault(category, []).append(f"{display_name}*{quantity}")
+    return "\n".join(f"【{category}】{'、'.join(entries)}" for category, entries in grouped.items())
+
+
+def build_label_item_summary(items: Any, max_chars: int) -> str:
+    if not isinstance(items, list) or max_chars <= 0:
+        return ""
+    products = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            quantity = max(1, int(item.get("quantity") or 1))
+        except (TypeError, ValueError):
+            quantity = 1
+        category = compact_label_text(item.get("product_category") or "商品", 12)
+        name = clean_label_product_name(
+            item.get("product_name") or item.get("product_barcode") or category,
+            category,
+        )
+        products.append((category, name, quantity))
+    if not products:
+        return ""
+
+    full_summary = format_grouped_label_items(products)
+    if len(full_summary) <= max_chars:
+        return full_summary
+
+    shortest_summary = full_summary
+    for keyword_chars in range(LABEL_ITEM_KEYWORD_MAX_CHARS, 0, -1):
+        shortest_summary = format_grouped_label_items(products, keyword_chars)
+        if len(shortest_summary) <= max_chars:
+            return shortest_summary
+    return shortest_summary
+
+
+def build_label_remark(shipment: Dict[str, Any]) -> str:
+    manual_remark = compact_label_text(shipment.get("remark"), LABEL_REMARK_MAX_CHARS)
+    item_budget = 80 if manual_remark else LABEL_REMARK_MAX_CHARS
+    item_summary = build_label_item_summary(shipment.get("items"), item_budget)
+    if not item_summary:
+        return manual_remark
+    if not manual_remark:
+        return item_summary
+    prefix = f"{item_summary}；备注："
+    remaining = LABEL_REMARK_MAX_CHARS - len(prefix)
+    if remaining <= 0:
+        return compact_label_text(item_summary, LABEL_REMARK_MAX_CHARS)
+    return f"{prefix}{compact_label_text(manual_remark, remaining)}"
 
 
 class Kuaidi100LabelClient:
@@ -116,6 +212,7 @@ class Kuaidi100LabelClient:
         print_mode = str(settings.get("print_mode") or "PDF")
         account_net = str(settings.get("net") or "")
         api_print_type = "CLOUD" if print_mode == "CLOUD" and account_net not in THIRD_PARTY_NETS else "IMAGE"
+        item_cargo = build_label_item_summary(shipment.get("items"), LABEL_CARGO_MAX_CHARS)
         param: Dict[str, Any] = {
             **self._account_param(settings),
             "printType": api_print_type,
@@ -131,11 +228,11 @@ class Kuaidi100LabelClient:
                 "printAddr": str(settings.get("sender_address") or ""),
                 "company": str(settings.get("sender_company") or ""),
             },
-            "cargo": str(settings.get("cargo_name") or "香氛商品"),
+            "cargo": item_cargo or str(settings.get("cargo_name") or "香氛商品"),
             "count": 1,
             "payType": str(settings.get("pay_type") or "MONTHLY"),
             "expType": str(settings.get("exp_type") or "标准快递"),
-            "remark": str(shipment.get("remark") or "")[:100],
+            "remark": build_label_remark(shipment),
             "orderId": str(shipment.get("booking_request_id") or shipment.get("business_id") or "")[:32],
             "reorder": False,
             "callBackUrl": print_callback_url(),

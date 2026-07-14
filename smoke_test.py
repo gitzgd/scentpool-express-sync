@@ -216,6 +216,10 @@ def main() -> None:
                     "booking_salt": "salt-smoke",
                     "booking_request_id": "SP20260710S01N1",
                     "remark": "烟测",
+                    "items": [
+                        {"product_category": "睡眠喷雾", "product_name": "（喷雾）基诺山雨林与苔藓", "quantity": 2},
+                        {"product_category": "香包", "product_name": "（香包）曼听墨玫瑰", "quantity": 1},
+                    ],
                 },
                 {
                     "sender_name": "总部",
@@ -244,8 +248,26 @@ def main() -> None:
         assert order_form["sign"][0] == expected_order_sign
         assert json.loads(order_param)["orderId"] == "SP20260710S01N1"
         assert json.loads(order_param)["reorder"] is False
+        assert json.loads(order_param)["cargo"] == "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1"
+        assert json.loads(order_param)["remark"] == "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1；备注：烟测"
         assert json.loads(order_param)["thirdTemplateURL"] == "https://cloudprint.cainiao.com/template/standard/850338"
         assert "tempId" not in json.loads(order_param)
+        long_summary = shipping.build_label_item_summary(
+            [
+                {"product_category": "睡眠喷雾", "product_name": "（喷雾）基诺山雨林与苔藓", "quantity": 2},
+                {"product_category": "睡眠喷雾", "product_name": "（喷雾）打洛边境青柠与罗勒", "quantity": 3},
+                {"product_category": "香包", "product_name": "（香包）橘河红柚佛手柑", "quantity": 4},
+                {"product_category": "香包", "product_name": "（香包）基诺山雨林与苔藓", "quantity": 5},
+            ],
+            50,
+        )
+        assert len(long_summary) <= 50
+        assert "【睡眠喷雾】基诺山雨林*2" in long_summary
+        assert "打洛边境青柠*3" in long_summary
+        assert "【香包】橘河红柚佛手柑*4" in long_summary
+        assert "基诺山雨林*5" in long_summary
+        assert "\n【香包】" in long_summary
+        assert "另" not in long_summary
         auth_credentials = shipping.parse_auth_callback(
             json.dumps(
                 {
