@@ -355,6 +355,21 @@ def refresh_tracking_for_shipment(shipment: Dict[str, Any]) -> Dict[str, Any]:
             "raw": "",
             "is_signed": False,
         }
+    if (
+        result.get("tracking_status") == "查询失败"
+        and shipment.get("booking_status") == "已出单"
+        and shipment.get("booking_task_id")
+        and not shipment.get("tracking_last_event")
+        and not result.get("last_event")
+    ):
+        result = {
+            **result,
+            "tracking_status": "等待揽收",
+            "state_code": "",
+            "last_event": "",
+            "error": "",
+            "is_signed": False,
+        }
     return DB.apply_tracking_result(int(shipment["id"]), result)
 
 

@@ -231,6 +231,7 @@ def main() -> None:
                     "net": "cainiao",
                     "tbNet": "测试网点,001",
                     "third_template_url": "https://cloudprint.cainiao.com/template/standard/850338",
+                    "third_custom_template_url": "https://cloudprint.cainiao.com/template/customArea/77205369",
                     "pay_type": "MONTHLY",
                     "print_mode": "PDF",
                 },
@@ -251,6 +252,12 @@ def main() -> None:
         assert json.loads(order_param)["cargo"] == "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1"
         assert json.loads(order_param)["remark"] == "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1；备注：烟测"
         assert json.loads(order_param)["thirdTemplateURL"] == "https://cloudprint.cainiao.com/template/standard/850338"
+        assert json.loads(order_param)["thirdCustomTemplateUrl"] == "https://cloudprint.cainiao.com/template/customArea/77205369"
+        assert json.loads(order_param)["customParam"] == {
+            "itemSummary": "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1",
+            "cargo": "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1",
+            "remark": "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1；备注：烟测",
+        }
         assert "tempId" not in json.loads(order_param)
         long_summary = shipping.build_label_item_summary(
             [
@@ -413,6 +420,9 @@ def main() -> None:
         assert body["settings"]["carrier_settings"]["圆通"]["thirdTemplateURL"] == (
             "https://cloudprint.cainiao.com/template/standard/850338"
         )
+        assert body["settings"]["carrier_settings"]["圆通"]["thirdCustomTemplateUrl"] == (
+            "https://cloudprint.cainiao.com/template/customArea/77205369"
+        )
         assert body["settings"]["carrier_settings"]["京东"]["thirdTemplateURL"] == ""
         assert body["settings"]["carrier_settings"]["顺丰"]["thirdTemplateURL"] == ""
 
@@ -542,6 +552,9 @@ def main() -> None:
         assert body["settings"]["carrier_settings"]["圆通"]["thirdTemplateURL"] == (
             "https://cloudprint.cainiao.com/template/standard/850338"
         )
+        assert body["settings"]["carrier_settings"]["圆通"]["thirdCustomTemplateUrl"] == (
+            "https://cloudprint.cainiao.com/template/customArea/77205369"
+        )
 
         status, body = request(
             admin,
@@ -569,9 +582,9 @@ def main() -> None:
 
         def fake_batch_tracking(_shipment):
             return {
-                "provider": "kuaidi100", "tracking_status": "等待揽收", "state_code": "0",
+                "provider": "kuaidi100", "tracking_status": "查询失败", "state_code": "",
                 "last_event": "", "checked_at": "2026-07-10T12:05:00+08:00", "signed_at": "",
-                "error": "", "raw": "{}", "is_signed": False,
+                "error": "查询无结果", "raw": "{}", "is_signed": False,
             }
 
         server.query_tracking = fake_batch_tracking

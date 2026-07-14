@@ -1048,6 +1048,12 @@ tr:last-child td {
   border-bottom: 0;
 }
 
+.carrier-template-inputs {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
 .check-row {
   display: inline-flex;
   align-items: center;

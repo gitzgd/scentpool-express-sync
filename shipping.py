@@ -213,6 +213,7 @@ class Kuaidi100LabelClient:
         account_net = str(settings.get("net") or "")
         api_print_type = "CLOUD" if print_mode == "CLOUD" and account_net not in THIRD_PARTY_NETS else "IMAGE"
         item_cargo = build_label_item_summary(shipment.get("items"), LABEL_CARGO_MAX_CHARS)
+        label_remark = build_label_remark(shipment)
         param: Dict[str, Any] = {
             **self._account_param(settings),
             "printType": api_print_type,
@@ -232,7 +233,7 @@ class Kuaidi100LabelClient:
             "count": 1,
             "payType": str(settings.get("pay_type") or "MONTHLY"),
             "expType": str(settings.get("exp_type") or "标准快递"),
-            "remark": build_label_remark(shipment),
+            "remark": label_remark,
             "orderId": str(shipment.get("booking_request_id") or shipment.get("business_id") or "")[:32],
             "reorder": False,
             "callBackUrl": print_callback_url(),
@@ -245,6 +246,13 @@ class Kuaidi100LabelClient:
             param["siid"] = str(settings["printer_siid"])
         if settings.get("third_template_url") and account_net in THIRD_PARTY_NETS:
             param["thirdTemplateURL"] = str(settings["third_template_url"])
+            param["customParam"] = {
+                "itemSummary": item_cargo or str(settings.get("cargo_name") or "香氛商品"),
+                "cargo": item_cargo or str(settings.get("cargo_name") or "香氛商品"),
+                "remark": label_remark,
+            }
+            if settings.get("third_custom_template_url"):
+                param["thirdCustomTemplateUrl"] = str(settings["third_custom_template_url"])
         elif settings.get("template_id") and account_net not in THIRD_PARTY_NETS:
             param["tempId"] = str(settings["template_id"])
         if api_print_type == "CLOUD":

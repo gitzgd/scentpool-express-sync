@@ -42,7 +42,7 @@ python3 server.py --host 0.0.0.0 --port 8765
 - `SCENTPOOL_KUAIDI100_THIRD_INFO_ENDPOINT=https://poll.kuaidi100.com/eorderapi.do`：授权网点与面单余额接口。
 - `SCENTPOOL_KUAIDI100_LABEL_SECRET`：企业电子面单 secret，只放 Render 环境变量。
 - `SCENTPOOL_PUBLIC_BASE_URL`：网站公网根地址，用于生成菜鸟授权和打印状态回调地址。
-- 菜鸟授权面单使用每家快递公司自己的 `thirdTemplateURL`。圆通当前配置为一联单模板 `https://cloudprint.cainiao.com/template/standard/850338`；京东和顺丰暂不配置模板。
+- 菜鸟授权面单使用每家快递公司自己的 `thirdTemplateURL`。圆通当前配置为一联单模板 `https://cloudprint.cainiao.com/template/standard/850338` 和货物自定义区模板 `https://cloudprint.cainiao.com/template/customArea/77205369`；京东和顺丰暂不配置模板。系统通过 `thirdCustomTemplateUrl` 和 `customParam.itemSummary` 传入按分类换行的商品名称与数量。
 - 电子面单的物品名称和备注会从发货单商品明细自动生成，格式为“【分类】商品名*数量”；同分类商品合并展示，不同分类自动换行。物品栏超过 50 字时会清理重复品类前缀并逐级缩写每个商品的主关键词，但不会省略任何商品。备注最多 100 字。
 
 ## 发布到 Render

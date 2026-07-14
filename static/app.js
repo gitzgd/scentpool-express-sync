@@ -2177,6 +2177,9 @@ async function renderShippingSettings() {
   const defaultTemplateUrls = {
     "圆通": "https://cloudprint.cainiao.com/template/standard/850338",
   };
+  const defaultCustomTemplateUrls = {
+    "圆通": "https://cloudprint.cainiao.com/template/customArea/77205369",
+  };
   const branchSelect = (company) => {
     const current = carrierSettings[company]?.tbNet || "";
     const options = branchOptions.filter((item) => item.company === company);
@@ -2248,7 +2251,10 @@ async function renderShippingSettings() {
             <strong>${company}</strong>
             ${branchSelect(company)}
             <input class="input" data-carrier-exp="${company}" value="${escapeHtml(carrierSettings[company]?.expType || (company === "顺丰" ? "顺丰标快" : "标准快递"))}" aria-label="${company}产品类型" />
-            <input class="input" data-carrier-template="${company}" value="${escapeHtml(carrierSettings[company]?.thirdTemplateURL || defaultTemplateUrls[company] || "")}" placeholder="菜鸟一联单模板 URL" aria-label="${company}菜鸟一联单模板 URL" />
+            <div class="carrier-template-inputs">
+              <input class="input" data-carrier-template="${company}" value="${escapeHtml(carrierSettings[company]?.thirdTemplateURL || defaultTemplateUrls[company] || "")}" placeholder="菜鸟一联单模板 URL" aria-label="${company}菜鸟一联单模板 URL" />
+              <input class="input" data-carrier-custom-template="${company}" value="${escapeHtml(carrierSettings[company]?.thirdCustomTemplateUrl || defaultCustomTemplateUrls[company] || "")}" placeholder="菜鸟货物自定义区模板 URL" aria-label="${company}菜鸟货物自定义区模板 URL" />
+            </div>
           </div>
         `).join("")}
       </div>
@@ -2277,6 +2283,7 @@ async function renderShippingSettings() {
         tbNet: document.querySelector(`[data-carrier-branch="${company}"]`)?.value || "",
         expType: document.querySelector(`[data-carrier-exp="${company}"]`)?.value.trim() || (company === "顺丰" ? "顺丰标快" : "标准快递"),
         thirdTemplateURL: document.querySelector(`[data-carrier-template="${company}"]`)?.value.trim() || "",
+        thirdCustomTemplateUrl: document.querySelector(`[data-carrier-custom-template="${company}"]`)?.value.trim() || "",
       };
     });
     try {

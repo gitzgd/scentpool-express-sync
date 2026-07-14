@@ -22,6 +22,9 @@ DEFAULT_EXPRESS_COMPANY = "圆通"
 DEFAULT_CAINIAO_TEMPLATE_URLS = {
     "圆通": "https://cloudprint.cainiao.com/template/standard/850338",
 }
+DEFAULT_CAINIAO_CUSTOM_TEMPLATE_URLS = {
+    "圆通": "https://cloudprint.cainiao.com/template/customArea/77205369",
+}
 DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "scentpool2026"
 DEFAULT_STORE_USERNAME = "store01"
@@ -1193,6 +1196,8 @@ class Database:
                 carrier = {}
                 settings["carrier_settings"][company] = carrier
             carrier.setdefault("thirdTemplateURL", DEFAULT_CAINIAO_TEMPLATE_URLS.get(company, ""))
+            if not carrier.get("thirdCustomTemplateUrl"):
+                carrier["thirdCustomTemplateUrl"] = DEFAULT_CAINIAO_CUSTOM_TEMPLATE_URLS.get(company, "")
         try:
             settings["branch_options"] = json.loads(settings.get("branch_options_json") or "[]")
         except json.JSONDecodeError:
@@ -1254,10 +1259,16 @@ class Database:
             ).strip()
             if template_url and not template_url.startswith("https://cloudprint.cainiao.com/template/"):
                 raise AppError(f"{company}的菜鸟面单模板 URL 无效。")
+            custom_template_url = str(
+                value.get("thirdCustomTemplateUrl") or DEFAULT_CAINIAO_CUSTOM_TEMPLATE_URLS.get(company, "")
+            ).strip()
+            if custom_template_url and not custom_template_url.startswith("https://cloudprint.cainiao.com/template/"):
+                raise AppError(f"{company}的菜鸟货物自定义区模板 URL 无效。")
             normalized_carriers[company] = {
                 "tbNet": str(value.get("tbNet") or "").strip(),
                 "expType": str(value.get("expType") or ("顺丰标快" if company == "顺丰" else "标准快递")).strip(),
                 "thirdTemplateURL": template_url,
+                "thirdCustomTemplateUrl": custom_template_url,
             }
         now = now_text()
         with self.connect() as conn:
@@ -1311,6 +1322,9 @@ class Database:
                 "tbNet": carrier.get("tbNet", ""),
                 "exp_type": carrier.get("expType", "顺丰标快" if company == "顺丰" else "标准快递"),
                 "third_template_url": carrier.get("thirdTemplateURL", ""),
+                "third_custom_template_url": (
+                    carrier.get("thirdCustomTemplateUrl") or DEFAULT_CAINIAO_CUSTOM_TEMPLATE_URLS.get(company, "")
+                ),
             }
         )
         return settings
