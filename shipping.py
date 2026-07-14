@@ -129,7 +129,7 @@ def build_label_remark(shipment: Dict[str, Any]) -> str:
         return manual_remark
     if not manual_remark:
         return item_summary
-    prefix = f"{item_summary}；备注："
+    prefix = f"{item_summary}\n备注："
     remaining = LABEL_REMARK_MAX_CHARS - len(prefix)
     if remaining <= 0:
         return compact_label_text(item_summary, LABEL_REMARK_MAX_CHARS)
@@ -247,7 +247,7 @@ class Kuaidi100LabelClient:
         if settings.get("third_template_url") and account_net in THIRD_PARTY_NETS:
             param["thirdTemplateURL"] = str(settings["third_template_url"])
             param["customParam"] = {
-                "itemSummary": item_cargo or str(settings.get("cargo_name") or "香氛商品"),
+                "itemSummary": label_remark or item_cargo or str(settings.get("cargo_name") or "香氛商品"),
                 "cargo": item_cargo or str(settings.get("cargo_name") or "香氛商品"),
                 "remark": label_remark,
             }

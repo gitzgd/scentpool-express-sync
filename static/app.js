@@ -29,6 +29,8 @@ const state = {
   batchPreview: null,
   batchFilters: { store_id: "", status: "待处理", date_from: "", date_to: "", q: "" },
   batchSelectedIds: [],
+  batchPrintOpen: false,
+  batchPrintSelectedIds: [],
   activeShippingBatch: null,
   shippingBatchPollTimer: null,
 };
@@ -1579,6 +1581,43 @@ function renderShippingBatchPreview() {
   `;
 }
 
+function batchPrintableShipments() {
+  return state.shipments.filter(
+    (row) => row.label_print_status === "待打印" && String(row.label_url || "").trim()
+  );
+}
+
+function renderBatchPrintPanel() {
+  if (!state.batchPrintOpen) return "";
+  const eligible = batchPrintableShipments();
+  const eligibleIds = new Set(eligible.map((row) => Number(row.id)));
+  const selectedIds = new Set(
+    state.batchPrintSelectedIds.filter((id) => eligibleIds.has(Number(id))).map(Number)
+  );
+  return `
+    <section class="panel panel-pad shipping-batch-panel">
+      <div class="section-title">
+        <div><h2>批量打印面单</h2><div class="muted mini">当前筛选中待打印 ${eligible.length} 单，已选择 <span id="batchPrintSelectedCount">${selectedIds.size}</span> 单</div></div>
+        <button class="btn ghost small" id="closeBatchPrint" type="button">关闭</button>
+      </div>
+      <div class="inline-actions batch-print-actions">
+        <button class="btn secondary small" id="selectAllBatchPrint" type="button">全选</button>
+        <button class="btn ghost small" id="clearBatchPrint" type="button">取消全选</button>
+        <button class="btn primary" id="mergeBatchPrint" type="button" ${selectedIds.size ? "" : "disabled"}>合并并打印 ${selectedIds.size} 单</button>
+      </div>
+      <div class="batch-order-list">
+        ${eligible.map((row) => `
+          <div class="batch-order-row">
+            <input class="batch-order-checkbox" type="checkbox" data-batch-print-select value="${row.id}" aria-label="选择面单 ${escapeHtml(row.business_id)}" ${selectedIds.has(Number(row.id)) ? "checked" : ""} />
+            <div><strong>${escapeHtml(row.business_id)}</strong><div class="muted mini">${escapeHtml(row.store_name_snapshot)} · ${escapeHtml(row.recipient_name)}</div></div>
+            <span class="muted mini">${escapeHtml(row.tracking_no)}</span>
+          </div>
+        `).join("") || `<div class="empty">当前筛选中没有待打印面单</div>`}
+      </div>
+    </section>
+  `;
+}
+
 function renderShippingBatchProgress() {
   const data = state.activeShippingBatch;
   if (!data?.batch) return "";
@@ -1627,13 +1666,14 @@ async function renderAdmin() {
       "总部统一处理门店提交的发货需求。",
       `<div class="actions">
         <button class="btn primary" id="previewShippingBatch" type="button">批量打单</button>
+        <button class="btn secondary" id="openBatchPrint" type="button" ${batchPrintableShipments().length ? "" : "disabled"}>批量打印面单</button>
         <button class="btn secondary" id="syncTracking" type="button">同步物流</button>
-        <a class="btn secondary" href="/api/export/cainiao.xlsx?${exportParams.toString()}">菜鸟打印数据</a>
         <a class="btn primary" href="/api/export/shipments.xlsx?${exportParams.toString()}">导出 XLSX</a>
         <a class="btn secondary" href="/api/export/shipments.csv?${exportParams.toString()}">导出 CSV</a>
         <a class="btn secondary" href="/api/admin/backup.db">备份数据库</a>
       </div>`
     )}
+    ${renderBatchPrintPanel()}
     ${renderShippingBatchPreview()}
     ${renderShippingBatchProgress()}
     <section class="panel panel-pad">
@@ -1863,6 +1903,88 @@ function renderShipmentTable(shipments) {
 }
 
 function bindAdmin() {
+  document.getElementById("openBatchPrint")?.addEventListener("click", () => {
+    state.batchPrintSelectedIds = batchPrintableShipments().map((row) => Number(row.id));
+    state.batchPrintOpen = true;
+    render();
+  });
+  document.getElementById("closeBatchPrint")?.addEventListener("click", () => {
+    state.batchPrintOpen = false;
+    state.batchPrintSelectedIds = [];
+    render();
+  });
+  const updateBatchPrintSelection = () => {
+    const selected = Array.from(document.querySelectorAll("[data-batch-print-select]:checked"))
+      .map((node) => Number(node.value));
+    state.batchPrintSelectedIds = selected;
+    const count = document.getElementById("batchPrintSelectedCount");
+    if (count) count.textContent = String(selected.length);
+    const submit = document.getElementById("mergeBatchPrint");
+    if (submit) {
+      submit.textContent = `合并并打印 ${selected.length} 单`;
+      submit.disabled = !selected.length;
+    }
+  };
+  document.querySelectorAll("[data-batch-print-select]").forEach((node) => {
+    node.addEventListener("change", updateBatchPrintSelection);
+  });
+  document.getElementById("selectAllBatchPrint")?.addEventListener("click", () => {
+    document.querySelectorAll("[data-batch-print-select]").forEach((node) => { node.checked = true; });
+    updateBatchPrintSelection();
+  });
+  document.getElementById("clearBatchPrint")?.addEventListener("click", () => {
+    document.querySelectorAll("[data-batch-print-select]").forEach((node) => { node.checked = false; });
+    updateBatchPrintSelection();
+  });
+  document.getElementById("mergeBatchPrint")?.addEventListener("click", async () => {
+    const shipmentIds = Array.from(document.querySelectorAll("[data-batch-print-select]:checked"))
+      .map((node) => Number(node.value));
+    if (!shipmentIds.length) {
+      toast("请至少选择一张待打印面单。");
+      return;
+    }
+    if (!confirm(`确认合并并打印 ${shipmentIds.length} 张面单？生成成功后这些订单将标记为已打印。`)) return;
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      toast("浏览器阻止了打印窗口，请允许本站打开弹窗后重试。");
+      return;
+    }
+    printWindow.document.write("<!doctype html><meta charset='utf-8'><title>正在合并面单</title><p style='font-family:sans-serif;padding:32px'>正在合并面单，请稍候...</p>");
+    printWindow.document.close();
+    const button = document.getElementById("mergeBatchPrint");
+    if (button) button.disabled = true;
+    try {
+      const response = await fetch("/api/admin/labels/batch-print", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ shipment_ids: shipmentIds }),
+      });
+      if (!response.ok) {
+        const contentType = response.headers.get("content-type") || "";
+        const errorData = contentType.includes("application/json") ? await response.json() : await response.text();
+        throw new Error(errorData.error || errorData || "批量面单合并失败");
+      }
+      const pdfUrl = URL.createObjectURL(await response.blob());
+      printWindow.location.replace(pdfUrl);
+      setTimeout(() => {
+        try {
+          printWindow.focus();
+          printWindow.print();
+        } catch (_error) {
+          // PDF remains open so the browser print button can still be used.
+        }
+      }, 1800);
+      setTimeout(() => URL.revokeObjectURL(pdfUrl), 10 * 60 * 1000);
+      state.batchPrintOpen = false;
+      state.batchPrintSelectedIds = [];
+      toast(`已合并 ${shipmentIds.length} 张面单并标记为已打印。`);
+      render();
+    } catch (error) {
+      printWindow.close();
+      toast(error.message);
+      if (button) button.disabled = false;
+    }
+  });
   const previewButton = document.getElementById("previewShippingBatch");
   if (previewButton) {
     previewButton.addEventListener("click", async () => {

@@ -1772,6 +1772,62 @@ class Database:
                 (now, shipment_id),
             )
 
+    def batch_print_shipments(self, shipment_ids: Iterable[Any]) -> List[Dict[str, Any]]:
+        normalized_ids: List[int] = []
+        for value in shipment_ids:
+            try:
+                shipment_id = int(value)
+            except (TypeError, ValueError):
+                raise AppError("批量打印包含无效的订单 ID。")
+            if shipment_id > 0 and shipment_id not in normalized_ids:
+                normalized_ids.append(shipment_id)
+        if not normalized_ids:
+            raise AppError("请至少选择一张待打印面单。")
+
+        placeholders = ",".join("?" for _ in normalized_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, business_id, label_url, label_print_status
+                FROM shipments
+                WHERE id IN ({placeholders})
+                """,
+                normalized_ids,
+            ).fetchall()
+        rows_by_id = {int(row["id"]): dict(row) for row in rows}
+        missing = [shipment_id for shipment_id in normalized_ids if shipment_id not in rows_by_id]
+        if missing:
+            raise AppError("部分发货单不存在，无法批量打印。", 404, {"shipment_ids": missing})
+        shipments = [rows_by_id[shipment_id] for shipment_id in normalized_ids]
+        invalid = [
+            row["business_id"]
+            for row in shipments
+            if row["label_print_status"] != "待打印" or not str(row["label_url"] or "").strip()
+        ]
+        if invalid:
+            raise AppError(
+                "只有待打印且已生成 PDF 的订单可以批量打印。",
+                409,
+                {"business_ids": invalid},
+            )
+        return shipments
+
+    def mark_labels_printed(self, shipment_ids: Iterable[int]) -> None:
+        normalized_ids = list(dict.fromkeys(int(value) for value in shipment_ids))
+        if not normalized_ids:
+            return
+        placeholders = ",".join("?" for _ in normalized_ids)
+        now = now_text()
+        with self.connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE shipments
+                SET label_print_status = '打印成功', label_print_error = '', updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                [now, *normalized_ids],
+            )
+
     def mark_booking_cancelled(self, shipment_id: int, raw: str = "") -> Dict[str, Any]:
         now = now_text()
         with self.connect() as conn:

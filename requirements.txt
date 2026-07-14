@@ -1,1 +1,1 @@
-# No third-party runtime dependencies.
+pypdf>=5.0,<7

@@ -18,6 +18,8 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
+from pypdf import PdfReader, PdfWriter
+
 import server
 import shipping
 import tracking
@@ -96,6 +98,14 @@ def request_form(opener, base, method, path, payload):
             return response.status, json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def blank_label_pdf() -> bytes:
+    output = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=216, height=369)
+    writer.write(output)
+    return output.getvalue()
 
 
 def main() -> None:
@@ -250,13 +260,13 @@ def main() -> None:
         assert json.loads(order_param)["orderId"] == "SP20260710S01N1"
         assert json.loads(order_param)["reorder"] is False
         assert json.loads(order_param)["cargo"] == "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1"
-        assert json.loads(order_param)["remark"] == "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1；备注：烟测"
+        assert json.loads(order_param)["remark"] == "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1\n备注：烟测"
         assert json.loads(order_param)["thirdTemplateURL"] == "https://cloudprint.cainiao.com/template/standard/850338"
         assert json.loads(order_param)["thirdCustomTemplateUrl"] == "https://cloudprint.cainiao.com/template/customArea/77205369"
         assert json.loads(order_param)["customParam"] == {
-            "itemSummary": "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1",
+            "itemSummary": "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1\n备注：烟测",
             "cargo": "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1",
-            "remark": "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1；备注：烟测",
+            "remark": "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1\n备注：烟测",
         }
         assert "tempId" not in json.loads(order_param)
         long_summary = shipping.build_label_item_summary(
@@ -602,6 +612,42 @@ def main() -> None:
         status, body = request(admin, base, "GET", "/api/shipments?q=ORDER-SMOKE-001")
         assert status == 200, body
         assert body["shipments"][0]["tracking_status"] == "等待揽收"
+        assert body["shipments"][0]["label_print_status"] == "待打印"
+
+        original_download_label_pdf = server.download_label_pdf
+        try:
+            server.download_label_pdf = lambda _url, _business_id: blank_label_pdf()
+            merged_direct = server.build_batch_label_pdf(
+                [
+                    {"id": 1, "business_id": "PDF-1", "label_url": "https://api.kuaidi100.com/label/1"},
+                    {"id": 2, "business_id": "PDF-2", "label_url": "https://api.kuaidi100.com/label/2"},
+                ]
+            )
+            assert len(PdfReader(io.BytesIO(merged_direct)).pages) == 2
+            status, merged_pdf, headers = request_full(
+                admin,
+                base,
+                "POST",
+                "/api/admin/labels/batch-print",
+                {"shipment_ids": [shipment_id]},
+            )
+        finally:
+            server.download_label_pdf = original_download_label_pdf
+        assert status == 200
+        assert merged_pdf.startswith(b"%PDF")
+        assert len(PdfReader(io.BytesIO(merged_pdf)).pages) == 1
+        assert "inline" in headers.get("Content-Disposition", "")
+        status, body = request(admin, base, "GET", "/api/shipments?q=YT-SMOKE-BOOKING-001")
+        assert status == 200, body
+        assert body["shipments"][0]["label_print_status"] == "打印成功"
+        status, body = request(
+            admin,
+            base,
+            "POST",
+            "/api/admin/labels/batch-print",
+            {"shipment_ids": [shipment_id]},
+        )
+        assert status == 409, body
 
         callback_param = json.dumps(
             {"status": "200", "message": "打印成功"},
@@ -644,15 +690,14 @@ def main() -> None:
         assert status == 200, body
         assert body["shipment"]["label_print_status"] == "打印成功"
 
-        status, export_body, headers = request_full(
+        status, export_body, _headers = request_full(
             admin,
             base,
             "GET",
             "/api/export/cainiao.xlsx?q=YT-SMOKE-BOOKING-001",
         )
-        assert status == 200
-        assert export_body.startswith(b"PK")
-        assert "scentpool-cainiao.xlsx" in headers.get("Content-Disposition", "")
+        assert status == 404
+        assert export_body["error"] == "接口不存在。"
 
         try:
             shipping.urllib.request.urlopen = fake_label_urlopen

@@ -996,6 +996,10 @@ tr:last-child td {
   margin-bottom: 16px;
 }
 
+.batch-print-actions {
+  margin: 14px 0;
+}
+
 .batch-controls {
   display: grid;
   grid-template-columns: 180px 140px 140px 140px auto;

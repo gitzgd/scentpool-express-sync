@@ -9,6 +9,8 @@ import mimetypes
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 import zipfile
 from datetime import datetime
 from email.parser import BytesParser
@@ -19,6 +21,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from xml.sax.saxutils import escape as xml_escape
+
+from pypdf import PdfReader, PdfWriter
+from pypdf.errors import PdfReadError
 
 from database import AppError, Database, DEFAULT_PRODUCT_FILE, RETURN_STATUSES, STATUSES, now_text
 from shipping import (
@@ -38,6 +43,10 @@ PRODUCT_FILE_PATH = DEFAULT_PRODUCT_FILE
 SESSION_SECURE = False
 ALLOW_DB_RESTORE = False
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_BATCH_PRINT_ORDERS = 500
+MAX_LABEL_PDF_BYTES = 10 * 1024 * 1024
+MAX_BATCH_PDF_BYTES = 100 * 1024 * 1024
+LABEL_PDF_HOST_SUFFIXES = ("kuaidi100.com", "cainiao.com", "aliyuncs.com")
 
 
 def json_bytes(data: Any) -> bytes:
@@ -205,34 +214,6 @@ def build_shipments_xlsx(shipments: Any) -> bytes:
     return build_table_xlsx(EXPORT_HEADERS, export_rows(shipments), EXPORT_COLUMN_WIDTHS, "发货明细")
 
 
-CAINIAO_HEADERS = [
-    "订单编号", "快递公司", "运单号", "收件人姓名", "收件人手机", "收件人地址",
-    "商品名称", "商品数量", "寄件人姓名", "寄件人手机", "寄件人地址", "备注",
-]
-CAINIAO_WIDTHS = [28, 12, 22, 14, 16, 42, 42, 12, 14, 16, 42, 24]
-
-
-def build_cainiao_xlsx(shipments: Any, settings: Dict[str, Any]) -> bytes:
-    rows: list[list[Any]] = []
-    for shipment in shipments:
-        if not str(shipment.get("tracking_no") or "").strip():
-            continue
-        item_names = "、".join(
-            f"{item.get('product_name') or item.get('product_barcode')} x{item.get('quantity') or 0}"
-            for item in shipment.get("items") or []
-        )
-        total_quantity = sum(int(item.get("quantity") or 0) for item in shipment.get("items") or [])
-        rows.append(
-            [
-                shipment.get("business_id"), shipment.get("express_company"), shipment.get("tracking_no"),
-                shipment.get("recipient_name"), shipment.get("phone"), shipment.get("address"),
-                item_names, total_quantity, settings.get("sender_name"), settings.get("sender_mobile"),
-                settings.get("sender_address"), shipment.get("remark"),
-            ]
-        )
-    return build_table_xlsx(CAINIAO_HEADERS, rows, CAINIAO_WIDTHS, "菜鸟打印数据")
-
-
 def safe_filename_part(value: Any) -> str:
     text = str(value or "").strip()
     for char in '\\/:*?"<>|':
@@ -272,6 +253,65 @@ def export_filename(query: Dict[str, str], shipments: Any, extension: str) -> st
 
 def attachment_header(filename: str, fallback: str) -> str:
     return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}"
+
+
+def inline_header(filename: str, fallback: str) -> str:
+    return f"inline; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}"
+
+
+def trusted_label_pdf_url(value: str) -> bool:
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme in {"http", "https"} and any(
+        host == suffix or host.endswith(f".{suffix}") for suffix in LABEL_PDF_HOST_SUFFIXES
+    )
+
+
+def download_label_pdf(url: str, business_id: str) -> bytes:
+    if not trusted_label_pdf_url(url):
+        raise AppError(f"订单 {business_id} 的面单地址不受信任。", 502)
+    request = urllib.request.Request(url, headers={"User-Agent": "ScentpoolExpress/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            final_url = response.geturl()
+            if not trusted_label_pdf_url(final_url):
+                raise AppError(f"订单 {business_id} 的面单跳转地址不受信任。", 502)
+            payload = response.read(MAX_LABEL_PDF_BYTES + 1)
+    except AppError:
+        raise
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise AppError(f"订单 {business_id} 的面单下载失败：{exc}", 502) from exc
+    if len(payload) > MAX_LABEL_PDF_BYTES:
+        raise AppError(f"订单 {business_id} 的面单文件超过 10MB。", 502)
+    if not payload.lstrip().startswith(b"%PDF"):
+        raise AppError(f"订单 {business_id} 返回的面单不是 PDF。", 502)
+    return payload
+
+
+def build_batch_label_pdf(shipments: list[Dict[str, Any]]) -> bytes:
+    writer = PdfWriter()
+    total_bytes = 0
+    for shipment in shipments:
+        business_id = str(shipment.get("business_id") or shipment.get("id") or "未知")
+        label_urls = [part.strip() for part in str(shipment.get("label_url") or "").split(",") if part.strip()]
+        if not label_urls:
+            raise AppError(f"订单 {business_id} 没有可打印的面单。", 409)
+        for label_url in label_urls:
+            payload = download_label_pdf(label_url, business_id)
+            total_bytes += len(payload)
+            if total_bytes > MAX_BATCH_PDF_BYTES:
+                raise AppError("本次合并的面单文件超过 100MB，请分批打印。", 413)
+            try:
+                reader = PdfReader(io.BytesIO(payload), strict=False)
+                for page in reader.pages:
+                    writer.add_page(page)
+            except (PdfReadError, ValueError, OSError) as exc:
+                raise AppError(f"订单 {business_id} 的面单 PDF 无法解析。", 502) from exc
+    if not writer.pages:
+        raise AppError("没有可合并的面单页面。", 409)
+    output = io.BytesIO()
+    writer.write(output)
+    return output.getvalue()
 
 
 def env_flag(name: str) -> bool:
@@ -833,6 +873,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
             return
 
+        if path == "/api/admin/labels/batch-print" and self.command == "POST":
+            self.require_admin(user)
+            body = self.read_json()
+            shipment_ids = body.get("shipment_ids") if isinstance(body.get("shipment_ids"), list) else []
+            if len(shipment_ids) > MAX_BATCH_PRINT_ORDERS:
+                raise AppError(f"单次最多合并 {MAX_BATCH_PRINT_ORDERS} 张面单，请分批打印。", 413)
+            shipments = DB.batch_print_shipments(shipment_ids)
+            payload = build_batch_label_pdf(shipments)
+            DB.mark_labels_printed([int(row["id"]) for row in shipments])
+            filename = f"面单_{local_now().strftime('%Y-%m-%d_%H%M')}_{len(shipments)}单.pdf"
+            self.send_bytes(
+                payload,
+                "application/pdf",
+                inline_header(filename, "scentpool-labels.pdf"),
+            )
+            return
+
         if path.startswith("/api/shipments/") and path.endswith("/items") and self.command == "PATCH":
             shipment_id = int(path.split("/")[3])
             shipment = DB.update_shipment_items(shipment_id, user, self.read_json())
@@ -883,20 +940,6 @@ class Handler(BaseHTTPRequestHandler):
             self.require_admin(user)
             shipments = DB.list_shipments(user, query)
             self.send_xlsx(shipments, export_filename(query, shipments, "xlsx"))
-            return
-
-        if path == "/api/export/cainiao.xlsx" and self.command == "GET":
-            self.require_admin(user)
-            shipments = [row for row in DB.list_shipments(user, query) if str(row.get("tracking_no") or "").strip()]
-            if not shipments:
-                raise AppError("当前筛选结果中没有已取得快递单号的订单。", 409)
-            payload = build_cainiao_xlsx(shipments, DB.get_shipping_settings())
-            filename = f"总部_{export_date_part(query)}_菜鸟打印数据.xlsx"
-            self.send_bytes(
-                payload,
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                attachment_header(filename, "scentpool-cainiao.xlsx"),
-            )
             return
 
         self.error_json("接口不存在。", 404)
