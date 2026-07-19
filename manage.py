@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import shutil
+import json
+from datetime import datetime
 from pathlib import Path
 
 from database import AppError, Database
@@ -45,8 +46,24 @@ def command_export_production(args: argparse.Namespace) -> None:
     if output.exists() and not args.overwrite:
         raise AppError(f"输出文件已存在：{output}")
     output.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(args.db, output)
+    db.backup_to(output)
     print(f"已生成生产数据库：{output}")
+
+
+def command_backup(args: argparse.Namespace) -> None:
+    db = Database(str(args.db))
+    output = args.output
+    if output is None:
+        output = Path(args.db).parent / "backups" / f"scentpool-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+    if output.exists() and not args.overwrite:
+        raise AppError(f"输出文件已存在：{output}")
+    db.backup_to(output)
+    print(f"已生成并校验数据库备份：{output}")
+
+
+def command_diagnostics(args: argparse.Namespace) -> None:
+    db = Database(str(args.db))
+    print(json.dumps(db.storage_diagnostics(), ensure_ascii=False, indent=2))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,6 +83,14 @@ def build_parser() -> argparse.ArgumentParser:
     export_production.add_argument("--output", type=Path, required=True, help="输出 .db 文件路径")
     export_production.add_argument("--overwrite", action="store_true", help="允许覆盖已有输出文件")
     export_production.set_defaults(func=command_export_production)
+
+    backup = subparsers.add_parser("backup", help="使用 SQLite 在线备份并执行完整性校验")
+    backup.add_argument("--output", type=Path, help="输出 .db 文件；不传则写入数据库旁的 backups 目录")
+    backup.add_argument("--overwrite", action="store_true", help="允许覆盖已有输出文件")
+    backup.set_defaults(func=command_backup)
+
+    diagnostics = subparsers.add_parser("diagnostics", help="查看数据库文件、WAL、表记录和原始报文占用")
+    diagnostics.set_defaults(func=command_diagnostics)
     return parser
 
 

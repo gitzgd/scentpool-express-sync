@@ -2,28 +2,26 @@ from __future__ import annotations
 
 import argparse
 import csv
-import tempfile
 import io
 import json
 import mimetypes
 import os
+import subprocess
+import sys
+import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from email.parser import BytesParser
 from email.policy import default as email_policy
 from http import cookies
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from xml.sax.saxutils import escape as xml_escape
-
-from pypdf import PdfReader, PdfWriter
-from pypdf.errors import PdfReadError
 
 from database import AppError, Database, DEFAULT_PRODUCT_FILE, RETURN_STATUSES, STATUSES, now_text
 from shipping import (
@@ -42,11 +40,26 @@ DB: Database
 PRODUCT_FILE_PATH = DEFAULT_PRODUCT_FILE
 SESSION_SECURE = False
 ALLOW_DB_RESTORE = False
+
+
+def bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)).strip())
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
-MAX_BATCH_PRINT_ORDERS = 500
+MAX_JSON_BODY_BYTES = 1024 * 1024
+MAX_FORM_BODY_BYTES = 1024 * 1024
+MAX_BATCH_PRINT_ORDERS = bounded_env_int("SCENTPOOL_MAX_BATCH_PRINT_ORDERS", 200, 1, 300)
 MAX_LABEL_PDF_BYTES = 10 * 1024 * 1024
-MAX_BATCH_PDF_BYTES = 100 * 1024 * 1024
-LABEL_PDF_HOST_SUFFIXES = ("kuaidi100.com", "cainiao.com", "aliyuncs.com")
+MAX_BATCH_PDF_BYTES = 60 * 1024 * 1024
+MAX_REQUEST_THREADS = bounded_env_int("SCENTPOOL_MAX_REQUEST_THREADS", 8, 2, 16)
+LABEL_MERGE_TIMEOUT_SECONDS = bounded_env_int("SCENTPOOL_LABEL_MERGE_TIMEOUT_SECONDS", 600, 60, 1200)
+TRACKING_SYNC_LOCK = threading.Lock()
+RETURN_TRACKING_SYNC_LOCK = threading.Lock()
 
 
 def json_bytes(data: Any) -> bytes:
@@ -259,59 +272,76 @@ def inline_header(filename: str, fallback: str) -> str:
     return f"inline; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}"
 
 
-def trusted_label_pdf_url(value: str) -> bool:
-    parsed = urlparse(value)
-    host = (parsed.hostname or "").lower()
-    return parsed.scheme in {"http", "https"} and any(
-        host == suffix or host.endswith(f".{suffix}") for suffix in LABEL_PDF_HOST_SUFFIXES
-    )
-
-
-def download_label_pdf(url: str, business_id: str) -> bytes:
-    if not trusted_label_pdf_url(url):
-        raise AppError(f"订单 {business_id} 的面单地址不受信任。", 502)
-    request = urllib.request.Request(url, headers={"User-Agent": "ScentpoolExpress/1.0"})
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            final_url = response.geturl()
-            if not trusted_label_pdf_url(final_url):
-                raise AppError(f"订单 {business_id} 的面单跳转地址不受信任。", 502)
-            payload = response.read(MAX_LABEL_PDF_BYTES + 1)
-    except AppError:
-        raise
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise AppError(f"订单 {business_id} 的面单下载失败：{exc}", 502) from exc
-    if len(payload) > MAX_LABEL_PDF_BYTES:
-        raise AppError(f"订单 {business_id} 的面单文件超过 10MB。", 502)
-    if not payload.lstrip().startswith(b"%PDF"):
-        raise AppError(f"订单 {business_id} 返回的面单不是 PDF。", 502)
-    return payload
-
-
-def build_batch_label_pdf(shipments: list[Dict[str, Any]]) -> bytes:
-    writer = PdfWriter()
-    total_bytes = 0
+def build_batch_label_pdf_file(shipments: list[Dict[str, Any]], work_dir: Path) -> Path:
+    job_path = work_dir / "job.json"
+    output_path = work_dir / "labels.pdf"
+    job_shipments = []
     for shipment in shipments:
         business_id = str(shipment.get("business_id") or shipment.get("id") or "未知")
         label_urls = [part.strip() for part in str(shipment.get("label_url") or "").split(",") if part.strip()]
         if not label_urls:
             raise AppError(f"订单 {business_id} 没有可打印的面单。", 409)
-        for label_url in label_urls:
-            payload = download_label_pdf(label_url, business_id)
-            total_bytes += len(payload)
-            if total_bytes > MAX_BATCH_PDF_BYTES:
-                raise AppError("本次合并的面单文件超过 100MB，请分批打印。", 413)
-            try:
-                reader = PdfReader(io.BytesIO(payload), strict=False)
-                for page in reader.pages:
-                    writer.add_page(page)
-            except (PdfReadError, ValueError, OSError) as exc:
-                raise AppError(f"订单 {business_id} 的面单 PDF 无法解析。", 502) from exc
-    if not writer.pages:
-        raise AppError("没有可合并的面单页面。", 409)
-    output = io.BytesIO()
-    writer.write(output)
-    return output.getvalue()
+        job_shipments.append(
+            {
+                "id": shipment.get("id"),
+                "business_id": business_id,
+                "label_urls": label_urls,
+            }
+        )
+    job_path.write_text(
+        json.dumps(
+            {
+                "shipments": job_shipments,
+                "max_label_bytes": MAX_LABEL_PDF_BYTES,
+                "max_total_bytes": MAX_BATCH_PDF_BYTES,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    command = [
+        sys.executable,
+        str(BASE_DIR / "label_pdf.py"),
+        "--job",
+        str(job_path),
+        "--output",
+        str(output_path),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=LABEL_MERGE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AppError("批量面单合并超时，请减少勾选数量后重试。", 504) from exc
+    child_result: Dict[str, Any] = {}
+    for line in reversed((completed.stdout or "").splitlines()):
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            child_result = parsed
+            break
+    if completed.returncode != 0 or not output_path.is_file():
+        message = ""
+        if child_result:
+            message = str(child_result.get("error") or "")
+        raise AppError(message or "批量面单合并失败。", 502)
+    if output_path.stat().st_size > MAX_BATCH_PDF_BYTES:
+        raise AppError("合并后的面单文件超过限制，请减少勾选数量后重试。", 413)
+    print(
+        "[labels] merged "
+        f"orders={len(shipments)} pages={int(child_result.get('pages') or 0)} "
+        f"source_bytes={int(child_result.get('source_bytes') or 0)} "
+        f"output_bytes={output_path.stat().st_size}",
+        flush=True,
+    )
+    return output_path
 
 
 def env_flag(name: str) -> bool:
@@ -341,8 +371,7 @@ def save_database_backup() -> Path:
     backup_dir = Path(DB.path).parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup_path = backup_dir / f"scentpool-before-restore-{local_now().strftime('%Y%m%d-%H%M%S')}.db"
-    backup_path.write_bytes(DB.backup_bytes())
-    return backup_path
+    return DB.backup_to(backup_path)
 
 
 def validate_database_file(path: Path) -> None:
@@ -447,39 +476,51 @@ def require_manual_tracking_allowed(row: Dict[str, Any]) -> None:
 
 
 def sync_tracking_batch(*, force: bool = False, limit: int = 20) -> Dict[str, Any]:
+    if not TRACKING_SYNC_LOCK.acquire(blocking=False):
+        return {"checked": 0, "signed": 0, "errors": 0, "skipped_recent": 0, "remaining": 0, "busy": True}
     stale_before = manual_refresh_stale_before() if force else tracking_stale_before()
-    total = DB.tracking_candidate_count()
-    eligible = DB.tracking_candidate_count(stale_before=stale_before)
-    candidates = DB.tracking_candidates(stale_before=stale_before, limit=limit)
-    results = []
-    signed = 0
-    errors = 0
-    for shipment in candidates:
-        result = refresh_tracking_for_shipment(shipment)
-        signed += 1 if result.get("status") == "已签收" else 0
-        errors += 1 if result.get("tracking_status") == "查询失败" else 0
-        results.append(result)
-    return {
-        "checked": len(results),
-        "signed": signed,
-        "errors": errors,
-        "skipped_recent": max(0, total - eligible),
-        "remaining": max(0, eligible - len(results)),
-        "results": results,
-    }
+    try:
+        total = DB.tracking_candidate_count()
+        eligible = DB.tracking_candidate_count(stale_before=stale_before)
+        candidates = DB.tracking_candidates(stale_before=stale_before, limit=limit)
+        checked = 0
+        signed = 0
+        errors = 0
+        for shipment in candidates:
+            result = refresh_tracking_for_shipment(shipment)
+            checked += 1
+            signed += 1 if result.get("status") == "已签收" else 0
+            errors += 1 if result.get("tracking_status") == "查询失败" else 0
+        return {
+            "checked": checked,
+            "signed": signed,
+            "errors": errors,
+            "skipped_recent": max(0, total - eligible),
+            "remaining": max(0, eligible - checked),
+            "busy": False,
+        }
+    finally:
+        TRACKING_SYNC_LOCK.release()
 
 
 def sync_return_tracking_batch(*, force: bool = False, limit: int = 20) -> Dict[str, Any]:
-    candidates = DB.return_tracking_candidates(stale_before="" if force else return_tracking_stale_before(), limit=limit)
-    results = []
-    signed = 0
-    errors = 0
-    for return_order in candidates:
-        result = refresh_tracking_for_return(return_order)
-        signed += 1 if result.get("status") == "已签收" else 0
-        errors += 1 if result.get("tracking_status") == "查询失败" else 0
-        results.append(result)
-    return {"checked": len(results), "signed": signed, "errors": errors, "results": results}
+    if not RETURN_TRACKING_SYNC_LOCK.acquire(blocking=False):
+        return {"checked": 0, "signed": 0, "errors": 0, "busy": True}
+    try:
+        candidates = DB.return_tracking_candidates(
+            stale_before="" if force else return_tracking_stale_before(), limit=limit
+        )
+        checked = 0
+        signed = 0
+        errors = 0
+        for return_order in candidates:
+            result = refresh_tracking_for_return(return_order)
+            checked += 1
+            signed += 1 if result.get("status") == "已签收" else 0
+            errors += 1 if result.get("tracking_status") == "查询失败" else 0
+        return {"checked": checked, "signed": signed, "errors": errors, "busy": False}
+    finally:
+        RETURN_TRACKING_SYNC_LOCK.release()
 
 
 def tracking_worker() -> None:
@@ -536,8 +577,66 @@ def start_shipping_worker() -> None:
     thread.start()
 
 
+class FixedThreadPoolHTTPServer(HTTPServer):
+    def __init__(self, server_address: tuple[str, int], handler_class: type[BaseHTTPRequestHandler], max_workers: int):
+        self.max_workers = max(2, int(max_workers))
+        self._request_slots = threading.BoundedSemaphore(self.max_workers)
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.max_workers,
+            thread_name_prefix="scentpool-http",
+        )
+        self._executor_closed = False
+        super().__init__(server_address, handler_class)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        self._request_slots.acquire()
+        try:
+            self._executor.submit(self._process_request, request, client_address)
+        except Exception:
+            self._request_slots.release()
+            self.shutdown_request(request)
+            raise
+
+    def _process_request(self, request: Any, client_address: Any) -> None:
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            self.shutdown_request(request)
+            self._request_slots.release()
+
+    def server_close(self) -> None:
+        super().server_close()
+        if not self._executor_closed:
+            self._executor_closed = True
+            self._executor.shutdown(wait=True, cancel_futures=True)
+
+
+def process_memory_diagnostics() -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "active_threads": threading.active_count(),
+        "request_thread_limit": MAX_REQUEST_THREADS,
+    }
+    status_path = Path("/proc/self/status")
+    if status_path.exists():
+        for line in status_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("VmRSS:"):
+                result["rss_bytes"] = int(line.split()[1]) * 1024
+            elif line.startswith("VmHWM:"):
+                result["peak_rss_bytes"] = int(line.split()[1]) * 1024
+            elif line.startswith("Threads:"):
+                result["os_threads"] = int(line.split()[1])
+    return result
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ScentpoolExpress/1.0"
+
+    def log_message(self, format: str, *args: Any) -> None:
+        if self.path == "/api/health" and args and str(args[0]).startswith("GET /api/health"):
+            return
+        super().log_message(format, *args)
 
     def do_GET(self) -> None:
         self.route()
@@ -699,11 +798,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/admin/backup.db" and self.command == "GET":
             self.require_admin(user)
             filename = f"scentpool-backup-{local_now().strftime('%Y%m%d-%H%M%S')}.db"
-            self.send_bytes(
-                DB.backup_bytes(),
-                "application/octet-stream",
-                attachment_header(filename, "scentpool-backup.db"),
-            )
+            with tempfile.TemporaryDirectory(prefix="scentpool-download-backup-") as directory:
+                backup_path = DB.backup_to(Path(directory) / "scentpool.db")
+                self.send_file(
+                    backup_path,
+                    "application/octet-stream",
+                    attachment_header(filename, "scentpool-backup.db"),
+                )
             return
 
         if path == "/api/admin/restore-db" and self.command == "POST":
@@ -722,6 +823,17 @@ class Handler(BaseHTTPRequestHandler):
             config = tracking_config_public()
             config["return_interval_minutes"] = return_tracking_interval_minutes()
             self.send_json({"tracking": config, "shipping": label_config_public()})
+            return
+
+        if path == "/api/admin/system/diagnostics" and self.command == "GET":
+            self.require_admin(user)
+            self.send_json(
+                {
+                    "time": now_text(),
+                    "process": process_memory_diagnostics(),
+                    "storage": DB.storage_diagnostics(),
+                }
+            )
             return
 
         if path == "/api/admin/shipping-settings" and self.command == "GET":
@@ -824,6 +936,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"shipment": shipment}, status=201)
             return
 
+        if path == "/api/shipments/summary" and self.command == "GET":
+            self.send_json({"counts": DB.shipment_status_counts(user, query), "statuses": STATUSES})
+            return
+
         if path == "/api/shipments" and self.command == "GET":
             self.send_json({"shipments": DB.list_shipments(user, query), "statuses": STATUSES})
             return
@@ -840,14 +956,17 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/shipments/") and path.endswith("/label/cancel") and self.command == "POST":
             self.require_admin(user)
             shipment_id = int(path.split("/")[3])
+            body = self.read_json()
             booking = DB.booking_for_cancel(shipment_id)
             result = Kuaidi100LabelClient.from_env().cancel_label(
-                booking, DB.shipping_settings_for_company(str(booking.get("express_company") or ""))
+                booking,
+                DB.shipping_settings_for_company(str(booking.get("express_company") or "")),
+                str(body.get("reason") or "订单信息需要修改"),
             )
             if not result.get("success"):
                 raise AppError(str(result.get("error") or "取消电子面单失败。"), 502)
             DB.mark_booking_cancelled(shipment_id, str(result.get("raw") or ""))
-            self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
+            self.send_json({"shipment": DB.get_shipment(shipment_id, user), "provider_code": result.get("code", "")})
             return
 
         if path.startswith("/api/shipments/") and path.endswith("/label/reprint") and self.command == "POST":
@@ -880,14 +999,15 @@ class Handler(BaseHTTPRequestHandler):
             if len(shipment_ids) > MAX_BATCH_PRINT_ORDERS:
                 raise AppError(f"单次最多合并 {MAX_BATCH_PRINT_ORDERS} 张面单，请分批打印。", 413)
             shipments = DB.batch_print_shipments(shipment_ids)
-            payload = build_batch_label_pdf(shipments)
-            DB.mark_labels_printed([int(row["id"]) for row in shipments])
-            filename = f"面单_{local_now().strftime('%Y-%m-%d_%H%M')}_{len(shipments)}单.pdf"
-            self.send_bytes(
-                payload,
-                "application/pdf",
-                inline_header(filename, "scentpool-labels.pdf"),
-            )
+            with tempfile.TemporaryDirectory(prefix="scentpool-label-merge-") as directory:
+                payload_path = build_batch_label_pdf_file(shipments, Path(directory))
+                DB.mark_labels_printed([int(row["id"]) for row in shipments])
+                filename = f"面单_{local_now().strftime('%Y-%m-%d_%H%M')}_{len(shipments)}单.pdf"
+                self.send_file(
+                    payload_path,
+                    "application/pdf",
+                    inline_header(filename, "scentpool-labels.pdf"),
+                )
             return
 
         if path.startswith("/api/shipments/") and path.endswith("/items") and self.command == "PATCH":
@@ -1004,16 +1124,28 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def send_file(self, path: Path, content_type: str, content_disposition: str = "") -> None:
+        size = path.stat().st_size
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        if content_disposition:
+            self.send_header("Content-Disposition", content_disposition)
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(64 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
     def send_health(self) -> None:
         try:
-            summary = DB.database_summary()
+            DB.health_check()
             self.send_json(
                 {
                     "ok": True,
                     "database": True,
-                    "products": summary["products"],
-                    "shipments": summary["shipments"],
-                    "returns": summary["returns"],
                     "time": now_text(),
                 }
             )
@@ -1057,6 +1189,8 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         if length <= 0:
             return {}
+        if length > MAX_JSON_BODY_BYTES:
+            raise AppError("请求内容不能超过 1MB。", 413)
         raw = self.rfile.read(length).decode("utf-8")
         try:
             data = json.loads(raw)
@@ -1068,6 +1202,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def read_form(self) -> Dict[str, str]:
         length = int(self.headers.get("Content-Length", "0"))
+        if length > MAX_FORM_BODY_BYTES:
+            raise AppError("表单内容不能超过 1MB。", 413)
         raw = self.rfile.read(length).decode("utf-8") if length > 0 else ""
         return {key: values[-1] for key, values in parse_qs(raw, keep_blank_values=True).items()}
 
@@ -1133,7 +1269,7 @@ def main() -> None:
     if production and DB.default_credentials_active():
         raise RuntimeError("生产数据库仍可使用默认账号密码登录，请先重置 admin 和门店账号密码。")
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server = FixedThreadPoolHTTPServer((args.host, args.port), Handler, MAX_REQUEST_THREADS)
     print(f"万物香铺快递同步已启动：http://{args.host}:{args.port}")
     print(f"数据库：{args.db}")
     print(f"商品文件：{args.products}")

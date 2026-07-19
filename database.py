@@ -58,6 +58,12 @@ def shipment_business_id(order_date: str, store_id: int, store_order_no: str) ->
     return f"{order_date.replace('-', '')}-S{int(store_id):02d}-{store_order_no}"
 
 
+def new_booking_request_id(order_date: str, store_id: int, shipment_id: int) -> str:
+    seed = f"{order_date}:{store_id}:{shipment_id}:{secrets.token_hex(12)}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16].upper()
+    return f"SP{order_date.replace('-', '')}{digest}"
+
+
 def business_search_parts(query: str) -> Optional[tuple[str, Optional[int], str]]:
     text = str(query or "").strip()
     match = re.match(r"^(\d{4})-?(\d{2})-?(\d{2})[-_\s]+[sS](\d+)[-_\s]+(.+)$", text)
@@ -88,9 +94,14 @@ class Database:
         self.path = path
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=15)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 15000")
+        conn.execute("PRAGMA cache_size = -2048")
+        conn.execute("PRAGMA temp_store = FILE")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA wal_autocheckpoint = 1000")
         return conn
 
     def initialize(
@@ -104,6 +115,7 @@ class Database:
         if directory:
             os.makedirs(directory, exist_ok=True)
         with self.connect() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS stores (
@@ -305,6 +317,7 @@ class Database:
                     attempt_count INTEGER NOT NULL DEFAULT 0,
                     error TEXT NOT NULL DEFAULT '',
                     response_raw TEXT NOT NULL DEFAULT '',
+                    cancel_param_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE (batch_id, shipment_id),
@@ -601,6 +614,7 @@ class Database:
             "callback_salt": "TEXT NOT NULL DEFAULT ''",
             "task_id": "TEXT NOT NULL DEFAULT ''",
             "order_id": "TEXT NOT NULL DEFAULT ''",
+            "cancel_param_json": "TEXT NOT NULL DEFAULT '{}'",
         }
         for name, definition in columns.items():
             if name not in existing:
@@ -657,6 +671,57 @@ class Database:
                 "returns": conn.execute("SELECT COUNT(*) FROM return_orders").fetchone()[0],
             }
 
+    def health_check(self) -> bool:
+        with self.connect() as conn:
+            return conn.execute("SELECT 1").fetchone()[0] == 1
+
+    def storage_diagnostics(self) -> Dict[str, Any]:
+        database_path = Path(self.path)
+        table_names = (
+            "stores",
+            "users",
+            "sessions",
+            "products",
+            "shipments",
+            "shipment_items",
+            "shipping_batches",
+            "shipping_batch_items",
+            "shipping_callback_events",
+            "return_orders",
+            "return_items",
+        )
+        with self.connect() as conn:
+            table_counts = {
+                table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in table_names
+            }
+            raw_sizes = dict(
+                conn.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(LENGTH(tracking_raw)), 0) AS tracking_raw_bytes,
+                        COALESCE(SUM(LENGTH(booking_raw)), 0) AS booking_raw_bytes,
+                        COALESCE(MAX(LENGTH(tracking_raw)), 0) AS largest_tracking_raw_bytes,
+                        COALESCE(MAX(LENGTH(booking_raw)), 0) AS largest_booking_raw_bytes
+                    FROM shipments
+                    """
+                ).fetchone()
+            )
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+            journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0])
+        return {
+            "database_bytes": database_path.stat().st_size if database_path.exists() else 0,
+            "wal_bytes": Path(f"{self.path}-wal").stat().st_size if Path(f"{self.path}-wal").exists() else 0,
+            "page_count": page_count,
+            "page_size": page_size,
+            "freelist_count": freelist_count,
+            "journal_mode": journal_mode,
+            "table_counts": table_counts,
+            "raw_sizes": {key: int(value or 0) for key, value in raw_sizes.items()},
+        }
+
     def default_credentials_active(self) -> bool:
         return bool(
             self.authenticate(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
@@ -678,10 +743,22 @@ class Database:
             if cursor.rowcount == 0:
                 raise AppError(f"账号不存在：{username}", 404)
 
+    def backup_to(self, target: str | Path) -> Path:
+        target_path = Path(target)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as source, sqlite3.connect(str(target_path)) as destination:
+            source.backup(destination)
+            integrity = str(destination.execute("PRAGMA integrity_check").fetchone()[0])
+        if integrity.lower() != "ok":
+            raise AppError(f"数据库备份完整性校验失败：{integrity}", 500)
+        return target_path
+
     def backup_bytes(self) -> bytes:
-        with self.connect() as conn:
-            conn.execute("PRAGMA wal_checkpoint(FULL)")
-        return Path(self.path).read_bytes()
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="scentpool-backup-") as directory:
+            target = self.backup_to(Path(directory) / "scentpool.db")
+            return target.read_bytes()
 
     def count_products(self) -> int:
         with self.connect() as conn:
@@ -1054,7 +1131,11 @@ class Database:
             conn.execute("UPDATE shipments SET updated_at = ? WHERE id = ?", (now, shipment_id))
         return self.get_shipment(shipment_id, user)
 
-    def list_shipments(self, user: Dict[str, Any], filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _shipment_filter_sql(
+        self,
+        user: Dict[str, Any],
+        filters: Dict[str, Any],
+    ) -> tuple[List[str], List[Any]]:
         where = []
         params: List[Any] = []
 
@@ -1139,6 +1220,25 @@ class Database:
                 )
                 params.extend([q, q, q, q, q, q])
 
+        return where, params
+
+    def shipment_status_counts(self, user: Dict[str, Any], filters: Dict[str, Any]) -> Dict[str, int]:
+        where, params = self._shipment_filter_sql(user, filters)
+        sql = "SELECT shipments.status, COUNT(*) AS count FROM shipments"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " GROUP BY shipments.status"
+        counts = {status: 0 for status in STATUSES}
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        for row in rows:
+            counts[str(row["status"])] = int(row["count"])
+        counts["total"] = sum(counts.values())
+        return counts
+
+    def list_shipments(self, user: Dict[str, Any], filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        where, params = self._shipment_filter_sql(user, filters)
+
         sql = "SELECT shipments.* FROM shipments"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -1165,6 +1265,9 @@ class Database:
                 f"{item['product_category']} / {item['product_name']} x{item['quantity']}"
                 for item in row["items"]
             )
+            row.pop("booking_raw", None)
+            row.pop("booking_salt", None)
+            row.pop("booking_poll_token", None)
         return rows
 
     def get_shipping_settings(self, *, public: bool = False) -> Dict[str, Any]:
@@ -1493,7 +1596,12 @@ class Database:
             )
             batch_id = int(cursor.lastrowid)
             for shipment, company in valid:
-                request_id = str(shipment["booking_request_id"] or f"SP{shipment['order_date'].replace('-', '')}S{int(shipment['store_id']):02d}N{shipment['id']}")[:32]
+                request_id = str(
+                    shipment["booking_request_id"]
+                    or new_booking_request_id(
+                        str(shipment["order_date"]), int(shipment["store_id"]), int(shipment["id"])
+                    )
+                )[:32]
                 salt = str(shipment["booking_salt"] or secrets.token_hex(12))
                 conn.execute(
                     """
@@ -1573,12 +1681,14 @@ class Database:
             conn.execute(
                 """
                 UPDATE shipping_batch_items
-                SET status = ?, task_id = ?, order_id = ?, error = ?, response_raw = ?, updated_at = ?
+                SET status = ?, task_id = ?, order_id = ?, error = ?, response_raw = ?,
+                    cancel_param_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
                     item_status, str(result.get("task_id") or ""), str(result.get("carrier_order_no") or ""),
-                    str(result.get("error") or ""), str(result.get("raw") or ""), now, item_id,
+                    str(result.get("error") or ""), str(result.get("raw") or ""),
+                    json.dumps(result.get("cancel_param") or {}, ensure_ascii=False), now, item_id,
                 ),
             )
             conn.execute(
@@ -1647,6 +1757,8 @@ class Database:
                 (batch_id,),
             ).fetchall()
         item_list = [dict(item) for item in items]
+        for item in item_list:
+            item.pop("cancel_param_json", None)
         counts: Dict[str, int] = {}
         for item in item_list:
             counts[item["status"]] = counts.get(item["status"], 0) + 1
@@ -1738,13 +1850,30 @@ class Database:
     def booking_for_cancel(self, shipment_id: int) -> Dict[str, Any]:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
+            batch_item = conn.execute(
+                """
+                SELECT cancel_param_json
+                FROM shipping_batch_items
+                WHERE shipment_id = ? AND status = '成功'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (shipment_id,),
+            ).fetchone()
         if not row:
             raise AppError("发货单不存在。", 404)
         if not row["booking_task_id"] or not row["tracking_no"]:
             raise AppError("这个订单没有可取消的电子面单。", 409)
         if row["status"] == "已签收":
             raise AppError("已签收订单不能取消快递下单。", 409)
-        return dict(row)
+        booking = dict(row)
+        try:
+            booking["label_cancel_param"] = json.loads(
+                str(batch_item["cancel_param_json"] or "{}") if batch_item else "{}"
+            )
+        except json.JSONDecodeError:
+            booking["label_cancel_param"] = {}
+        return booking
 
     def mark_label_reprint(self, shipment_id: int, raw: str = "") -> None:
         now = now_text()
@@ -1834,7 +1963,7 @@ class Database:
             conn.execute(
                 """
                 UPDATE shipments
-                SET status = '待处理', express_company = '', tracking_no = '', tracking_provider = '',
+                SET status = '待处理', tracking_no = '', tracking_provider = '',
                     tracking_status = '', tracking_state_code = '', tracking_last_event = '',
                     tracking_last_checked_at = '', tracking_signed_at = '', tracking_error = '', tracking_raw = '',
                     shipped_at = '', booking_status = '已取消', booking_task_id = '', booking_order_id = '',

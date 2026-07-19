@@ -214,8 +214,9 @@ class Kuaidi100LabelClient:
         api_print_type = "CLOUD" if print_mode == "CLOUD" and account_net not in THIRD_PARTY_NETS else "IMAGE"
         item_cargo = build_label_item_summary(shipment.get("items"), LABEL_CARGO_MAX_CHARS)
         label_remark = build_label_remark(shipment)
+        account_param = self._account_param(settings)
         param: Dict[str, Any] = {
-            **self._account_param(settings),
+            **account_param,
             "printType": api_print_type,
             "kuaidicom": company_code,
             "recMan": {
@@ -272,8 +273,20 @@ class Kuaidi100LabelClient:
         result = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         tracking_no = str(result.get("kuaidinum") or "").strip()
         task_id = str(result.get("taskId") or "").strip()
+        carrier_order_no = str(result.get("kdComOrderNum") or "").strip()
         if not tracking_no or not task_id:
             return {"success": False, "error": "电子面单响应缺少快递单号或 taskId。", "raw": response["raw"]}
+        cancel_param = {
+            key: value
+            for key, value in account_param.items()
+            if key in {"partnerId", "partnerKey", "partnerSecret", "partnerName", "net", "code", "checkMan"}
+        }
+        cancel_param.update({"kuaidicom": company_code, "kuaidinum": tracking_no})
+        if carrier_order_no:
+            cancel_param["orderId"] = carrier_order_no
+        exp_type = str(settings.get("exp_type") or "").strip()
+        if exp_type:
+            cancel_param["expType"] = exp_type
         return {
             "success": True,
             "task_id": task_id,
@@ -281,30 +294,57 @@ class Kuaidi100LabelClient:
             "label_url": str(result.get("label") or ""),
             "child_no": str(result.get("childNum") or ""),
             "return_no": str(result.get("returnNum") or ""),
-            "carrier_order_no": str(result.get("kdComOrderNum") or ""),
+            "carrier_order_no": carrier_order_no,
+            "cancel_param": cancel_param,
             "print_type": api_print_type,
             "print_status": "打印中" if api_print_type == "CLOUD" else "待打印",
             "raw": response["raw"],
             "error": "",
         }
 
-    def cancel_label(self, shipment: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+    def cancel_label(
+        self,
+        shipment: Dict[str, Any],
+        settings: Dict[str, Any],
+        reason: str = "订单信息需要修改",
+    ) -> Dict[str, Any]:
         company_code = EXPRESS_COMPANY_CODES.get(str(shipment.get("express_company") or ""))
-        param = {
-            **self._account_param(settings),
+        saved_param = shipment.get("label_cancel_param")
+        param = dict(saved_param) if isinstance(saved_param, dict) else {}
+        if not param:
+            param = {
+                key: value
+                for key, value in self._account_param(settings).items()
+                if key != "tbNet"
+            }
+        param.update({
             "kuaidicom": company_code or "",
             "kuaidinum": str(shipment.get("tracking_no") or ""),
-            "orderId": str(shipment.get("label_carrier_order_no") or ""),
-            "reason": "订单信息需要修改",
-            "expType": str(settings.get("exp_type") or "标准快递"),
-        }
+            "reason": str(reason or "订单信息需要修改").strip()[:100],
+        })
+        carrier_order_no = str(shipment.get("label_carrier_order_no") or "").strip()
+        if carrier_order_no:
+            param["orderId"] = carrier_order_no
+        if not param.get("expType") and settings.get("exp_type"):
+            param["expType"] = str(settings["exp_type"])
+        param.pop("tbNet", None)
+        if not param.get("kuaidicom") or not param.get("kuaidinum"):
+            return {"success": False, "error": "取消面单缺少快递公司编码或快递单号。", "raw": ""}
         response = self._post(self.endpoint, "cancel", {key: value for key, value in param.items() if value})
         if not response.get("success"):
             return response
         payload = response["data"]
-        if not bool(payload.get("success")):
-            return {"success": False, "error": str(payload.get("message") or "电子面单取消失败"), "raw": response["raw"]}
-        return {"success": True, "raw": response["raw"], "error": ""}
+        code = str(payload.get("code") or "")
+        if not bool(payload.get("success")) or code != "200":
+            message = str(payload.get("message") or "电子面单取消失败")
+            if code == "30005" and company_code == "yuantong":
+                message = (
+                    "普通圆通 yuantong 不在快递100官方电子面单取消支持列表中。"
+                    "请先在菜鸟后台或联系圆通网点回收；系统未清空旧面单，也不会允许重复下单"
+                )
+            code_label = f"（{code}）" if code else ""
+            return {"success": False, "error": f"快递100取消失败{code_label}：{message}", "raw": response["raw"]}
+        return {"success": True, "raw": response["raw"], "error": "", "code": code}
 
     def reprint(self, task_id: str, siid: str = "") -> Dict[str, Any]:
         param = {"taskId": task_id}

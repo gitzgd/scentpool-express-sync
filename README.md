@@ -42,6 +42,10 @@ python3 server.py --host 0.0.0.0 --port 8765
 - `SCENTPOOL_KUAIDI100_THIRD_INFO_ENDPOINT=https://poll.kuaidi100.com/eorderapi.do`：授权网点与面单余额接口。
 - `SCENTPOOL_KUAIDI100_LABEL_SECRET`：企业电子面单 secret，只放 Render 环境变量。
 - `SCENTPOOL_PUBLIC_BASE_URL`：网站公网根地址，用于生成菜鸟授权和打印状态回调地址。
+- `SCENTPOOL_MAX_REQUEST_THREADS=8`：Web 请求固定线程池大小，防止并发请求无限创建线程与内存分配区。
+- `SCENTPOOL_MAX_BATCH_PRINT_ORDERS=200`：单次批量合并面单上限。
+- `SCENTPOOL_LABEL_PROCESS_MEMORY_MB=320`：Linux 上 PDF 合并子进程的硬内存上限。
+- `MALLOC_ARENA_MAX=2`、`MALLOC_TRIM_THRESHOLD_=131072`：限制 glibc 分配区并更积极归还空闲内存。
 - 菜鸟授权面单使用每家快递公司自己的 `thirdTemplateURL`。圆通当前配置为一联单模板 `https://cloudprint.cainiao.com/template/standard/850338` 和货物自定义区模板 `https://cloudprint.cainiao.com/template/customArea/77205369`；京东和顺丰暂不配置模板。系统通过 `thirdCustomTemplateUrl` 和 `customParam.itemSummary` 传入按分类换行的商品名称与数量。
 - 电子面单的物品名称和备注会从发货单商品明细自动生成，格式为“【分类】商品名*数量”；同分类商品合并展示，不同分类自动换行，订单备注在全部货品信息后另起一行显示。物品栏超过 50 字时会清理重复品类前缀并逐级缩写每个商品的主关键词，但不会省略任何商品。自定义区内容最多 100 字。
 - 发货后台可从当前筛选结果中选择全部或部分“待打印”订单，服务端合并快递100返回的 PDF 后一次打开打印窗口；合并成功的订单会统一标记为“打印成功”，后续仍可从单个订单查看原面单。
@@ -117,21 +121,26 @@ curl -b cookie.txt -c cookie.txt \
 - `PDF`：菜鸟授权模式返回 PDF 面单，在发货后台点击“查看面单”后使用本地打印机打印。
 - `CLOUD`：快递100云打印，需要网点电子面单账号和设备码 `siid`；打印状态通过回调更新，支持两天内复打。菜鸟第三方授权通道会固定返回 PDF，不执行云打印。
 
-电子面单取消只有在快递公司接口确认成功后才会清空单号并解锁订单。部分快递公司或授权通道不支持接口取消时，需要在菜鸟后台或合作网点人工回收面单。
+电子面单取消会使用原下单任务保存的授权参数调用快递100 `method=cancel`，只有返回 `code=200` 后才清空旧单号并解锁订单。取消后订单恢复为待处理并保留原快递公司；再次下单会生成新的 `orderId`，避免快递100在 48 小时内返回已经取消的旧面单。部分快递公司或授权通道不支持接口取消时，需要在菜鸟后台或合作网点人工回收面单。
+
+快递100当前官方取消列表包含京东、顺丰和圆通承诺达，但不包含普通圆通 `yuantong`。普通圆通返回 `30005` 时系统会保留原面单并阻止重复下单；不能仅在本地清空单号，否则旧面单仍可能有效。
 
 正式启用前需要在快递100企业后台开通“电子面单”并取得 `LABEL_SECRET`。配置完成、菜鸟授权成功并完成一张测试单后，将 Render 中的 `SCENTPOOL_KUAIDI100_LABEL_ENABLED` 改为 `1`。
 
 ## 备份与回滚
 
 - 总部在“发货后台”点击“备份数据库”，会下载完整 SQLite 文件。
+- 所有在线备份都使用 SQLite Backup API，并在交付前执行 `PRAGMA integrity_check`，兼容 WAL 模式。
+- 命令行可运行 `python3 manage.py --db /var/data/scentpool.db backup` 生成并校验备份，运行 `diagnostics` 查看文件与各表占用。
 - 恢复数据库前，服务会自动在数据库同目录的 `backups/` 下保存时间戳备份。
 - 本地数据库默认在 `/Users/zgd/scentpool-express-sync/data/scentpool.db`。
 - Render 数据库存放在持久磁盘 `/var/data/scentpool.db`，服务重启后数据应保留。
+- 生产事故、容量预估、备份恢复和数据库迁移门槛见 `OPERATIONS.md`。
 
 ## 本地验证
 
 ```bash
-python3 -m py_compile server.py database.py manage.py smoke_test.py tracking.py shipping.py
+python3 -m py_compile server.py database.py manage.py smoke_test.py tracking.py shipping.py label_pdf.py
 node --check static/app.js
 python3 smoke_test.py
 ```

@@ -16,6 +16,16 @@ services:
         value: /var/data/products.xlsx
       - key: SCENTPOOL_SESSION_SECURE
         value: "1"
+      - key: MALLOC_ARENA_MAX
+        value: "2"
+      - key: MALLOC_TRIM_THRESHOLD_
+        value: "131072"
+      - key: SCENTPOOL_MAX_REQUEST_THREADS
+        value: "8"
+      - key: SCENTPOOL_MAX_BATCH_PRINT_ORDERS
+        value: "200"
+      - key: SCENTPOOL_LABEL_PROCESS_MEMORY_MB
+        value: "320"
       - key: SCENTPOOL_ADMIN_PASSWORD
         sync: false
       - key: SCENTPOOL_ALLOW_DB_RESTORE

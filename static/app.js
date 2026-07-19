@@ -4,8 +4,9 @@ const state = {
   productsGrouped: null,
   productsAll: [],
   shipments: [],
-  adminShipmentSummary: [],
+  adminShipmentSummary: { total: 0 },
   storeShipments: [],
+  storeShipmentSummary: { total: 0 },
   returnOrders: [],
   storeReturnOrders: [],
   statuses: ["待处理", "已发货", "已签收", "异常", "已取消"],
@@ -165,17 +166,6 @@ function trackingTraceLines(row) {
     }
   }
   return row.tracking_last_event ? [row.tracking_last_event] : [];
-}
-
-function shipmentStatusCounts(rows) {
-  return rows.reduce(
-    (acc, row) => {
-      acc.total += 1;
-      acc[row.status] = (acc[row.status] || 0) + 1;
-      return acc;
-    },
-    { total: 0 }
-  );
 }
 
 function shipmentPageState(scope) {
@@ -416,8 +406,8 @@ async function loadShipments() {
 
   const summaryParams = new URLSearchParams(params);
   summaryParams.delete("status");
-  const summaryData = await api(`/api/shipments?${summaryParams.toString()}`);
-  state.adminShipmentSummary = summaryData.shipments || [];
+  const summaryData = await api(`/api/shipments/summary?${summaryParams.toString()}`);
+  state.adminShipmentSummary = summaryData.counts || { total: 0 };
 }
 
 async function loadShippingSettings() {
@@ -461,6 +451,10 @@ async function loadStoreShipments() {
   const data = await api(`/api/shipments?${params.toString()}`);
   state.storeShipments = data.shipments || [];
   state.statuses = data.statuses || state.statuses;
+  const summaryParams = new URLSearchParams(params);
+  summaryParams.delete("status");
+  const summaryData = await api(`/api/shipments/summary?${summaryParams.toString()}`);
+  state.storeShipmentSummary = summaryData.counts || { total: 0 };
 }
 
 async function loadReturnOrders(admin = false) {
@@ -880,23 +874,9 @@ async function renderStoreBoard() {
   await loadStoreShipments();
   const today = localDate();
   const yesterday = localDate(-1);
-  const todayData = await api(`/api/shipments?date_from=${today}&date_to=${today}`);
-  const todayCounts = (todayData.shipments || []).reduce(
-    (acc, row) => {
-      acc.total += 1;
-      acc[row.status] = (acc[row.status] || 0) + 1;
-      return acc;
-    },
-    { total: 0 }
-  );
-  const counts = state.storeShipments.reduce(
-    (acc, row) => {
-      acc.total += 1;
-      acc[row.status] = (acc[row.status] || 0) + 1;
-      return acc;
-    },
-    { total: 0 }
-  );
+  const todayData = await api(`/api/shipments/summary?date_from=${today}&date_to=${today}`);
+  const todayCounts = todayData.counts || { total: 0 };
+  const counts = state.storeShipmentSummary || { total: 0 };
   const pageData = paginatedShipments(state.storeShipments, "store");
   const content = `
     ${pageHead(
@@ -1658,7 +1638,7 @@ async function renderAdmin() {
   Object.entries(state.adminFilters).forEach(([key, value]) => {
     if (value) exportParams.set(key, value);
   });
-  const counts = shipmentStatusCounts(state.adminShipmentSummary);
+  const counts = state.adminShipmentSummary || { total: 0 };
   const pageData = paginatedShipments(state.shipments, "admin");
   const content = `
     ${pageHead(
@@ -1811,7 +1791,7 @@ function renderShipmentActions(row) {
         ${row.label_url ? `<a class="btn secondary small" href="${escapeHtml(row.label_url)}" target="_blank" rel="noopener">查看面单</a>` : ""}
         ${row.label_url && row.label_print_status !== "打印成功" ? `<button class="btn secondary small" data-label-printed="${row.id}" type="button">标记已打印</button>` : ""}
         ${row.label_print_type === "CLOUD" && row.booking_task_id ? `<button class="btn secondary small" data-reprint-label="${row.id}" type="button">复打面单</button>` : ""}
-        ${canCancel ? `<button class="btn danger small" data-cancel-label="${row.id}" type="button">取消面单</button>` : `<span class="muted mini">面单处理中</span>`}
+        ${canCancel ? `<button class="btn danger small" data-cancel-label="${row.id}" type="button">取消并回收面单</button>` : `<span class="muted mini">面单处理中</span>`}
         ${row.tracking_no ? `<button class="btn secondary small" data-refresh-tracking="${row.id}" type="button">查物流</button>` : ""}
         ${shippedAt}
       </div>
@@ -2173,10 +2153,13 @@ function bindAdmin() {
   document.querySelectorAll("[data-cancel-label]").forEach((node) => {
     node.addEventListener("click", async (event) => {
       const id = event.currentTarget.dataset.cancelLabel;
-      if (!confirm("确认取消并回收这张电子面单？只有快递公司确认成功后订单才会解锁。")) return;
+      if (!confirm("确认取消并回收这张电子面单？快递100与快递公司确认成功后，订单会恢复为待处理，并可重新下单生成新面单。")) return;
       try {
-        await api(`/api/shipments/${id}/label/cancel`, { method: "POST", body: JSON.stringify({}) });
-        toast("电子面单已取消。");
+        await api(`/api/shipments/${id}/label/cancel`, {
+          method: "POST",
+          body: JSON.stringify({ reason: "订单信息需要修改" }),
+        });
+        toast("面单已由快递100确认取消，可重新加入批量打单。");
         render();
       } catch (error) {
         toast(error.message);

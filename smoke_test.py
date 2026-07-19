@@ -14,13 +14,13 @@ import urllib.request
 import zipfile
 import sqlite3
 from http.cookiejar import CookieJar
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
 from pypdf import PdfReader, PdfWriter
 
 import server
+import label_pdf
 import shipping
 import tracking
 from database import AppError, DEFAULT_PRODUCT_FILE, Database
@@ -269,6 +269,68 @@ def main() -> None:
             "remark": "【睡眠喷雾】基诺山雨林与苔藓*2\n【香包】曼听墨玫瑰*1\n备注：烟测",
         }
         assert "tempId" not in json.loads(order_param)
+        assert order_result["cancel_param"] == {
+            "partnerId": "CAINIAO-ID",
+            "partnerKey": "CAINIAO-KEY",
+            "net": "cainiao",
+            "kuaidicom": "yuantong",
+            "kuaidinum": "YT-SMOKE-BOOKING-001",
+            "orderId": "KD-SMOKE",
+        }
+        original_shipping_urlopen = shipping.urllib.request.urlopen
+        try:
+            shipping.urllib.request.urlopen = fake_label_urlopen
+            cancel_result = shipping.Kuaidi100LabelClient("test-key", "test-label-secret").cancel_label(
+                {
+                    "express_company": "圆通",
+                    "tracking_no": "YT-SMOKE-BOOKING-001",
+                    "label_carrier_order_no": "KD-SMOKE",
+                    "label_cancel_param": order_result["cancel_param"],
+                },
+                {
+                    "partnerId": "CHANGED-ID",
+                    "partnerKey": "CHANGED-KEY",
+                    "net": "cainiao",
+                    "tbNet": "不应进入取消参数",
+                },
+            )
+        finally:
+            shipping.urllib.request.urlopen = original_shipping_urlopen
+        assert cancel_result["success"] is True
+        cancel_form = urllib.parse.parse_qs(shipping_captured["payload"])
+        cancel_param = json.loads(cancel_form["param"][0])
+        assert cancel_form["method"][0] == "cancel"
+        assert cancel_param["partnerId"] == "CAINIAO-ID"
+        assert cancel_param["partnerKey"] == "CAINIAO-KEY"
+        assert cancel_param["kuaidicom"] == "yuantong"
+        assert cancel_param["kuaidinum"] == "YT-SMOKE-BOOKING-001"
+        assert cancel_param["orderId"] == "KD-SMOKE"
+        assert "tbNet" not in cancel_param
+
+        class CancelFailureResponse(FakeLabelResponse):
+            def read(self):
+                return json.dumps(
+                    {"success": False, "code": 30005, "message": "该面单暂不支持取消"},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+
+        original_shipping_urlopen = shipping.urllib.request.urlopen
+        try:
+            shipping.urllib.request.urlopen = lambda _request, timeout=0: CancelFailureResponse()
+            failed_cancel = shipping.Kuaidi100LabelClient("test-key", "test-label-secret").cancel_label(
+                {
+                    "express_company": "圆通",
+                    "tracking_no": "YT-SMOKE-BOOKING-001",
+                    "label_carrier_order_no": "KD-SMOKE",
+                    "label_cancel_param": order_result["cancel_param"],
+                },
+                {},
+            )
+        finally:
+            shipping.urllib.request.urlopen = original_shipping_urlopen
+        assert failed_cancel["success"] is False
+        assert "30005" in failed_cancel["error"]
+        assert "普通圆通" in failed_cancel["error"]
         long_summary = shipping.build_label_item_summary(
             [
                 {"product_category": "睡眠喷雾", "product_name": "（喷雾）基诺山雨林与苔藓", "quantity": 2},
@@ -390,7 +452,7 @@ def main() -> None:
         server.DB.save_label_authorization(
             {"partnerId": "CAINIAO-ID", "partnerKey": "CAINIAO-KEY", "net": "cainiao"}
         )
-        httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        httpd = server.FixedThreadPoolHTTPServer(("127.0.0.1", 0), server.Handler, 4)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -402,7 +464,7 @@ def main() -> None:
         status, body = request(admin, base, "GET", "/api/health")
         assert status == 200, body
         assert body["ok"] is True
-        assert body["products"] == 52
+        assert body["database"] is True
 
         status, body = request(admin, base, "GET", "/login")
         assert status == 200
@@ -413,6 +475,12 @@ def main() -> None:
         status, body = request(admin, base, "POST", "/api/login", {"username": "admin", "password": "scentpool2026"})
         assert status == 200, body
         assert body["user"]["role"] == "admin"
+
+        status, body = request(admin, base, "GET", "/api/admin/system/diagnostics")
+        assert status == 200, body
+        assert body["storage"]["journal_mode"] == "wal"
+        assert body["storage"]["table_counts"]["products"] == 52
+        assert body["process"]["request_thread_limit"] == server.MAX_REQUEST_THREADS
 
         status, body = request(admin, base, "GET", "/api/admin/tracking/config")
         assert status == 200, body
@@ -524,6 +592,13 @@ def main() -> None:
         status, body = request(admin, base, "GET", "/api/shipments?q=ORDER-SMOKE-001")
         assert status == 200, body
         assert len(body["shipments"]) == 1
+        assert "booking_raw" not in body["shipments"][0]
+        assert "booking_salt" not in body["shipments"][0]
+
+        status, body = request(admin, base, "GET", "/api/shipments/summary?q=ORDER-SMOKE-001")
+        assert status == 200, body
+        assert body["counts"]["total"] == 1
+        assert body["counts"]["待处理"] == 1
 
         status, body = request(
             admin,
@@ -614,16 +689,34 @@ def main() -> None:
         assert body["shipments"][0]["tracking_status"] == "等待揽收"
         assert body["shipments"][0]["label_print_status"] == "待打印"
 
-        original_download_label_pdf = server.download_label_pdf
+        original_download_label_pdf = label_pdf.download_label_pdf
+        original_build_batch_label_pdf_file = server.build_batch_label_pdf_file
         try:
-            server.download_label_pdf = lambda _url, _business_id: blank_label_pdf()
-            merged_direct = server.build_batch_label_pdf(
-                [
-                    {"id": 1, "business_id": "PDF-1", "label_url": "https://api.kuaidi100.com/label/1"},
-                    {"id": 2, "business_id": "PDF-2", "label_url": "https://api.kuaidi100.com/label/2"},
-                ]
-            )
-            assert len(PdfReader(io.BytesIO(merged_direct)).pages) == 2
+            def fake_download_label_pdf(_url, _business_id, target, *, max_bytes):
+                payload = blank_label_pdf()
+                assert len(payload) <= max_bytes
+                target.write_bytes(payload)
+                return len(payload)
+
+            def fake_build_batch_label_pdf_file(_shipments, work_dir):
+                target = work_dir / "labels.pdf"
+                target.write_bytes(blank_label_pdf())
+                return target
+
+            label_pdf.download_label_pdf = fake_download_label_pdf
+            server.build_batch_label_pdf_file = fake_build_batch_label_pdf_file
+            with tempfile.TemporaryDirectory() as merge_dir:
+                merged_path = Path(merge_dir) / "merged.pdf"
+                label_pdf.merge_label_pdfs(
+                    [
+                        {"id": 1, "business_id": "PDF-1", "label_urls": ["https://api.kuaidi100.com/label/1"]},
+                        {"id": 2, "business_id": "PDF-2", "label_urls": ["https://api.kuaidi100.com/label/2"]},
+                    ],
+                    merged_path,
+                    max_label_bytes=1024 * 1024,
+                    max_total_bytes=2 * 1024 * 1024,
+                )
+                assert len(PdfReader(str(merged_path)).pages) == 2
             status, merged_pdf, headers = request_full(
                 admin,
                 base,
@@ -632,7 +725,8 @@ def main() -> None:
                 {"shipment_ids": [shipment_id]},
             )
         finally:
-            server.download_label_pdf = original_download_label_pdf
+            label_pdf.download_label_pdf = original_download_label_pdf
+            server.build_batch_label_pdf_file = original_build_batch_label_pdf_file
         assert status == 200
         assert merged_pdf.startswith(b"%PDF")
         assert len(PdfReader(io.BytesIO(merged_pdf)).pages) == 1
@@ -686,6 +780,7 @@ def main() -> None:
         assert body["shipments"][0]["status"] == "已发货"
         assert body["shipments"][0]["label_print_status"] == "打印成功"
         assert body["shipments"][0]["label_url"].endswith("smoke.pdf")
+        first_booking_request_id = body["shipments"][0]["booking_request_id"]
         status, body = request(admin, base, "POST", f"/api/shipments/{shipment_id}/label/printed", {})
         assert status == 200, body
         assert body["shipment"]["label_print_status"] == "打印成功"
@@ -706,6 +801,34 @@ def main() -> None:
             shipping.urllib.request.urlopen = original_shipping_urlopen
         assert status == 200, body
         assert body["shipment"]["status"] == "待处理"
+        assert body["shipment"]["booking_status"] == "已取消"
+        assert body["shipment"]["tracking_no"] == ""
+        assert body["shipment"]["express_company"] == "圆通"
+
+        status, rebook_body = request(
+            admin,
+            base,
+            "POST",
+            "/api/admin/shipping-batches",
+            {
+                "filters": {"q": "ORDER-SMOKE-001", "status": "待处理"},
+                "shipments": [{"id": shipment_id, "express_company": "圆通"}],
+            },
+        )
+        assert status == 202, rebook_body
+        status, body = request(admin, base, "GET", "/api/shipments?q=ORDER-SMOKE-001")
+        assert status == 200, body
+        second_booking_request_id = body["shipments"][0]["booking_request_id"]
+        assert second_booking_request_id != first_booking_request_id
+        assert len(second_booking_request_id) <= 32
+        original_shipping_urlopen = shipping.urllib.request.urlopen
+        try:
+            shipping.urllib.request.urlopen = fake_label_urlopen
+            assert server.process_next_shipping_job() is True
+            status, body = request(admin, base, "POST", f"/api/shipments/{shipment_id}/label/cancel", {})
+        finally:
+            shipping.urllib.request.urlopen = original_shipping_urlopen
+        assert status == 200, body
         assert body["shipment"]["booking_status"] == "已取消"
         assert body["shipment"]["tracking_no"] == ""
 
