@@ -168,6 +168,18 @@ function trackingTraceLines(row) {
   return row.tracking_last_event ? [row.tracking_last_event] : [];
 }
 
+function trackingDetailParts(row) {
+  const traceLines = trackingTraceLines(row);
+  return [
+    ...traceLines.map((line) => `<div>${escapeHtml(line)}</div>`),
+    row.tracking_last_checked_at ? `<div>查询：${escapeHtml(formatDate(row.tracking_last_checked_at))}</div>` : "",
+    row.tracking_signed_at ? `<div>签收：${escapeHtml(formatDate(row.tracking_signed_at))}</div>` : "",
+    row.shipped_at ? `<div>发货：${escapeHtml(formatDate(row.shipped_at))}</div>` : "",
+    row.tracking_error ? `<div class="tracking-error">错误：${escapeHtml(row.tracking_error)}</div>` : "",
+    row.shipping_note ? `<div>备注：${escapeHtml(row.shipping_note)}</div>` : "",
+  ].filter(Boolean);
+}
+
 function shipmentPageState(scope) {
   return scope === "admin" ? state.adminShipmentPage : state.storeShipmentPage;
 }
@@ -280,6 +292,32 @@ function bindTrackingCopyButtons() {
         await copyText(explicitTrackingNo || row?.querySelector("[data-tracking]")?.value || "");
       } catch (error) {
         toast(error.message || "复制失败。");
+      }
+    });
+  });
+}
+
+function bindTrackingDetails() {
+  document.querySelectorAll("[data-tracking-details]").forEach((details) => {
+    details.addEventListener("toggle", async () => {
+      if (!details.open || details.dataset.trackingLoaded === "1" || details.dataset.trackingLoading === "1") {
+        return;
+      }
+      const shipmentId = Number(details.dataset.trackingDetails);
+      const target = details.querySelector("[data-tracking-detail-lines]");
+      if (!Number.isInteger(shipmentId) || shipmentId < 1 || !target) return;
+      details.dataset.trackingLoading = "1";
+      try {
+        const data = await api(`/api/shipments?id=${shipmentId}&include_tracking_raw=1`);
+        const row = (data.shipments || [])[0];
+        if (!row) throw new Error("发货单不存在。");
+        const parts = trackingDetailParts(row);
+        target.innerHTML = parts.length ? parts.join("") : `<div class="muted mini">暂无详细物流轨迹</div>`;
+        details.dataset.trackingLoaded = "1";
+      } catch (error) {
+        target.innerHTML = `<div class="tracking-error">${escapeHtml(error.message || "物流详情加载失败。")}</div>`;
+      } finally {
+        delete details.dataset.trackingLoading;
       }
     });
   });
@@ -737,15 +775,7 @@ function renderTrackingDetailBlock(row, options = {}) {
   const showCopy = Boolean(options.showCopy);
   const company = row.express_company || DEFAULT_EXPRESS_COMPANY;
   const summary = cleanTrackingEvent(row.tracking_last_event) || row.tracking_status || (row.tracking_error ? "物流查询失败" : "物流待查询");
-  const traceLines = trackingTraceLines(row);
-  const detailParts = [
-    ...traceLines.map((line) => `<div>${escapeHtml(line)}</div>`),
-    row.tracking_last_checked_at ? `<div>查询：${escapeHtml(formatDate(row.tracking_last_checked_at))}</div>` : "",
-    row.tracking_signed_at ? `<div>签收：${escapeHtml(formatDate(row.tracking_signed_at))}</div>` : "",
-    row.shipped_at ? `<div>发货：${escapeHtml(formatDate(row.shipped_at))}</div>` : "",
-    row.tracking_error ? `<div class="tracking-error">错误：${escapeHtml(row.tracking_error)}</div>` : "",
-    row.shipping_note ? `<div>备注：${escapeHtml(row.shipping_note)}</div>` : "",
-  ].filter(Boolean);
+  const detailParts = trackingDetailParts(row);
   const statusHtml = row.tracking_status
     ? `<span class="status ${trackingClass(row.tracking_status)}">${escapeHtml(row.tracking_status)}</span>`
     : `<span class="muted mini">物流待查询</span>`;
@@ -761,7 +791,7 @@ function renderTrackingDetailBlock(row, options = {}) {
       </div>
       ${
         detailParts.length
-          ? `<details class="tracking-details"><summary>显示详细物流信息</summary><div class="tracking-detail-lines">${detailParts.join("")}</div></details>`
+          ? `<details class="tracking-details" data-tracking-details="${row.id}" data-tracking-loaded="${row.tracking_raw ? "1" : "0"}"><summary>显示详细物流信息</summary><div class="tracking-detail-lines" data-tracking-detail-lines>${detailParts.join("")}</div></details>`
           : ""
       }
     </div>
@@ -2679,6 +2709,7 @@ function bindProducts() {
 
 function bindCommon() {
   bindTrackingCopyButtons();
+  bindTrackingDetails();
   bindShipmentPagination();
   document.querySelectorAll("[data-route]").forEach((node) => {
     node.addEventListener("click", (event) => {

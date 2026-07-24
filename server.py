@@ -633,11 +633,6 @@ def process_memory_diagnostics() -> Dict[str, Any]:
 class Handler(BaseHTTPRequestHandler):
     server_version = "ScentpoolExpress/1.0"
 
-    def log_message(self, format: str, *args: Any) -> None:
-        if self.path == "/api/health" and args and str(args[0]).startswith("GET /api/health"):
-            return
-        super().log_message(format, *args)
-
     def do_GET(self) -> None:
         self.route()
 
@@ -1235,6 +1230,8 @@ class Handler(BaseHTTPRequestHandler):
             raise AppError("需要总部权限。", 403)
 
     def log_message(self, fmt: str, *args: Any) -> None:
+        if self.path == "/api/health" and args and str(args[0]).startswith("GET /api/health"):
+            return
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
 
 

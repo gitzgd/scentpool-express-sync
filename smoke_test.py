@@ -594,6 +594,7 @@ def main() -> None:
         assert len(body["shipments"]) == 1
         assert "booking_raw" not in body["shipments"][0]
         assert "booking_salt" not in body["shipments"][0]
+        assert "tracking_raw" not in body["shipments"][0]
 
         status, body = request(admin, base, "GET", "/api/shipments/summary?q=ORDER-SMOKE-001")
         assert status == 200, body
@@ -688,6 +689,15 @@ def main() -> None:
         assert status == 200, body
         assert body["shipments"][0]["tracking_status"] == "等待揽收"
         assert body["shipments"][0]["label_print_status"] == "待打印"
+        assert "tracking_raw" not in body["shipments"][0]
+        status, detail_body = request(
+            admin,
+            base,
+            "GET",
+            f"/api/shipments?id={shipment_id}&include_tracking_raw=1",
+        )
+        assert status == 200, detail_body
+        assert detail_body["shipments"][0]["tracking_raw"] == "{}"
 
         original_download_label_pdf = label_pdf.download_label_pdf
         original_build_batch_label_pdf_file = server.build_batch_label_pdf_file

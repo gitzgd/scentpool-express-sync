@@ -1238,6 +1238,10 @@ class Database:
 
     def list_shipments(self, user: Dict[str, Any], filters: Dict[str, Any]) -> List[Dict[str, Any]]:
         where, params = self._shipment_filter_sql(user, filters)
+        include_tracking_raw = (
+            str(filters.get("include_tracking_raw") or "").strip() == "1"
+            and bool(str(filters.get("id") or "").strip())
+        )
 
         sql = "SELECT shipments.* FROM shipments"
         if where:
@@ -1265,6 +1269,8 @@ class Database:
                 f"{item['product_category']} / {item['product_name']} x{item['quantity']}"
                 for item in row["items"]
             )
+            if not include_tracking_raw:
+                row.pop("tracking_raw", None)
             row.pop("booking_raw", None)
             row.pop("booking_salt", None)
             row.pop("booking_poll_token", None)
