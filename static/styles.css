@@ -28,6 +28,27 @@ body {
   line-height: 1.45;
 }
 
+html.app-loading body::before {
+  content: "";
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 100;
+  width: 32%;
+  height: 3px;
+  background: var(--blue);
+  animation: app-loading-slide 0.9s ease-in-out infinite;
+}
+
+@keyframes app-loading-slide {
+  from {
+    transform: translateX(-110%);
+  }
+  to {
+    transform: translateX(420%);
+  }
+}
+
 button,
 input,
 select,

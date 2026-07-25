@@ -92,6 +92,7 @@ def verify_password(password: str, stored: str) -> bool:
 class Database:
     def __init__(self, path: str):
         self.path = path
+        self._shipment_columns: Optional[List[str]] = None
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=15)
@@ -1243,12 +1244,24 @@ class Database:
             and bool(str(filters.get("id") or "").strip())
         )
 
-        sql = "SELECT shipments.* FROM shipments"
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY shipments.created_at DESC, shipments.id DESC"
-
         with self.connect() as conn:
+            if self._shipment_columns is None:
+                self._shipment_columns = [
+                    str(row["name"])
+                    for row in conn.execute("PRAGMA table_info(shipments)").fetchall()
+                ]
+            excluded = {"booking_raw", "booking_salt", "booking_poll_token"}
+            if not include_tracking_raw:
+                excluded.add("tracking_raw")
+            selected_columns = ", ".join(
+                f"shipments.{column}"
+                for column in self._shipment_columns
+                if column not in excluded
+            )
+            sql = f"SELECT {selected_columns} FROM shipments"
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY shipments.created_at DESC, shipments.id DESC"
             rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
             if not rows:
                 return []

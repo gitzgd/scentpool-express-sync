@@ -7,6 +7,7 @@ const state = {
   adminShipmentSummary: { total: 0 },
   storeShipments: [],
   storeShipmentSummary: { total: 0 },
+  storeTodaySummary: { total: 0 },
   returnOrders: [],
   storeReturnOrders: [],
   statuses: ["待处理", "已发货", "已签收", "异常", "已取消"],
@@ -40,6 +41,8 @@ const EXPRESS_COMPANIES = ["圆通", "京东", "顺丰"];
 const DEFAULT_EXPRESS_COMPANY = "圆通";
 const CATEGORY_COLOR_COUNT = 10;
 const SHIPMENT_PAGE_SIZE = 50;
+const pendingGetRequests = new Map();
+let activeDataLoads = 0;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -261,6 +264,24 @@ function toast(message) {
   setTimeout(() => node.remove(), 3200);
 }
 
+async function withButtonBusy(button, busyLabel, operation) {
+  if (!button) return operation();
+  const originalLabel = button.textContent;
+  const wasDisabled = button.disabled;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  button.textContent = busyLabel;
+  try {
+    return await operation();
+  } finally {
+    if (button.isConnected) {
+      button.disabled = wasDisabled;
+      button.removeAttribute("aria-busy");
+      button.textContent = originalLabel;
+    }
+  }
+}
+
 async function copyText(value) {
   const text = String(value || "").trim();
   if (!text) {
@@ -328,19 +349,34 @@ function bindShipmentPagination() {
     node.addEventListener("click", (event) => {
       const scope = event.currentTarget.dataset.shipmentPage;
       setShipmentPage(scope, event.currentTarget.dataset.page);
-      render();
+      render({ refreshData: false });
     });
   });
   document.querySelectorAll("[data-shipment-page-select]").forEach((node) => {
     node.addEventListener("change", (event) => {
       const scope = event.currentTarget.dataset.shipmentPageSelect;
       setShipmentPage(scope, event.currentTarget.value);
-      render();
+      render({ refreshData: false });
     });
   });
 }
 
 async function api(path, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  if (method === "GET" && pendingGetRequests.has(path)) {
+    return pendingGetRequests.get(path);
+  }
+  const request = apiRequest(path, options);
+  if (method !== "GET") return request;
+  pendingGetRequests.set(path, request);
+  try {
+    return await request;
+  } finally {
+    pendingGetRequests.delete(path);
+  }
+}
+
+async function apiRequest(path, options = {}) {
   const headers = options.headers || {};
   if (options.body && !(options.body instanceof FormData)) {
     headers["Content-Type"] = "application/json";
@@ -438,13 +474,14 @@ async function loadShipments() {
   Object.entries(state.adminFilters).forEach(([key, value]) => {
     if (value) params.set(key, value);
   });
-  const data = await api(`/api/shipments?${params.toString()}`);
-  state.shipments = data.shipments || [];
-  state.statuses = data.statuses || state.statuses;
-
   const summaryParams = new URLSearchParams(params);
   summaryParams.delete("status");
-  const summaryData = await api(`/api/shipments/summary?${summaryParams.toString()}`);
+  const [data, summaryData] = await Promise.all([
+    api(`/api/shipments?${params.toString()}`),
+    api(`/api/shipments/summary?${summaryParams.toString()}`),
+  ]);
+  state.shipments = data.shipments || [];
+  state.statuses = data.statuses || state.statuses;
   state.adminShipmentSummary = summaryData.counts || { total: 0 };
 }
 
@@ -478,7 +515,21 @@ function scheduleShippingBatchPoll() {
   if (state.shippingBatchPollTimer) clearTimeout(state.shippingBatchPollTimer);
   const status = state.activeShippingBatch?.batch?.status;
   if (!status || !["排队中", "处理中"].includes(status) || location.pathname !== "/admin") return;
-  state.shippingBatchPollTimer = setTimeout(() => render(), 2500);
+  state.shippingBatchPollTimer = setTimeout(async () => {
+    try {
+      const previousCounts = JSON.stringify(state.activeShippingBatch?.counts || {});
+      const previousStatus = state.activeShippingBatch?.batch?.status || "";
+      await loadActiveShippingBatch();
+      const nextCounts = JSON.stringify(state.activeShippingBatch?.counts || {});
+      const nextStatus = state.activeShippingBatch?.batch?.status || "";
+      if (previousCounts !== nextCounts || previousStatus !== nextStatus) {
+        await loadShipments();
+      }
+      await render({ refreshData: false });
+    } catch (error) {
+      scheduleShippingBatchPoll();
+    }
+  }, 2500);
 }
 
 async function loadStoreShipments() {
@@ -486,13 +537,21 @@ async function loadStoreShipments() {
   Object.entries(state.storeFilters).forEach(([key, value]) => {
     if (value) params.set(key, value);
   });
-  const data = await api(`/api/shipments?${params.toString()}`);
-  state.storeShipments = data.shipments || [];
-  state.statuses = data.statuses || state.statuses;
   const summaryParams = new URLSearchParams(params);
   summaryParams.delete("status");
-  const summaryData = await api(`/api/shipments/summary?${summaryParams.toString()}`);
+  const [data, summaryData] = await Promise.all([
+    api(`/api/shipments?${params.toString()}`),
+    api(`/api/shipments/summary?${summaryParams.toString()}`),
+  ]);
+  state.storeShipments = data.shipments || [];
+  state.statuses = data.statuses || state.statuses;
   state.storeShipmentSummary = summaryData.counts || { total: 0 };
+}
+
+async function loadStoreTodaySummary() {
+  const today = localDate();
+  const data = await api(`/api/shipments/summary?date_from=${today}&date_to=${today}`);
+  state.storeTodaySummary = data.counts || { total: 0 };
 }
 
 async function loadReturnOrders(admin = false) {
@@ -899,13 +958,17 @@ function bindSubmit() {
   });
 }
 
-async function renderStoreBoard() {
-  await ensureProductsGrouped();
-  await loadStoreShipments();
+async function renderStoreBoard({ refreshData = true } = {}) {
+  if (refreshData) {
+    await Promise.all([
+      ensureProductsGrouped(),
+      loadStoreShipments(),
+      loadStoreTodaySummary(),
+    ]);
+  }
   const today = localDate();
   const yesterday = localDate(-1);
-  const todayData = await api(`/api/shipments/summary?date_from=${today}&date_to=${today}`);
-  const todayCounts = todayData.counts || { total: 0 };
+  const todayCounts = state.storeTodaySummary || { total: 0 };
   const counts = state.storeShipmentSummary || { total: 0 };
   const pageData = paginatedShipments(state.storeShipments, "store");
   const content = `
@@ -1075,7 +1138,7 @@ function bindShipmentItemEditor(sourceRows) {
       const row = sourceRows.find((item) => item.id === id);
       state.editingShipmentId = id;
       state.shipmentEditItems = itemsFromProductSnapshots(row?.items || []);
-      render();
+      render({ refreshData: false });
     });
   });
   document.querySelectorAll("[data-edit-item-category]").forEach((node) => {
@@ -1083,14 +1146,14 @@ function bindShipmentItemEditor(sourceRows) {
       const index = Number(event.currentTarget.dataset.editItemCategory);
       state.shipmentEditItems[index].category = event.currentTarget.value;
       state.shipmentEditItems[index].barcode = "";
-      render();
+      render({ refreshData: false });
     });
   });
   document.querySelectorAll("[data-edit-item-product]").forEach((node) => {
     node.addEventListener("change", (event) => {
       const index = Number(event.currentTarget.dataset.editItemProduct);
       state.shipmentEditItems[index].barcode = event.currentTarget.value;
-      render();
+      render({ refreshData: false });
     });
   });
   document.querySelectorAll("[data-edit-item-quantity]").forEach((node) => {
@@ -1103,7 +1166,7 @@ function bindShipmentItemEditor(sourceRows) {
   if (addEditItem) {
     addEditItem.addEventListener("click", () => {
       state.shipmentEditItems.push({ category: "", barcode: "", quantity: 1 });
-      render();
+      render({ refreshData: false });
     });
   }
   document.querySelectorAll("[data-remove-edit-item]").forEach((node) => {
@@ -1111,7 +1174,7 @@ function bindShipmentItemEditor(sourceRows) {
       const index = Number(event.currentTarget.dataset.removeEditItem);
       state.shipmentEditItems.splice(index, 1);
       if (!state.shipmentEditItems.length) state.shipmentEditItems.push({ category: "", barcode: "", quantity: 1 });
-      render();
+      render({ refreshData: false });
     });
   });
   const cancelEditItems = document.querySelector("[data-cancel-edit-items]");
@@ -1119,7 +1182,7 @@ function bindShipmentItemEditor(sourceRows) {
     cancelEditItems.addEventListener("click", () => {
       state.editingShipmentId = null;
       state.shipmentEditItems = [];
-      render();
+      render({ refreshData: false });
     });
   }
   document.querySelectorAll("[data-save-edit-items]").forEach((node) => {
@@ -1656,12 +1719,16 @@ function renderShippingBatchProgress() {
   `;
 }
 
-async function renderAdmin() {
-  await ensureProductsGrouped();
-  await loadStores();
-  await loadShipments();
-  await loadShippingSettings();
-  await loadActiveShippingBatch();
+async function renderAdmin({ refreshData = true } = {}) {
+  if (refreshData) {
+    await Promise.all([
+      ensureProductsGrouped(),
+      loadStores(),
+      loadShipments(),
+      loadShippingSettings(),
+      loadActiveShippingBatch(),
+    ]);
+  }
   const today = localDate();
   const yesterday = localDate(-1);
   const exportParams = new URLSearchParams();
@@ -1916,12 +1983,12 @@ function bindAdmin() {
   document.getElementById("openBatchPrint")?.addEventListener("click", () => {
     state.batchPrintSelectedIds = batchPrintableShipments().map((row) => Number(row.id));
     state.batchPrintOpen = true;
-    render();
+    render({ refreshData: false });
   });
   document.getElementById("closeBatchPrint")?.addEventListener("click", () => {
     state.batchPrintOpen = false;
     state.batchPrintSelectedIds = [];
-    render();
+    render({ refreshData: false });
   });
   const updateBatchPrintSelection = () => {
     const selected = Array.from(document.querySelectorAll("[data-batch-print-select]:checked"))
@@ -1997,7 +2064,7 @@ function bindAdmin() {
   });
   const previewButton = document.getElementById("previewShippingBatch");
   if (previewButton) {
-    previewButton.addEventListener("click", async () => {
+    previewButton.addEventListener("click", async (event) => {
       try {
         state.batchFilters = {
           store_id: state.adminFilters.store_id,
@@ -2006,8 +2073,8 @@ function bindAdmin() {
           date_to: state.adminFilters.date_to,
           q: state.adminFilters.q,
         };
-        await loadShippingBatchPreview(state.batchFilters);
-        render();
+        await withButtonBusy(event.currentTarget, "正在加载…", () => loadShippingBatchPreview(state.batchFilters));
+        render({ refreshData: false });
       } catch (error) {
         toast(error.message);
       }
@@ -2016,7 +2083,7 @@ function bindAdmin() {
   document.getElementById("closeBatchPreview")?.addEventListener("click", () => {
     state.batchPreview = null;
     state.batchSelectedIds = [];
-    render();
+    render({ refreshData: false });
   });
   const updateBatchSelection = () => {
     const selected = Array.from(document.querySelectorAll("[data-batch-select]:checked")).map((node) => Number(node.value));
@@ -2048,7 +2115,7 @@ function bindAdmin() {
     };
     try {
       await loadShippingBatchPreview(state.batchFilters);
-      render();
+      render({ refreshData: false });
     } catch (error) {
       toast(error.message);
     }
@@ -2057,7 +2124,7 @@ function bindAdmin() {
     state.batchFilters = { store_id: "", status: "待处理", date_from: "", date_to: "", q: "" };
     try {
       await loadShippingBatchPreview(state.batchFilters);
-      render();
+      render({ refreshData: false });
     } catch (error) {
       toast(error.message);
     }
@@ -2091,7 +2158,7 @@ function bindAdmin() {
       state.activeShippingBatch = data;
       sessionStorage.setItem("scentpool_shipping_batch_id", String(data.batch.id));
       toast("电子面单任务已创建。即使关闭页面，后台也会继续处理。");
-      render();
+      render({ refreshData: false });
     } catch (error) {
       toast(error.message);
     }
@@ -2102,7 +2169,7 @@ function bindAdmin() {
     try {
       state.activeShippingBatch = await api(`/api/admin/shipping-batches/${batchId}/retry`, { method: "POST", body: JSON.stringify({}) });
       toast("失败订单已重新加入队列。");
-      render();
+      render({ refreshData: false });
     } catch (error) {
       toast(error.message);
     }
@@ -2110,7 +2177,7 @@ function bindAdmin() {
   document.getElementById("closeShippingBatch")?.addEventListener("click", () => {
     state.activeShippingBatch = null;
     sessionStorage.removeItem("scentpool_shipping_batch_id");
-    render();
+    render({ refreshData: false });
   });
   document.querySelectorAll("[data-admin-preset]").forEach((node) => {
     node.addEventListener("click", (event) => {
@@ -2141,12 +2208,14 @@ function bindAdmin() {
     state.adminShipmentPage = 1;
     render();
   });
-  document.getElementById("syncTracking").addEventListener("click", async () => {
+  document.getElementById("syncTracking").addEventListener("click", async (event) => {
     try {
-      const data = await api("/api/admin/tracking/sync", {
-        method: "POST",
-        body: JSON.stringify({ force: true, limit: 0 }),
-      });
+      const data = await withButtonBusy(event.currentTarget, "同步中…", () =>
+        api("/api/admin/tracking/sync", {
+          method: "POST",
+          body: JSON.stringify({ force: true, limit: 0 }),
+        })
+      );
       const result = data.result || {};
       const skipped = result.skipped_recent || 0;
       const failed = result.errors || 0;
@@ -2159,20 +2228,22 @@ function bindAdmin() {
   document.querySelectorAll("[data-edit-shipping]").forEach((node) => {
     node.addEventListener("click", (event) => {
       state.editingShipmentShippingId = Number(event.currentTarget.dataset.editShipping);
-      render();
+      render({ refreshData: false });
     });
   });
   document.querySelectorAll("[data-cancel-shipping]").forEach((node) => {
     node.addEventListener("click", () => {
       state.editingShipmentShippingId = null;
-      render();
+      render({ refreshData: false });
     });
   });
   document.querySelectorAll("[data-refresh-tracking]").forEach((node) => {
     node.addEventListener("click", async (event) => {
       const id = event.currentTarget.dataset.refreshTracking;
       try {
-        await api(`/api/shipments/${id}/tracking/refresh`, { method: "POST", body: JSON.stringify({}) });
+        await withButtonBusy(event.currentTarget, "查询中…", () =>
+          api(`/api/shipments/${id}/tracking/refresh`, { method: "POST", body: JSON.stringify({}) })
+        );
         toast("物流已刷新。");
         render();
       } catch (error) {
@@ -2185,10 +2256,12 @@ function bindAdmin() {
       const id = event.currentTarget.dataset.cancelLabel;
       if (!confirm("确认取消并回收这张电子面单？快递100与快递公司确认成功后，订单会恢复为待处理，并可重新下单生成新面单。")) return;
       try {
-        await api(`/api/shipments/${id}/label/cancel`, {
-          method: "POST",
-          body: JSON.stringify({ reason: "订单信息需要修改" }),
-        });
+        await withButtonBusy(event.currentTarget, "取消中…", () =>
+          api(`/api/shipments/${id}/label/cancel`, {
+            method: "POST",
+            body: JSON.stringify({ reason: "订单信息需要修改" }),
+          })
+        );
         toast("面单已由快递100确认取消，可重新加入批量打单。");
         render();
       } catch (error) {
@@ -2238,7 +2311,9 @@ function bindAdmin() {
         shipping_note: row.querySelector("[data-note]").value,
       };
       try {
-        await api(`/api/shipments/${id}`, { method: "PATCH", body: JSON.stringify(payload) });
+        await withButtonBusy(event.currentTarget, "保存中…", () =>
+          api(`/api/shipments/${id}`, { method: "PATCH", body: JSON.stringify(payload) })
+        );
         state.editingShipmentShippingId = null;
         toast("已保存。");
         render();
@@ -2526,8 +2601,8 @@ function bindStores() {
   });
 }
 
-async function renderProducts() {
-  await loadProductsAll();
+async function renderProducts({ refreshData = true } = {}) {
+  if (refreshData) await loadProductsAll();
   const categoriesAll = [...new Set(state.productsAll.map((product) => product.category))].sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
   const filtered = state.productsAll.filter((product) => {
     const q = state.productFilters.q.trim();
@@ -2652,7 +2727,7 @@ function bindProducts() {
       state.productsGrouped = null;
       event.currentTarget.reset();
       toast("商品已保存。");
-      render();
+      render({ refreshData: false });
     } catch (error) {
       toast(error.message);
     }
@@ -2662,11 +2737,11 @@ function bindProducts() {
       category: document.getElementById("productCategory").value,
       q: document.getElementById("productSearch").value.trim(),
     };
-    render();
+    render({ refreshData: false });
   });
   document.getElementById("resetProductFilters").addEventListener("click", () => {
     state.productFilters = { category: "", q: "" };
-    render();
+    render({ refreshData: false });
   });
   document.getElementById("importProducts").addEventListener("click", async () => {
     const file = document.getElementById("productFile").files[0];
@@ -2684,7 +2759,7 @@ function bindProducts() {
       state.productsAll = data.products || [];
       state.productsGrouped = null;
       toast(`已刷新 ${data.result.imported} 个商品。`);
-      render();
+      render({ refreshData: false });
     } catch (error) {
       toast(error.message);
     }
@@ -2699,7 +2774,7 @@ function bindProducts() {
         state.productsAll = data.products || [];
         state.productsGrouped = null;
         toast("商品已删除。");
-        render();
+        render({ refreshData: false });
       } catch (error) {
         toast(error.message);
       }
@@ -2727,14 +2802,23 @@ function bindCommon() {
   }
 }
 
-async function render() {
+async function render({ refreshData = true } = {}) {
   const path = location.pathname;
+  const showsLoading = refreshData && path !== "/login";
+  if (showsLoading) {
+    activeDataLoads += 1;
+    document.documentElement.classList.add("app-loading");
+  }
   if (!state.user && path !== "/login") {
     await loadMe();
   }
   if (!state.user && path !== "/login") {
     history.replaceState({}, "", "/login");
     renderLogin();
+    if (showsLoading) {
+      activeDataLoads = Math.max(0, activeDataLoads - 1);
+      if (!activeDataLoads) document.documentElement.classList.remove("app-loading");
+    }
     return;
   }
   if (state.user && (path === "/" || path === "/login")) {
@@ -2747,19 +2831,19 @@ async function render() {
     } else if (location.pathname === "/submit") {
       await renderSubmit();
     } else if (location.pathname === "/shipments" && state.user.role === "staff") {
-      await renderStoreBoard();
+      await renderStoreBoard({ refreshData });
     } else if (location.pathname === "/returns/new" && state.user.role === "staff") {
       await renderReturnNew();
     } else if (location.pathname === "/returns" && state.user.role === "staff") {
       await renderReturnBoard(false);
     } else if (location.pathname === "/admin" && state.user.role === "admin") {
-      await renderAdmin();
+      await renderAdmin({ refreshData });
     } else if (location.pathname === "/admin/returns" && state.user.role === "admin") {
       await renderReturnBoard(true);
     } else if (location.pathname === "/admin/stores" && state.user.role === "admin") {
       await renderStores();
     } else if (location.pathname === "/admin/products" && state.user.role === "admin") {
-      await renderProducts();
+      await renderProducts({ refreshData });
     } else if (location.pathname === "/admin/shipping" && state.user.role === "admin") {
       await renderShippingSettings();
     } else {
@@ -2768,6 +2852,11 @@ async function render() {
   } catch (error) {
     document.getElementById("app").innerHTML = shell(`<section class="panel panel-pad"><div class="empty">${escapeHtml(error.message)}</div></section>`);
     bindCommon();
+  } finally {
+    if (showsLoading) {
+      activeDataLoads = Math.max(0, activeDataLoads - 1);
+      if (!activeDataLoads) document.documentElement.classList.remove("app-loading");
+    }
   }
 }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import hashlib
 import io
 import json
@@ -698,6 +699,17 @@ def main() -> None:
         )
         assert status == 200, detail_body
         assert detail_body["shipments"][0]["tracking_raw"] == "{}"
+        compressed_request = urllib.request.Request(
+            base + "/api/shipments",
+            method="GET",
+            headers={"Accept-Encoding": "gzip"},
+        )
+        with admin.open(compressed_request, timeout=5) as response:
+            compressed_body = response.read()
+            assert response.headers.get("Content-Encoding") == "gzip"
+            assert response.headers.get("Server-Timing", "").startswith("app;dur=")
+            compressed_json = json.loads(gzip.decompress(compressed_body).decode("utf-8"))
+            assert compressed_json["shipments"]
 
         original_download_label_pdf = label_pdf.download_label_pdf
         original_build_batch_label_pdf_file = server.build_batch_label_pdf_file

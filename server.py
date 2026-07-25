@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import io
 import json
 import mimetypes
@@ -58,6 +59,7 @@ MAX_LABEL_PDF_BYTES = 10 * 1024 * 1024
 MAX_BATCH_PDF_BYTES = 60 * 1024 * 1024
 MAX_REQUEST_THREADS = bounded_env_int("SCENTPOOL_MAX_REQUEST_THREADS", 8, 2, 16)
 LABEL_MERGE_TIMEOUT_SECONDS = bounded_env_int("SCENTPOOL_LABEL_MERGE_TIMEOUT_SECONDS", 600, 60, 1200)
+SLOW_REQUEST_MILLISECONDS = bounded_env_int("SCENTPOOL_SLOW_REQUEST_MILLISECONDS", 1000, 250, 10000)
 TRACKING_SYNC_LOCK = threading.Lock()
 RETURN_TRACKING_SYNC_LOCK = threading.Lock()
 
@@ -653,6 +655,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def route(self) -> None:
+        started_at = time.perf_counter()
+        self._request_started_at = started_at
+        path = urlparse(self.path).path
         try:
             parsed = urlparse(self.path)
             path = parsed.path
@@ -672,6 +677,10 @@ class Handler(BaseHTTPRequestHandler):
             self.error_json(exc.message, exc.status, exc.details)
         except Exception as exc:  # pragma: no cover - final safety net for local prototype
             self.error_json(f"服务器错误：{exc}", 500)
+        finally:
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            if path.startswith("/api/") and path != "/api/health" and elapsed_ms >= SLOW_REQUEST_MILLISECONDS:
+                print(f"[slow-request] {self.command} {path} {elapsed_ms:.0f}ms")
 
     def route_api(self, path: str, query: Dict[str, str]) -> None:
         if path == "/api/health" and self.command == "GET":
@@ -1068,25 +1077,45 @@ class Handler(BaseHTTPRequestHandler):
         content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
         if content_type.startswith("text/") or content_type in {"application/javascript"}:
             content_type += "; charset=utf-8"
-        self.serve_file(file_path, content_type)
+        self.serve_file(file_path, content_type, cache_control="public, max-age=300")
 
-    def serve_file(self, path: Path, content_type: str) -> None:
+    def serve_file(self, path: Path, content_type: str, *, cache_control: str = "no-cache") -> None:
         data = path.read_bytes()
+        data, content_encoding = self.compressible_payload(data, content_type)
         self.send_response(200)
         self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", cache_control)
+        if content_encoding:
+            self.send_header("Content-Encoding", content_encoding)
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
     def send_json(self, data: Any, status: int = 200, headers: Optional[Dict[str, str]] = None) -> None:
         payload = json_bytes(data)
+        payload, content_encoding = self.compressible_payload(payload, "application/json")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        if content_encoding:
+            self.send_header("Content-Encoding", content_encoding)
+            self.send_header("Vary", "Accept-Encoding")
+        started_at = getattr(self, "_request_started_at", None)
+        if started_at is not None:
+            self.send_header("Server-Timing", f"app;dur={(time.perf_counter() - started_at) * 1000:.1f}")
         self.send_header("Content-Length", str(len(payload)))
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
         self.wfile.write(payload)
+
+    def compressible_payload(self, payload: bytes, content_type: str) -> tuple[bytes, str]:
+        accepts_gzip = "gzip" in str(self.headers.get("Accept-Encoding") or "").lower()
+        is_compressible = content_type.startswith("text/") or content_type.startswith("application/json") or "javascript" in content_type
+        if not accepts_gzip or not is_compressible or len(payload) < 1024:
+            return payload, ""
+        return gzip.compress(payload, compresslevel=5), "gzip"
 
     def send_csv(self, shipments: Any, filename: str) -> None:
         stream = io.StringIO()
