@@ -60,6 +60,17 @@ button {
   border: 0;
 }
 
+button,
+a,
+summary {
+  touch-action: manipulation;
+}
+
+:where(button, a, input, select, textarea, summary):focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
 a {
   color: inherit;
   text-decoration: none;
@@ -495,17 +506,31 @@ a {
 .store-remark-editor {
   display: grid;
   gap: 8px;
-  min-width: 190px;
+  width: 100%;
+  min-width: 0;
 }
 
 .store-remark-editor textarea {
+  width: 100%;
+  min-width: 0;
   resize: vertical;
 }
 
 .admin-order-cell {
   display: grid;
   gap: 7px;
-  min-width: 140px;
+  align-content: start;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.admin-order-cell .btn {
+  width: auto;
+  max-width: 100%;
+  justify-self: start;
+  white-space: normal;
 }
 
 .summary-list {
@@ -590,7 +615,7 @@ table {
 
 .shipments-table table {
   table-layout: fixed;
-  min-width: 1120px;
+  min-width: 1280px;
 }
 
 .store-shipments-table table {
@@ -603,39 +628,39 @@ table {
 }
 
 .shipments-table .col-business {
-  width: 130px;
+  width: 148px;
 }
 
 .shipments-table .col-created {
-  width: 92px;
+  width: 88px;
 }
 
 .shipments-table .col-store {
-  width: 90px;
+  width: 88px;
 }
 
 .shipments-table .col-order {
-  width: 105px;
+  width: 138px;
 }
 
 .shipments-table .col-recipient {
-  width: 160px;
+  width: 174px;
 }
 
 .shipments-table .col-items {
-  width: 190px;
+  width: 184px;
 }
 
 .shipments-table .col-status {
-  width: 108px;
+  width: 98px;
 }
 
 .shipments-table .col-shipping {
-  width: 220px;
+  width: 216px;
 }
 
 .shipments-table .col-actions {
-  width: 102px;
+  width: 94px;
 }
 
 .store-shipments-table th:nth-child(1),
@@ -681,6 +706,11 @@ td {
   vertical-align: top;
   font-size: 13px;
   overflow-wrap: anywhere;
+}
+
+.shipments-table td {
+  min-width: 0;
+  overflow: hidden;
 }
 
 th {
@@ -736,11 +766,55 @@ tr:last-child td {
 }
 
 .business-id {
-  display: inline-block;
+  display: block;
+  width: 100%;
+  max-width: 100%;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 12px;
   line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.sequence-cell,
+.created-cell {
+  font-variant-numeric: tabular-nums;
+}
+
+.order-number {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.order-remark {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.recipient-cell {
+  min-width: 0;
+}
+
+.recipient-name,
+.recipient-phone,
+.recipient-address {
+  display: block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.recipient-phone {
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+
+.recipient-address {
+  margin-top: 2px;
 }
 
 .status-cell {
@@ -1274,5 +1348,16 @@ tr:last-child td {
   .user-strip {
     width: 100%;
     justify-content: space-between;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

@@ -260,6 +260,9 @@ function toast(message) {
   if (existing) existing.remove();
   const node = document.createElement("div");
   node.className = "toast";
+  node.setAttribute("role", "status");
+  node.setAttribute("aria-live", "polite");
+  node.setAttribute("aria-atomic", "true");
   node.textContent = message;
   document.body.appendChild(node);
   setTimeout(() => node.remove(), 3200);
@@ -1956,7 +1959,7 @@ function renderAdminShipmentOrderCell(row) {
   if (editable && state.editingShipmentRemarkId === row.id) {
     return `
       <div class="admin-order-cell">
-        <strong>${escapeHtml(row.store_order_no)}</strong>
+        <strong class="order-number" translate="no">${escapeHtml(row.store_order_no)}</strong>
         <div class="store-remark-editor">
           <textarea class="table-input" data-admin-remark maxlength="500" rows="3" aria-label="订单备注">${escapeHtml(row.remark || "")}</textarea>
           <div class="inline-actions">
@@ -1969,8 +1972,8 @@ function renderAdminShipmentOrderCell(row) {
   }
   return `
     <div class="admin-order-cell">
-      <strong>${escapeHtml(row.store_order_no)}</strong>
-      ${row.remark ? `<div class="muted mini">${escapeHtml(row.remark)}</div>` : `<div class="muted mini">无备注</div>`}
+      <strong class="order-number" translate="no">${escapeHtml(row.store_order_no)}</strong>
+      ${row.remark ? `<div class="muted mini order-remark">${escapeHtml(row.remark)}</div>` : `<div class="muted mini">无备注</div>`}
       ${editable ? `<button class="btn secondary small" data-edit-admin-remark="${row.id}" type="button">修改备注</button>` : ""}
     </div>
   `;
@@ -2039,17 +2042,17 @@ function renderShipmentTable(shipments) {
             .map(
               (row) => `
                 <tr class="shipment-row ${statusClass(row.status)}" data-shipment="${row.id}">
-                  <td>${row.id}</td>
+                  <td class="sequence-cell">${row.id}</td>
                   <td class="business-cell">
-                    <strong class="business-id">${escapeHtml(shipmentBusinessId(row))}</strong>
+                    <strong class="business-id" translate="no">${escapeHtml(shipmentBusinessId(row))}</strong>
                   </td>
-                  <td>${escapeHtml(formatDate(row.created_at))}</td>
-                  <td>${escapeHtml(row.store_name_snapshot)}</td>
+                  <td class="created-cell">${escapeHtml(formatDate(row.created_at))}</td>
+                  <td class="store-cell">${escapeHtml(row.store_name_snapshot)}</td>
                   <td>${renderAdminShipmentOrderCell(row)}</td>
-                  <td>
-                    <strong>${escapeHtml(row.recipient_name)}</strong><br />
-                    <span class="muted">${escapeHtml(row.phone)}</span><br />
-                    <span>${escapeHtml(row.address)}</span>
+                  <td class="recipient-cell">
+                    <strong class="recipient-name">${escapeHtml(row.recipient_name)}</strong>
+                    <span class="muted recipient-phone" translate="no">${escapeHtml(row.phone)}</span>
+                    <span class="recipient-address">${escapeHtml(row.address)}</span>
 	                  </td>
 	                  <td class="items-cell">
 	                    ${renderShipmentItemsWithEditButton(row)}
