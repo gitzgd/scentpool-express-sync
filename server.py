@@ -1020,6 +1020,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"shipment": shipment})
             return
 
+        if path.startswith("/api/shipments/") and path.endswith("/remark") and self.command == "PATCH":
+            shipment_id = int(path.split("/")[3])
+            shipment = DB.update_shipment_remark(shipment_id, user, self.read_json())
+            self.send_json({"shipment": shipment})
+            return
+
         if path.startswith("/api/shipments/") and self.command == "PATCH":
             self.require_admin(user)
             shipment_id = int(path.rsplit("/", 1)[-1])
@@ -1032,9 +1038,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path.startswith("/api/shipments/") and self.command == "DELETE":
-            self.require_admin(user)
             shipment_id = int(path.rsplit("/", 1)[-1])
-            self.send_json({"shipment": DB.delete_shipment(shipment_id)})
+            self.send_json({"shipment": DB.delete_shipment(shipment_id, user)})
             return
 
         if path == "/api/returns" and self.command == "POST":

@@ -488,6 +488,26 @@ a {
   gap: 8px;
 }
 
+.store-order-actions {
+  margin-top: 10px;
+}
+
+.store-remark-editor {
+  display: grid;
+  gap: 8px;
+  min-width: 190px;
+}
+
+.store-remark-editor textarea {
+  resize: vertical;
+}
+
+.admin-order-cell {
+  display: grid;
+  gap: 7px;
+  min-width: 140px;
+}
+
 .summary-list {
   display: grid;
   gap: 10px;

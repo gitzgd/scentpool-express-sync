@@ -1132,6 +1132,31 @@ class Database:
             conn.execute("UPDATE shipments SET updated_at = ? WHERE id = ?", (now, shipment_id))
         return self.get_shipment(shipment_id, user)
 
+    def update_shipment_remark(self, shipment_id: int, user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+        remark = str(payload.get("remark") or "").strip()
+        if len(remark) > 500:
+            raise AppError("订单备注不能超过 500 个字符。")
+
+        now = now_text()
+        with self.connect() as conn:
+            shipment = conn.execute(
+                "SELECT store_id, status, booking_status FROM shipments WHERE id = ?",
+                (shipment_id,),
+            ).fetchone()
+            if not shipment:
+                raise AppError("发货单不存在。", 404)
+            if user.get("role") == "staff" and shipment["store_id"] != user.get("store_id"):
+                raise AppError("无权编辑这个发货单。", 403)
+            if shipment["status"] != "待处理":
+                raise AppError("只有尚未发货的待处理订单可以修改备注。", 409)
+            if shipment["booking_status"] not in BOOKING_EDITABLE_STATUSES:
+                raise AppError("快递下单处理中。如需修改，请先取消快递下单。", 409)
+            conn.execute(
+                "UPDATE shipments SET remark = ?, updated_at = ? WHERE id = ?",
+                (remark, now, shipment_id),
+            )
+        return self.get_shipment(shipment_id, user)
+
     def _shipment_filter_sql(
         self,
         user: Dict[str, Any],
@@ -2179,11 +2204,18 @@ class Database:
             "should_refresh_tracking": tracking_reset,
         }
 
-    def delete_shipment(self, shipment_id: int) -> Dict[str, Any]:
+    def delete_shipment(self, shipment_id: int, user: Dict[str, Any]) -> Dict[str, Any]:
         with self.connect() as conn:
-            shipment = conn.execute("SELECT booking_status FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
+            shipment = conn.execute(
+                "SELECT store_id, status, booking_status FROM shipments WHERE id = ?",
+                (shipment_id,),
+            ).fetchone()
             if not shipment:
                 raise AppError("发货单不存在。", 404)
+            if user.get("role") == "staff" and shipment["store_id"] != user.get("store_id"):
+                raise AppError("无权删除这个发货单。", 403)
+            if shipment["status"] != "待处理":
+                raise AppError("只有尚未发货的待处理订单可以删除。", 409)
             if shipment["booking_status"] not in BOOKING_EDITABLE_STATUSES:
                 raise AppError("快递下单处理中，不能直接删除。请先取消快递下单。", 409)
             cursor = conn.execute("DELETE FROM shipments WHERE id = ?", (shipment_id,))

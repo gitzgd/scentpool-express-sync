@@ -24,6 +24,7 @@ const state = {
   storeReturnFilters: { status: "", date_from: "", date_to: "", q: "" },
   productFilters: { category: "", q: "" },
   editingShipmentId: null,
+  editingShipmentRemarkId: null,
   editingShipmentShippingId: null,
   shipmentEditItems: [],
   shippingSettings: null,
@@ -1047,11 +1048,8 @@ function renderStoreBoardTable(shipments) {
 	                    ${renderShipmentItemsWithEditButton(row)}
 	                  </td>
 	                  <td><span class="status ${statusClass(row.status)}">${escapeHtml(row.status)}</span></td>
-	                  <td>${renderTrackingInfo(row, { showCopy: true })}</td>
-                  <td>
-                    ${row.remark ? `<div>${escapeHtml(row.remark)}</div>` : `<span class="muted">无</span>`}
-                    ${row.shipping_note ? `<div class="muted mini">总部：${escapeHtml(row.shipping_note)}</div>` : ""}
-	                  </td>
+                  <td>${renderTrackingInfo(row, { showCopy: true })}</td>
+                  <td>${renderStoreShipmentRemark(row)}</td>
 	                </tr>
 	                ${renderShipmentEditRow(row, 7)}
 	              `
@@ -1060,6 +1058,33 @@ function renderStoreBoardTable(shipments) {
         </tbody>
       </table>
     </div>
+  `;
+}
+
+function renderStoreShipmentRemark(row) {
+  const editable = row.status === "待处理" && bookingEditable(row);
+  if (editable && state.editingShipmentRemarkId === row.id) {
+    return `
+      <div class="store-remark-editor">
+        <textarea class="table-input" data-store-remark maxlength="500" rows="3" aria-label="订单备注">${escapeHtml(row.remark || "")}</textarea>
+        <div class="inline-actions">
+          <button class="btn primary small" data-save-store-remark="${row.id}" type="button">保存备注</button>
+          <button class="btn ghost small" data-cancel-store-remark type="button">取消</button>
+        </div>
+      </div>
+    `;
+  }
+  return `
+    ${row.remark ? `<div>${escapeHtml(row.remark)}</div>` : `<span class="muted">无</span>`}
+    ${row.shipping_note ? `<div class="muted mini">总部：${escapeHtml(row.shipping_note)}</div>` : ""}
+    ${
+      editable
+        ? `<div class="inline-actions store-order-actions">
+            <button class="btn secondary small" data-edit-store-remark="${row.id}" type="button">修改备注</button>
+            <button class="btn danger small" data-delete-store-shipment="${row.id}" data-order-no="${escapeHtml(row.store_order_no)}" type="button">删除整单</button>
+          </div>`
+        : ""
+    }
   `;
 }
 
@@ -1232,6 +1257,54 @@ function bindStoreBoard() {
     state.storeFilters = { status: "", date_from: "", date_to: "", q: "" };
     state.storeShipmentPage = 1;
     render();
+  });
+  document.querySelectorAll("[data-edit-store-remark]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      state.editingShipmentRemarkId = Number(event.currentTarget.dataset.editStoreRemark);
+      render({ refreshData: false });
+    });
+  });
+  document.querySelectorAll("[data-cancel-store-remark]").forEach((node) => {
+    node.addEventListener("click", () => {
+      state.editingShipmentRemarkId = null;
+      render({ refreshData: false });
+    });
+  });
+  document.querySelectorAll("[data-save-store-remark]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const id = event.currentTarget.dataset.saveStoreRemark;
+      const remark = event.currentTarget.closest(".store-remark-editor")?.querySelector("[data-store-remark]")?.value || "";
+      try {
+        await withButtonBusy(event.currentTarget, "保存中…", () =>
+          api(`/api/shipments/${id}/remark`, {
+            method: "PATCH",
+            body: JSON.stringify({ remark }),
+          })
+        );
+        state.editingShipmentRemarkId = null;
+        toast("订单备注已更新。");
+        render();
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+  });
+  document.querySelectorAll("[data-delete-store-shipment]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const id = event.currentTarget.dataset.deleteStoreShipment;
+      const orderNo = event.currentTarget.dataset.orderNo || id;
+      if (!confirm(`确认删除未发货订单 ${orderNo}？商品明细和整张订单都会删除，且无法恢复。`)) return;
+      try {
+        await withButtonBusy(event.currentTarget, "删除中…", () =>
+          api(`/api/shipments/${id}`, { method: "DELETE" })
+        );
+        state.editingShipmentRemarkId = null;
+        toast("未发货订单已删除。");
+        render();
+      } catch (error) {
+        toast(error.message);
+      }
+    });
   });
   bindShipmentItemEditor(state.storeShipments);
 }
@@ -1878,6 +1951,31 @@ function renderAdminShipmentShippingCell(row) {
   `;
 }
 
+function renderAdminShipmentOrderCell(row) {
+  const editable = row.status === "待处理" && bookingEditable(row);
+  if (editable && state.editingShipmentRemarkId === row.id) {
+    return `
+      <div class="admin-order-cell">
+        <strong>${escapeHtml(row.store_order_no)}</strong>
+        <div class="store-remark-editor">
+          <textarea class="table-input" data-admin-remark maxlength="500" rows="3" aria-label="订单备注">${escapeHtml(row.remark || "")}</textarea>
+          <div class="inline-actions">
+            <button class="btn primary small" data-save-admin-remark="${row.id}" type="button">保存备注</button>
+            <button class="btn ghost small" data-cancel-admin-remark type="button">取消</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+  return `
+    <div class="admin-order-cell">
+      <strong>${escapeHtml(row.store_order_no)}</strong>
+      ${row.remark ? `<div class="muted mini">${escapeHtml(row.remark)}</div>` : `<div class="muted mini">无备注</div>`}
+      ${editable ? `<button class="btn secondary small" data-edit-admin-remark="${row.id}" type="button">修改备注</button>` : ""}
+    </div>
+  `;
+}
+
 function renderShipmentActions(row) {
   const editing = shipmentShippingEditing(row);
   const shippedAt = row.shipped_at ? `<div class="muted mini action-time">${escapeHtml(formatDate(row.shipped_at))}</div>` : "";
@@ -1899,7 +1997,7 @@ function renderShipmentActions(row) {
       <div class="shipment-actions">
         <button class="btn primary small" data-save-shipment="${row.id}" type="button">保存</button>
         ${row.tracking_no ? `<button class="btn ghost small" data-cancel-shipping="${row.id}" type="button">取消</button>` : ""}
-        <button class="btn danger small" data-delete-shipment="${row.id}" data-order-no="${escapeHtml(row.store_order_no)}" type="button">删除</button>
+        ${row.status === "待处理" ? `<button class="btn danger small" data-delete-shipment="${row.id}" data-order-no="${escapeHtml(row.store_order_no)}" type="button">删除整单</button>` : ""}
         ${shippedAt}
       </div>
     `;
@@ -1908,7 +2006,7 @@ function renderShipmentActions(row) {
     <div class="shipment-actions">
       <button class="btn secondary small" data-edit-shipping="${row.id}" type="button">编辑</button>
       ${row.tracking_no ? `<button class="btn secondary small" data-refresh-tracking="${row.id}" type="button">查物流</button>` : ""}
-      <button class="btn danger small" data-delete-shipment="${row.id}" data-order-no="${escapeHtml(row.store_order_no)}" type="button">删除</button>
+      ${row.status === "待处理" ? `<button class="btn danger small" data-delete-shipment="${row.id}" data-order-no="${escapeHtml(row.store_order_no)}" type="button">删除整单</button>` : ""}
       ${shippedAt}
     </div>
   `;
@@ -1947,10 +2045,7 @@ function renderShipmentTable(shipments) {
                   </td>
                   <td>${escapeHtml(formatDate(row.created_at))}</td>
                   <td>${escapeHtml(row.store_name_snapshot)}</td>
-                  <td>
-                    <strong>${escapeHtml(row.store_order_no)}</strong>
-                    ${row.remark ? `<div class="muted mini">${escapeHtml(row.remark)}</div>` : ""}
-                  </td>
+                  <td>${renderAdminShipmentOrderCell(row)}</td>
                   <td>
                     <strong>${escapeHtml(row.recipient_name)}</strong><br />
                     <span class="muted">${escapeHtml(row.phone)}</span><br />
@@ -2322,14 +2417,48 @@ function bindAdmin() {
       }
     });
   });
+  document.querySelectorAll("[data-edit-admin-remark]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      state.editingShipmentRemarkId = Number(event.currentTarget.dataset.editAdminRemark);
+      render({ refreshData: false });
+    });
+  });
+  document.querySelectorAll("[data-cancel-admin-remark]").forEach((node) => {
+    node.addEventListener("click", () => {
+      state.editingShipmentRemarkId = null;
+      render({ refreshData: false });
+    });
+  });
+  document.querySelectorAll("[data-save-admin-remark]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const id = event.currentTarget.dataset.saveAdminRemark;
+      const remark = event.currentTarget.closest(".admin-order-cell")?.querySelector("[data-admin-remark]")?.value || "";
+      try {
+        await withButtonBusy(event.currentTarget, "保存中…", () =>
+          api(`/api/shipments/${id}/remark`, {
+            method: "PATCH",
+            body: JSON.stringify({ remark }),
+          })
+        );
+        state.editingShipmentRemarkId = null;
+        toast("订单备注已更新。");
+        render();
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+  });
   document.querySelectorAll("[data-delete-shipment]").forEach((node) => {
     node.addEventListener("click", async (event) => {
       const id = event.currentTarget.dataset.deleteShipment;
       const orderNo = event.currentTarget.dataset.orderNo || id;
-      if (!confirm(`确认删除发货记录 ${orderNo}？删除后不可恢复。`)) return;
+      if (!confirm(`确认删除未发货订单 ${orderNo}？商品明细和整张订单都会删除，且无法恢复。`)) return;
       try {
-        await api(`/api/shipments/${id}`, { method: "DELETE" });
-        toast("发货记录已删除。");
+        await withButtonBusy(event.currentTarget, "删除中…", () =>
+          api(`/api/shipments/${id}`, { method: "DELETE" })
+        );
+        state.editingShipmentRemarkId = null;
+        toast("未发货订单已删除。");
         render();
       } catch (error) {
         toast(error.message);

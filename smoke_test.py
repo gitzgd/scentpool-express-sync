@@ -587,6 +587,31 @@ def main() -> None:
         assert body["shipment"]["items"][1]["product_barcode"] == product_2["barcode"]
         assert body["shipment"]["items"][1]["quantity"] == 3
 
+        status, body = request(
+            staff,
+            base,
+            "PATCH",
+            f"/api/shipments/{shipment_id}/remark",
+            {"remark": "门店修改后的备注"},
+        )
+        assert status == 200, body
+        assert body["shipment"]["remark"] == "门店修改后的备注"
+
+        delete_payload = {
+            **shipment_payload,
+            "store_order_no": "ORDER-SMOKE-DELETE",
+            "remark": "待删除",
+        }
+        status, body = request(staff, base, "POST", "/api/shipments", delete_payload)
+        assert status == 201, body
+        delete_shipment_id = body["shipment"]["id"]
+        status, body = request(staff, base, "DELETE", f"/api/shipments/{delete_shipment_id}")
+        assert status == 200, body
+        assert body["shipment"]["deleted"] is True
+        status, body = request(admin, base, "GET", "/api/shipments?q=ORDER-SMOKE-DELETE")
+        assert status == 200, body
+        assert len(body["shipments"]) == 0
+
         status, body = request(staff, base, "POST", "/api/shipments", shipment_payload)
         assert status == 409, body
 
@@ -762,6 +787,15 @@ def main() -> None:
             "POST",
             "/api/admin/labels/batch-print",
             {"shipment_ids": [shipment_id]},
+        )
+        assert status == 409, body
+
+        status, body = request(
+            staff,
+            base,
+            "PATCH",
+            f"/api/shipments/{shipment_id}/remark",
+            {"remark": "发货后不能修改"},
         )
         assert status == 409, body
 
@@ -1007,15 +1041,14 @@ def main() -> None:
             assert "wrapText" in styles_xml
 
         status, body = request(staff, base, "DELETE", f"/api/shipments/{shipment_id}")
-        assert status == 403, body
+        assert status == 409, body
 
         status, body = request(admin, base, "DELETE", f"/api/shipments/{shipment_id}")
-        assert status == 200, body
-        assert body["shipment"]["deleted"] is True
+        assert status == 409, body
 
         status, body = request(admin, base, "GET", "/api/shipments?q=ORDER-SMOKE-001")
         assert status == 200, body
-        assert len(body["shipments"]) == 0
+        assert len(body["shipments"]) == 1
 
         httpd.shutdown()
         thread.join(timeout=2)
