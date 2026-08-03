@@ -32,6 +32,8 @@ DEFAULT_STORE_PASSWORD = "scentpool2026"
 APP_TZ = ZoneInfo("Asia/Shanghai")
 BOOKING_EDITABLE_STATUSES = ("未下单", "下单失败", "已取消")
 BOOKING_ACTIVE_STATUSES = ("排队中", "提交中")
+SHIPPING_STALE_MINUTES = 10
+SHIPPING_STALE_MAX_ATTEMPTS = 3
 
 
 class AppError(Exception):
@@ -722,6 +724,137 @@ class Database:
             "table_counts": table_counts,
             "raw_sizes": {key: int(value or 0) for key, value in raw_sizes.items()},
         }
+
+    def task_alerts(self, limit: int = 50) -> Dict[str, Any]:
+        """Return current operational failures without recipient personal data."""
+        stale_before = (datetime.now(APP_TZ) - timedelta(minutes=30)).isoformat(timespec="seconds")
+        items: List[Dict[str, Any]] = []
+
+        def add_alert(
+            row: sqlite3.Row,
+            alert_type: str,
+            status: str,
+            message: str,
+            updated_at: str,
+            *,
+            batch_id: Any = None,
+        ) -> None:
+            items.append(
+                {
+                    "type": alert_type,
+                    "record_id": int(row["id"]),
+                    "business_id": str(row["business_id"]),
+                    "store_name": str(row["store_name"]),
+                    "status": status,
+                    "message": message,
+                    "updated_at": updated_at,
+                    "batch_id": int(batch_id) if batch_id else None,
+                }
+            )
+
+        with self.connect() as conn:
+            shipment_rows = conn.execute(
+                """
+                SELECT
+                    shipments.id,
+                    shipments.business_id,
+                    shipments.store_name_snapshot AS store_name,
+                    shipments.booking_status,
+                    shipments.booking_error,
+                    shipments.booking_updated_at,
+                    shipments.tracking_status,
+                    shipments.tracking_error,
+                    shipments.tracking_last_checked_at,
+                    shipments.label_print_status,
+                    shipments.label_print_error,
+                    shipments.updated_at,
+                    (
+                        SELECT shipping_batch_items.batch_id
+                        FROM shipping_batch_items
+                        WHERE shipping_batch_items.shipment_id = shipments.id
+                        ORDER BY shipping_batch_items.id DESC
+                        LIMIT 1
+                    ) AS latest_batch_id
+                FROM shipments
+                WHERE
+                    shipments.booking_status = '下单失败'
+                    OR (
+                        shipments.booking_status IN ('排队中', '提交中')
+                        AND shipments.booking_updated_at <> ''
+                        AND shipments.booking_updated_at < ?
+                    )
+                    OR shipments.tracking_status = '查询失败'
+                    OR shipments.label_print_status = '打印失败'
+                """,
+                (stale_before,),
+            ).fetchall()
+            return_rows = conn.execute(
+                """
+                SELECT
+                    return_orders.id,
+                    'RETURN-' || return_orders.id AS business_id,
+                    return_orders.store_name_snapshot AS store_name,
+                    return_orders.tracking_status,
+                    return_orders.tracking_error,
+                    return_orders.tracking_last_checked_at,
+                    return_orders.updated_at
+                FROM return_orders
+                WHERE return_orders.tracking_status = '查询失败'
+                """
+            ).fetchall()
+
+        for row in shipment_rows:
+            if row["booking_status"] == "下单失败":
+                add_alert(
+                    row,
+                    "面单下单失败",
+                    "需要处理",
+                    str(row["booking_error"] or "电子面单没有取得快递单号。"),
+                    str(row["booking_updated_at"] or row["updated_at"]),
+                    batch_id=row["latest_batch_id"],
+                )
+            elif row["booking_status"] in BOOKING_ACTIVE_STATUSES:
+                add_alert(
+                    row,
+                    "面单等待过久",
+                    "等待超过30分钟",
+                    "电子面单任务长时间没有完成，系统会自动尝试恢复；刷新后仍未变化请联系管理员。",
+                    str(row["booking_updated_at"] or row["updated_at"]),
+                    batch_id=row["latest_batch_id"],
+                )
+            if row["tracking_status"] == "查询失败":
+                add_alert(
+                    row,
+                    "物流查询失败",
+                    "稍后重试",
+                    str(row["tracking_error"] or "暂时没有取得物流信息。"),
+                    str(row["tracking_last_checked_at"] or row["updated_at"]),
+                )
+            if row["label_print_status"] == "打印失败":
+                add_alert(
+                    row,
+                    "面单打印失败",
+                    "需要重新打印",
+                    str(row["label_print_error"] or "打印机没有确认打印成功。"),
+                    str(row["updated_at"]),
+                )
+
+        for row in return_rows:
+            add_alert(
+                row,
+                "退货物流查询失败",
+                "稍后重试",
+                str(row["tracking_error"] or "暂时没有取得退货物流信息。"),
+                str(row["tracking_last_checked_at"] or row["updated_at"]),
+            )
+
+        items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        counts: Dict[str, int] = {}
+        for item in items:
+            counts[item["type"]] = counts.get(item["type"], 0) + 1
+        counts["total"] = len(items)
+        visible_items = items[: max(1, min(int(limit or 50), 100))]
+        return {"counts": counts, "items": visible_items, "stale_after_minutes": 30}
 
     def default_credentials_active(self) -> bool:
         return bool(
@@ -1832,21 +1965,64 @@ class Database:
             )
         return self.get_shipping_batch(batch_id)
 
-    def reset_stale_shipping_jobs(self) -> None:
+    def reset_stale_shipping_jobs(self) -> Dict[str, int]:
         now = now_text()
-        stale_before = (datetime.now(APP_TZ) - timedelta(minutes=10)).isoformat(timespec="seconds")
+        stale_before = (
+            datetime.now(APP_TZ) - timedelta(minutes=SHIPPING_STALE_MINUTES)
+        ).isoformat(timespec="seconds")
+        requeued = 0
+        failed = 0
+        affected_batches: set[int] = set()
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT id, shipment_id, batch_id FROM shipping_batch_items WHERE status = '提交中' AND updated_at < ?",
+                """
+                SELECT id, shipment_id, batch_id, attempt_count
+                FROM shipping_batch_items
+                WHERE status = '提交中' AND updated_at < ?
+                """,
                 (stale_before,),
             ).fetchall()
             for row in rows:
-                conn.execute("UPDATE shipping_batch_items SET status = '排队中', updated_at = ? WHERE id = ?", (now, row["id"]))
-                conn.execute(
-                    "UPDATE shipments SET booking_status = '排队中', booking_updated_at = ?, updated_at = ? WHERE id = ?",
-                    (now, now, row["shipment_id"]),
-                )
-                conn.execute("UPDATE shipping_batches SET status = '排队中', updated_at = ? WHERE id = ?", (now, row["batch_id"]))
+                affected_batches.add(int(row["batch_id"]))
+                if int(row["attempt_count"] or 0) >= SHIPPING_STALE_MAX_ATTEMPTS:
+                    message = (
+                        f"电子面单任务连续 {SHIPPING_STALE_MAX_ATTEMPTS} 次等待超时，"
+                        "系统已停止自动重试。请检查面单设置后点击“重试失败订单”。"
+                    )
+                    conn.execute(
+                        "UPDATE shipping_batch_items SET status = '失败', error = ?, updated_at = ? WHERE id = ?",
+                        (message, now, row["id"]),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE shipments
+                        SET booking_status = '下单失败', booking_error = ?, booking_updated_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (message, now, now, row["shipment_id"]),
+                    )
+                    failed += 1
+                else:
+                    next_attempt = int(row["attempt_count"] or 0) + 1
+                    message = (
+                        f"上次提交等待超时，系统已自动重新排队，准备第 {next_attempt} 次尝试。"
+                    )
+                    conn.execute(
+                        "UPDATE shipping_batch_items SET status = '排队中', error = ?, updated_at = ? WHERE id = ?",
+                        (message, now, row["id"]),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE shipments
+                        SET booking_status = '排队中', booking_error = ?, booking_updated_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (message, now, now, row["shipment_id"]),
+                    )
+                    requeued += 1
+            for batch_id in affected_batches:
+                self._refresh_shipping_batch_status(conn, batch_id, now)
+        return {"requeued": requeued, "failed": failed}
 
     def apply_label_print_callback(self, task_id: str, param_raw: str, param: Dict[str, Any]) -> Dict[str, Any]:
         print_status_code = str(param.get("status") or "")

@@ -60,6 +60,7 @@ MAX_BATCH_PDF_BYTES = 60 * 1024 * 1024
 MAX_REQUEST_THREADS = bounded_env_int("SCENTPOOL_MAX_REQUEST_THREADS", 8, 2, 16)
 LABEL_MERGE_TIMEOUT_SECONDS = bounded_env_int("SCENTPOOL_LABEL_MERGE_TIMEOUT_SECONDS", 600, 60, 1200)
 SLOW_REQUEST_MILLISECONDS = bounded_env_int("SCENTPOOL_SLOW_REQUEST_MILLISECONDS", 1000, 250, 10000)
+SHIPPING_TRANSIENT_RETRIES = bounded_env_int("SCENTPOOL_SHIPPING_TRANSIENT_RETRIES", 2, 0, 3)
 TRACKING_SYNC_LOCK = threading.Lock()
 RETURN_TRACKING_SYNC_LOCK = threading.Lock()
 
@@ -333,7 +334,10 @@ def build_batch_label_pdf_file(shipments: list[Dict[str, Any]], work_dir: Path) 
         message = ""
         if child_result:
             message = str(child_result.get("error") or "")
-        raise AppError(message or "批量面单合并失败。", 502)
+        raise AppError(
+            message or "批量面单合并没有完成，请减少勾选数量后重试；订单尚未标记为已打印。",
+            502,
+        )
     if output_path.stat().st_size > MAX_BATCH_PDF_BYTES:
         raise AppError("合并后的面单文件超过限制，请减少勾选数量后重试。", 413)
     print(
@@ -547,12 +551,34 @@ def process_next_shipping_job() -> bool:
     job = DB.claim_next_shipping_job()
     if not job:
         return False
-    try:
-        result = Kuaidi100LabelClient.from_env().create_label(
-            job, DB.shipping_settings_for_company(str(job.get("express_company") or ""))
+    client = Kuaidi100LabelClient.from_env()
+    settings = DB.shipping_settings_for_company(str(job.get("express_company") or ""))
+    result: Dict[str, Any] = {"success": False, "error": "电子面单下单失败。", "raw": ""}
+    max_attempts = SHIPPING_TRANSIENT_RETRIES + 1
+    for attempt in range(max_attempts):
+        try:
+            result = client.create_label(job, settings)
+        except Exception as exc:
+            print(f"[shipping] unexpected label error: {type(exc).__name__}", flush=True)
+            result = {
+                "success": False,
+                "error": "系统处理电子面单时发生内部错误，订单没有被删除。请联系管理员并提供业务ID。",
+                "raw": "",
+            }
+        if result.get("success") or not result.get("retryable"):
+            break
+        if attempt + 1 < max_attempts:
+            print(
+                f"[shipping] transient failure; retry={attempt + 1}/{SHIPPING_TRANSIENT_RETRIES}",
+                flush=True,
+            )
+            time.sleep(1 + attempt * 2)
+    if not result.get("success") and result.get("retryable") and SHIPPING_TRANSIENT_RETRIES:
+        original_error = str(result.get("error") or "电子面单请求失败。")
+        result["error"] = (
+            f"{original_error} 系统已自动重试 {SHIPPING_TRANSIENT_RETRIES} 次仍未成功，"
+            "请稍后点击“重试失败订单”。"
         )
-    except Exception as exc:
-        result = {"success": False, "error": f"电子面单下单失败：{exc}", "raw": ""}
     completed = DB.complete_shipping_job(int(job["batch_item_id"]), result)
     if completed.get("tracking_no"):
         try:
@@ -564,9 +590,17 @@ def process_next_shipping_job() -> bool:
 
 
 def shipping_worker() -> None:
-    DB.reset_stale_shipping_jobs()
+    recovered = DB.reset_stale_shipping_jobs()
+    next_stale_check = time.monotonic() + 60
+    if recovered.get("requeued") or recovered.get("failed"):
+        print(f"[shipping] recovered stale jobs: {recovered}", flush=True)
     while True:
         try:
+            if time.monotonic() >= next_stale_check:
+                recovered = DB.reset_stale_shipping_jobs()
+                next_stale_check = time.monotonic() + 60
+                if recovered.get("requeued") or recovered.get("failed"):
+                    print(f"[shipping] recovered stale jobs: {recovered}", flush=True)
             if label_enabled() and process_next_shipping_job():
                 continue
         except Exception as exc:
@@ -840,6 +874,11 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/admin/task-alerts" and self.command == "GET":
+            self.require_admin(user)
+            self.send_json(DB.task_alerts())
+            return
+
         if path == "/api/admin/shipping-settings" and self.command == "GET":
             self.require_admin(user)
             self.send_json({"settings": DB.get_shipping_settings(public=True), "shipping": label_config_public()})
@@ -1005,13 +1044,13 @@ class Handler(BaseHTTPRequestHandler):
             shipments = DB.batch_print_shipments(shipment_ids)
             with tempfile.TemporaryDirectory(prefix="scentpool-label-merge-") as directory:
                 payload_path = build_batch_label_pdf_file(shipments, Path(directory))
-                DB.mark_labels_printed([int(row["id"]) for row in shipments])
                 filename = f"面单_{local_now().strftime('%Y-%m-%d_%H%M')}_{len(shipments)}单.pdf"
                 self.send_file(
                     payload_path,
                     "application/pdf",
                     inline_header(filename, "scentpool-labels.pdf"),
                 )
+                DB.mark_labels_printed([int(row["id"]) for row in shipments])
             return
 
         if path.startswith("/api/shipments/") and path.endswith("/items") and self.command == "PATCH":

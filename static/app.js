@@ -34,8 +34,12 @@ const state = {
   batchSelectedIds: [],
   batchPrintOpen: false,
   batchPrintSelectedIds: [],
+  batchPrintError: "",
   activeShippingBatch: null,
   shippingBatchPollTimer: null,
+  shippingBatchPollError: "",
+  taskAlerts: { counts: { total: 0 }, items: [] },
+  taskAlertsLoadError: "",
 };
 
 const EXPRESS_COMPANIES = ["圆通", "京东", "顺丰"];
@@ -255,17 +259,32 @@ function categoryColorClass(category) {
   return `cat-color-${(hash % CATEGORY_COLOR_COUNT) + 1}`;
 }
 
-function toast(message) {
+function toast(message, options = {}) {
+  const type = options.type || "info";
+  const duration = Number(options.duration ?? (type === "error" ? 12000 : 3200));
   const existing = document.querySelector(".toast");
   if (existing) existing.remove();
   const node = document.createElement("div");
-  node.className = "toast";
-  node.setAttribute("role", "status");
-  node.setAttribute("aria-live", "polite");
+  node.className = `toast ${type}`;
+  node.setAttribute("role", type === "error" ? "alert" : "status");
+  node.setAttribute("aria-live", type === "error" ? "assertive" : "polite");
   node.setAttribute("aria-atomic", "true");
-  node.textContent = message;
+  const text = document.createElement("span");
+  text.textContent = String(message || "操作未完成，请重试。");
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "toast-close";
+  close.setAttribute("aria-label", "关闭提示");
+  close.textContent = "×";
+  close.addEventListener("click", () => node.remove());
+  node.append(text, close);
   document.body.appendChild(node);
-  setTimeout(() => node.remove(), 3200);
+  if (duration > 0) setTimeout(() => node.remove(), duration);
+}
+
+function errorToast(error, fallback = "操作失败，请稍后重试。") {
+  const message = String(error?.message || error || fallback).trim() || fallback;
+  toast(`操作未完成：${message}`, { type: "error" });
 }
 
 async function withButtonBusy(button, busyLabel, operation) {
@@ -316,7 +335,7 @@ function bindTrackingCopyButtons() {
       try {
         await copyText(explicitTrackingNo || row?.querySelector("[data-tracking]")?.value || "");
       } catch (error) {
-        toast(error.message || "复制失败。");
+        errorToast(error, "复制失败。");
       }
     });
   });
@@ -380,6 +399,15 @@ async function api(path, options = {}) {
   }
 }
 
+class ApiError extends Error {
+  constructor(message, status = 0, details = {}) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.details = details || {};
+  }
+}
+
 async function apiRequest(path, options = {}) {
   const headers = options.headers || {};
   if (options.body && !(options.body instanceof FormData)) {
@@ -393,7 +421,8 @@ async function apiRequest(path, options = {}) {
       state.user = null;
       navigate("/login");
     }
-    throw new Error(data.error || "请求失败");
+    const message = typeof data === "object" && data ? data.error : data;
+    throw new ApiError(message || "请求失败", response.status, data?.details || {});
   }
   return data;
 }
@@ -504,14 +533,30 @@ async function loadShippingBatchPreview(filters) {
   state.batchSelectedIds = (state.batchPreview?.eligible || []).map((row) => Number(row.id));
 }
 
+async function loadTaskAlerts() {
+  try {
+    const data = await api("/api/admin/task-alerts");
+    state.taskAlerts = data || { counts: { total: 0 }, items: [] };
+    state.taskAlertsLoadError = "";
+  } catch (error) {
+    state.taskAlertsLoadError = error.message || "任务状态暂时无法读取。";
+  }
+}
+
 async function loadActiveShippingBatch() {
   const batchId = state.activeShippingBatch?.batch?.id || sessionStorage.getItem("scentpool_shipping_batch_id");
   if (!batchId) return;
   try {
     state.activeShippingBatch = await api(`/api/admin/shipping-batches/${batchId}`);
-  } catch {
-    state.activeShippingBatch = null;
-    sessionStorage.removeItem("scentpool_shipping_batch_id");
+    state.shippingBatchPollError = "";
+  } catch (error) {
+    if (error.status === 404) {
+      state.activeShippingBatch = null;
+      state.shippingBatchPollError = "";
+      sessionStorage.removeItem("scentpool_shipping_batch_id");
+    } else {
+      state.shippingBatchPollError = `批次进度暂时无法刷新：${error.message || "请检查网络后重试。"}`;
+    }
   }
 }
 
@@ -527,11 +572,20 @@ function scheduleShippingBatchPoll() {
       const nextCounts = JSON.stringify(state.activeShippingBatch?.counts || {});
       const nextStatus = state.activeShippingBatch?.batch?.status || "";
       if (previousCounts !== nextCounts || previousStatus !== nextStatus) {
-        await loadShipments();
+        await Promise.all([loadShipments(), loadTaskAlerts()]);
       }
       await render({ refreshData: false });
+      if (["排队中", "处理中"].includes(previousStatus) && !["排队中", "处理中"].includes(nextStatus)) {
+        const failed = state.activeShippingBatch?.counts?.["失败"] || 0;
+        if (failed) {
+          errorToast(`电子面单批次已结束，其中 ${failed} 单失败。请查看页面顶部“任务状态”的红色提示。`);
+        } else {
+          toast("电子面单批次已全部完成。");
+        }
+      }
     } catch (error) {
-      scheduleShippingBatchPoll();
+      state.shippingBatchPollError = `批次进度暂时无法刷新：${error.message || "请检查网络后重试。"}`;
+      await render({ refreshData: false });
     }
   }, 2500);
 }
@@ -646,7 +700,7 @@ function renderLogin() {
       state.user = data.user;
       navigate(state.user.role === "admin" ? "/admin" : "/submit");
     } catch (error) {
-      toast(error.message);
+      errorToast(error);
     }
   });
 }
@@ -957,7 +1011,7 @@ function bindSubmit() {
       toast("已同步到总部。");
       render();
     } catch (error) {
-      toast(error.message);
+      errorToast(error);
     }
   });
 }
@@ -1226,7 +1280,7 @@ function bindShipmentItemEditor(sourceRows) {
         toast("商品明细已更新。");
         render();
       } catch (error) {
-        toast(error.message);
+        errorToast(error);
       }
     });
   });
@@ -1288,7 +1342,7 @@ function bindStoreBoard() {
         toast("订单备注已更新。");
         render();
       } catch (error) {
-        toast(error.message);
+        errorToast(error);
       }
     });
   });
@@ -1305,7 +1359,7 @@ function bindStoreBoard() {
         toast("未发货订单已删除。");
         render();
       } catch (error) {
-        toast(error.message);
+        errorToast(error);
       }
     });
   });
@@ -1480,7 +1534,7 @@ function bindReturnNew() {
       toast("退货已提交。");
       navigate("/returns");
     } catch (error) {
-      toast(error.message);
+      errorToast(error);
     }
   });
 }
@@ -1643,17 +1697,25 @@ function bindReturnBoard(admin = false) {
   });
   const syncReturnTracking = document.getElementById("syncReturnTracking");
   if (syncReturnTracking) {
-    syncReturnTracking.addEventListener("click", async () => {
+    syncReturnTracking.addEventListener("click", async (event) => {
       try {
-        const data = await api("/api/admin/return-tracking/sync", {
-          method: "POST",
-          body: JSON.stringify({ limit: 50 }),
-        });
+        const data = await withButtonBusy(event.currentTarget, "同步中…", () =>
+          api("/api/admin/return-tracking/sync", {
+            method: "POST",
+            body: JSON.stringify({ limit: 50 }),
+          })
+        );
         const result = data.result || {};
-        toast(`已同步 ${result.checked || 0} 单，签收 ${result.signed || 0} 单。`);
+        if (result.busy) {
+          errorToast("退货物流同步正在运行，本次没有重复启动。请稍后刷新查看结果。");
+        } else if (result.errors) {
+          errorToast(`退货物流同步完成，但有 ${result.errors} 单查询失败。请查看页面上的红色错误提示。`);
+        } else {
+          toast(`已同步 ${result.checked || 0} 单，签收 ${result.signed || 0} 单。`);
+        }
         render();
       } catch (error) {
-        toast(error.message);
+        errorToast(error, "退货物流同步失败。");
       }
     });
   }
@@ -1665,7 +1727,7 @@ function bindReturnBoard(admin = false) {
         toast("退货物流已刷新。");
         render();
       } catch (error) {
-        toast(error.message);
+        errorToast(error);
       }
     });
   });
@@ -1730,6 +1792,82 @@ function renderShippingBatchPreview() {
   `;
 }
 
+function taskAlertAdvice(type, message = "") {
+  if (type === "面单下单失败") {
+    const normalized = String(message || "");
+    if (/行政区|省市区|地址.*解析|地址.*格式/.test(normalized)) {
+      return "请核对收件地址的省、市、区和详细地址是否完整，并使用标准行政区名称；修改后再重试失败订单。";
+    }
+    if (/停发|暂停服务|超区|服务范围|不派送|无法配送/.test(normalized)) {
+      return "当前快递可能无法配送该区域。请先确认承运范围，必要时改用其他快递公司，再重试失败订单。";
+    }
+    if (/余额|欠费|单量|数量不足/.test(normalized)) {
+      return "请先在电子面单设置中检查网点余额或联系网点充值，确认恢复后再重试失败订单。";
+    }
+    if (/授权|网点|账号|账户|配置/.test(normalized)) {
+      return "请进入电子面单设置检查授权账号和网点配置，确认有效后再重试失败订单。";
+    }
+    if (/网络|超时|服务暂时|繁忙|自动重试/.test(normalized)) {
+      return "系统已经尝试自动恢复。请稍后只重试失败订单；若仍失败，把业务ID告诉管理员。";
+    }
+    return "请检查收件信息、授权网点和面单余额，再重新提交失败订单；仍失败时把业务ID告诉管理员。";
+  }
+  if (type === "面单等待过久") {
+    return "系统会自动恢复卡住的任务；刷新后仍未变化时请联系管理员，不要重复创建新批次。";
+  }
+  if (type === "面单打印失败") {
+    return "请检查打印机或浏览器弹窗；PDF批量打印失败时减少单次数量后重试。";
+  }
+  if (type === "物流查询失败" || type === "退货物流查询失败") {
+    return "这不会删除快递单号。请稍后再次查询，或等待系统下一轮自动同步。";
+  }
+  return "请刷新后重试；问题持续存在时联系管理员并提供业务ID。";
+}
+
+function renderTaskAlerts() {
+  const data = state.taskAlerts || { counts: { total: 0 }, items: [] };
+  const items = Array.isArray(data.items) ? data.items : [];
+  const total = Number(data.counts?.total || 0);
+  const visibleItems = items.slice(0, 12);
+  return `
+    <section class="panel panel-pad task-alert-panel" aria-live="polite">
+      <div class="section-title">
+        <div>
+          <h2>任务状态</h2>
+          <div class="muted mini">电子面单、物流和打印任务的当前结果；失败不会静默消失。</div>
+        </div>
+        <span class="status ${total || state.taskAlertsLoadError ? "exception" : "signed"}">
+          ${state.taskAlertsLoadError ? "状态读取失败" : total ? `需要处理 ${total} 项` : "运行正常"}
+        </span>
+      </div>
+      ${state.taskAlertsLoadError ? `<div class="notice danger-notice"><strong>无法确认后台任务是否正常。</strong><br>${escapeHtml(state.taskAlertsLoadError)}<br>请检查网络后刷新页面；在状态恢复前不要重复提交同一批任务。</div>` : ""}
+      ${!state.taskAlertsLoadError && !total ? `<div class="task-ok-message">当前没有面单下单失败、物流查询失败、打印失败或等待超过30分钟的任务。</div>` : ""}
+      ${visibleItems.length ? `
+        <div class="task-alert-list">
+          ${visibleItems.map((item) => `
+            <article class="task-alert-item">
+              <div class="task-alert-heading">
+                <div><strong>${escapeHtml(item.type)}</strong> · <span translate="no">${escapeHtml(item.business_id)}</span></div>
+                <span class="status exception">${escapeHtml(item.status)}</span>
+              </div>
+              <div class="muted mini">${escapeHtml(item.store_name)} · ${escapeHtml(formatDate(item.updated_at))}</div>
+              <div class="task-alert-message"><strong>失败原因：</strong>${escapeHtml(item.message || "任务没有成功完成。")}</div>
+              <div class="task-alert-advice"><strong>怎么处理：</strong>${escapeHtml(taskAlertAdvice(item.type, item.message))}</div>
+              <div class="inline-actions">
+                ${item.type === "面单下单失败" && item.batch_id ? `<button class="btn primary small" data-retry-alert-batch="${Number(item.batch_id)}" type="button">重新提交该批次失败订单</button>` : ""}
+                ${item.type === "退货物流查询失败"
+                  ? `<button class="btn secondary small" data-locate-return-alert="${escapeHtml(item.business_id)}" type="button">在退货看板中查看</button>`
+                  : `<button class="btn secondary small" data-locate-task-alert="${escapeHtml(item.business_id)}" type="button">在订单列表中查看</button>`}
+              </div>
+            </article>
+          `).join("")}
+        </div>
+        ${total > visibleItems.length ? `<div class="notice">还有 ${total - visibleItems.length} 项未展开，可处理当前项目后刷新查看。</div>` : ""}
+      ` : ""}
+    </section>
+  `;
+}
+
 function batchPrintableShipments() {
   return state.shipments.filter(
     (row) => row.label_print_status === "待打印" && String(row.label_url || "").trim()
@@ -1754,6 +1892,8 @@ function renderBatchPrintPanel() {
         <button class="btn ghost small" id="clearBatchPrint" type="button">取消全选</button>
         <button class="btn primary" id="mergeBatchPrint" type="button" ${selectedIds.size ? "" : "disabled"}>合并并打印 ${selectedIds.size} 单</button>
       </div>
+      ${state.batchPrintError ? `<div class="notice danger-notice"><strong>批量打印没有完成。</strong><br>${escapeHtml(state.batchPrintError)}<br>请减少勾选数量、检查网络或浏览器弹窗后重试；失败时订单不会被标记为已打印。</div>` : ""}
+      <div class="notice task-progress" id="batchPrintStatus" role="status" aria-live="polite" hidden></div>
       <div class="batch-order-list">
         ${eligible.map((row) => `
           <div class="batch-order-row">
@@ -1790,7 +1930,9 @@ function renderShippingBatchProgress() {
         ${failed ? `<button class="btn secondary small" id="retryShippingBatch" type="button">仅重试失败订单</button>` : ""}
         <button class="btn ghost small" id="closeShippingBatch" type="button">收起批次</button>
       </div>
-      ${failed ? `<div class="batch-errors">${(data.items || []).filter((item) => item.status === "失败").map((item) => `<div><strong>${escapeHtml(item.business_id)}</strong> ${escapeHtml(item.error || "下单失败")}</div>`).join("")}</div>` : ""}
+      ${state.shippingBatchPollError ? `<div class="notice danger-notice"><strong>批次进度刷新失败。</strong><br>${escapeHtml(state.shippingBatchPollError)}<br>后台任务不一定停止，请检查网络后刷新页面，不要重复提交同一批订单。</div>` : ""}
+      ${failed ? `<div class="notice danger-notice"><strong>本批次有 ${failed} 单没有取得快递单号。</strong><br>请阅读下方原因，检查信息后点击“仅重试失败订单”；不要为同一订单重新创建另一批次。</div>` : ""}
+      ${failed ? `<div class="batch-errors">${(data.items || []).filter((item) => item.status === "失败").map((item) => `<div class="batch-error-item"><strong>${escapeHtml(item.business_id)}</strong><div>失败原因：${escapeHtml(item.error || "电子面单没有成功生成。")}</div><div>怎么处理：${escapeHtml(taskAlertAdvice("面单下单失败", item.error))}</div></div>`).join("")}</div>` : ""}
     </section>
   `;
 }
@@ -1803,6 +1945,7 @@ async function renderAdmin({ refreshData = true } = {}) {
       loadShipments(),
       loadShippingSettings(),
       loadActiveShippingBatch(),
+      loadTaskAlerts(),
     ]);
   }
   const today = localDate();
@@ -1826,6 +1969,7 @@ async function renderAdmin({ refreshData = true } = {}) {
         <a class="btn secondary" href="/api/admin/backup.db">备份数据库</a>
       </div>`
     )}
+    ${renderTaskAlerts()}
     ${renderBatchPrintPanel()}
     ${renderShippingBatchPreview()}
     ${renderShippingBatchProgress()}
@@ -1923,6 +2067,7 @@ function renderAdminShipmentStatusCell(row) {
     <select class="table-input" data-status>
       ${state.statuses.map((status) => `<option value="${status}" ${status === row.status ? "selected" : ""}>${status}</option>`).join("")}
     </select>
+    ${renderBookingStatus(row)}
   `;
 }
 
@@ -1933,6 +2078,7 @@ function renderAdminShipmentShippingCell(row) {
   }
   return `
     <div class="shipping-editor">
+      ${row.booking_status === "下单失败" ? `<div class="inline-failure"><strong>电子面单未成功。</strong><div>${escapeHtml(row.booking_error || "没有取得快递单号。")}</div><div>${escapeHtml(taskAlertAdvice("面单下单失败", row.booking_error))}</div></div>` : ""}
       <label>
         <span>快递公司</span>
         <select class="table-input" data-company>
@@ -2078,6 +2224,49 @@ function renderShipmentTable(shipments) {
 }
 
 function bindAdmin() {
+  document.querySelectorAll("[data-locate-return-alert]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      state.adminReturnFilters = {
+        store_id: "",
+        status: "",
+        date_from: "",
+        date_to: "",
+        q: event.currentTarget.dataset.locateReturnAlert || "",
+      };
+      navigate("/admin/returns");
+    });
+  });
+  document.querySelectorAll("[data-locate-task-alert]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      state.adminFilters = {
+        store_id: "",
+        status: "",
+        date_from: "",
+        date_to: "",
+        q: event.currentTarget.dataset.locateTaskAlert || "",
+      };
+      state.adminShipmentPage = 1;
+      await render();
+      document.querySelector(".shipments-table")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  });
+  document.querySelectorAll("[data-retry-alert-batch]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const batchId = Number(event.currentTarget.dataset.retryAlertBatch);
+      if (!batchId || !confirm("确认重新提交这个批次中的失败订单？系统只会重试失败项，不会重复处理成功订单。")) return;
+      try {
+        state.activeShippingBatch = await withButtonBusy(event.currentTarget, "重新排队中…", () =>
+          api(`/api/admin/shipping-batches/${batchId}/retry`, { method: "POST", body: JSON.stringify({}) })
+        );
+        sessionStorage.setItem("scentpool_shipping_batch_id", String(batchId));
+        await Promise.all([loadShipments(), loadTaskAlerts()]);
+        toast("失败订单已重新加入队列，页面会持续显示处理结果。");
+        render({ refreshData: false });
+      } catch (error) {
+        errorToast(error, "失败订单重新提交失败。");
+      }
+    });
+  });
   document.getElementById("openBatchPrint")?.addEventListener("click", () => {
     state.batchPrintSelectedIds = batchPrintableShipments().map((row) => Number(row.id));
     state.batchPrintOpen = true;
@@ -2086,6 +2275,7 @@ function bindAdmin() {
   document.getElementById("closeBatchPrint")?.addEventListener("click", () => {
     state.batchPrintOpen = false;
     state.batchPrintSelectedIds = [];
+    state.batchPrintError = "";
     render({ refreshData: false });
   });
   const updateBatchPrintSelection = () => {
@@ -2124,10 +2314,25 @@ function bindAdmin() {
       toast("浏览器阻止了打印窗口，请允许本站打开弹窗后重试。");
       return;
     }
-    printWindow.document.write("<!doctype html><meta charset='utf-8'><title>正在合并面单</title><p style='font-family:sans-serif;padding:32px'>正在合并面单，请稍候...</p>");
+    printWindow.document.write("<!doctype html><meta charset='utf-8'><title>正在合并面单</title><p style='font-family:sans-serif;padding:32px;line-height:1.7'>正在合并面单，请稍候。<br>订单较多时可能需要 10–30 秒，请不要重复点击或关闭此窗口。</p>");
     printWindow.document.close();
     const button = document.getElementById("mergeBatchPrint");
-    if (button) button.disabled = true;
+    const progress = document.getElementById("batchPrintStatus");
+    state.batchPrintError = "";
+    if (button) {
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      button.textContent = `正在合并 ${shipmentIds.length} 单…`;
+    }
+    if (progress) {
+      progress.hidden = false;
+      progress.textContent = `正在合并 ${shipmentIds.length} 张面单，请勿重复提交。`;
+    }
+    const slowTimer = setTimeout(() => {
+      if (progress?.isConnected) {
+        progress.textContent = "任务仍在正常处理。较大批次可能需要更长时间，请继续等待；若最终失败，页面会明确显示原因。";
+      }
+    }, 8000);
     try {
       const response = await fetch("/api/admin/labels/batch-print", {
         method: "POST",
@@ -2152,12 +2357,21 @@ function bindAdmin() {
       setTimeout(() => URL.revokeObjectURL(pdfUrl), 10 * 60 * 1000);
       state.batchPrintOpen = false;
       state.batchPrintSelectedIds = [];
+      state.batchPrintError = "";
       toast(`已合并 ${shipmentIds.length} 张面单并标记为已打印。`);
       render();
     } catch (error) {
       printWindow.close();
-      toast(error.message);
-      if (button) button.disabled = false;
+      state.batchPrintError = error.message || "批量面单合并失败。";
+      errorToast(error, "批量面单合并失败。");
+      render({ refreshData: false });
+    } finally {
+      clearTimeout(slowTimer);
+      if (button?.isConnected) {
+        button.disabled = false;
+        button.removeAttribute("aria-busy");
+        button.textContent = `合并并打印 ${shipmentIds.length} 单`;
+      }
     }
   });
   const previewButton = document.getElementById("previewShippingBatch");
@@ -2174,7 +2388,7 @@ function bindAdmin() {
         await withButtonBusy(event.currentTarget, "正在加载…", () => loadShippingBatchPreview(state.batchFilters));
         render({ refreshData: false });
       } catch (error) {
-        toast(error.message);
+        errorToast(error);
       }
     });
   }
@@ -2215,7 +2429,7 @@ function bindAdmin() {
       await loadShippingBatchPreview(state.batchFilters);
       render({ refreshData: false });
     } catch (error) {
-      toast(error.message);
+      errorToast(error);
     }
   });
   document.getElementById("resetBatchFilters")?.addEventListener("click", async () => {
@@ -2224,7 +2438,7 @@ function bindAdmin() {
       await loadShippingBatchPreview(state.batchFilters);
       render({ refreshData: false });
     } catch (error) {
-      toast(error.message);
+      errorToast(error);
     }
   });
   document.getElementById("batchBulkCompany")?.addEventListener("change", (event) => {
@@ -2232,7 +2446,7 @@ function bindAdmin() {
       if (row.querySelector("[data-batch-select]")?.checked) row.querySelector("[data-batch-company]").value = event.currentTarget.value;
     });
   });
-  document.getElementById("createShippingBatch")?.addEventListener("click", async () => {
+  document.getElementById("createShippingBatch")?.addEventListener("click", async (event) => {
     const shipments = Array.from(document.querySelectorAll("[data-batch-shipment]"))
       .filter((row) => row.querySelector("[data-batch-select]")?.checked)
       .map((row) => ({
@@ -2245,31 +2459,37 @@ function bindAdmin() {
     }
     if (!confirm(`确认向快递100提交 ${shipments.length} 张电子面单？成功后将立即取得快递单号。`)) return;
     try {
-      const data = await api("/api/admin/shipping-batches", {
-        method: "POST",
-        body: JSON.stringify({
-          filters: state.batchFilters,
-          shipments,
-        }),
-      });
+      const data = await withButtonBusy(event.currentTarget, "正在创建任务…", () =>
+        api("/api/admin/shipping-batches", {
+          method: "POST",
+          body: JSON.stringify({
+            filters: state.batchFilters,
+            shipments,
+          }),
+        })
+      );
       state.batchPreview = null;
       state.activeShippingBatch = data;
       sessionStorage.setItem("scentpool_shipping_batch_id", String(data.batch.id));
       toast("电子面单任务已创建。即使关闭页面，后台也会继续处理。");
       render({ refreshData: false });
     } catch (error) {
-      toast(error.message);
+      errorToast(error, "电子面单任务创建失败。");
     }
   });
-  document.getElementById("retryShippingBatch")?.addEventListener("click", async () => {
+  document.getElementById("retryShippingBatch")?.addEventListener("click", async (event) => {
     const batchId = state.activeShippingBatch?.batch?.id;
     if (!batchId) return;
+    if (!confirm("确认只重新提交本批次中的失败订单？已经成功的订单不会重复下单。")) return;
     try {
-      state.activeShippingBatch = await api(`/api/admin/shipping-batches/${batchId}/retry`, { method: "POST", body: JSON.stringify({}) });
-      toast("失败订单已重新加入队列。");
+      state.activeShippingBatch = await withButtonBusy(event.currentTarget, "重新排队中…", () =>
+        api(`/api/admin/shipping-batches/${batchId}/retry`, { method: "POST", body: JSON.stringify({}) })
+      );
+      await loadTaskAlerts();
+      toast("失败订单已重新加入队列，页面会持续显示处理结果。");
       render({ refreshData: false });
     } catch (error) {
-      toast(error.message);
+      errorToast(error, "失败订单重新提交失败。");
     }
   });
   document.getElementById("closeShippingBatch")?.addEventListener("click", () => {
@@ -2317,10 +2537,16 @@ function bindAdmin() {
       const result = data.result || {};
       const skipped = result.skipped_recent || 0;
       const failed = result.errors || 0;
-      toast(`已同步 ${result.checked || 0} 单，签收 ${result.signed || 0} 单${failed ? `，失败 ${failed} 单` : ""}${skipped ? `；另有 ${skipped} 单在 30 分钟保护期内` : ""}。`);
+      if (result.busy) {
+        errorToast("物流同步任务正在运行，本次没有重复启动。请稍后刷新查看结果。");
+      } else if (failed) {
+        errorToast(`物流同步完成，但有 ${failed} 单查询失败。请查看页面顶部“任务状态”的红色提示。`);
+      } else {
+        toast(`已同步 ${result.checked || 0} 单，签收 ${result.signed || 0} 单${skipped ? `；另有 ${skipped} 单在 30 分钟保护期内` : ""}。`);
+      }
       render();
     } catch (error) {
-      toast(error.message);
+      errorToast(error, "物流同步失败。");
     }
   });
   document.querySelectorAll("[data-edit-shipping]").forEach((node) => {
@@ -2345,7 +2571,7 @@ function bindAdmin() {
         toast("物流已刷新。");
         render();
       } catch (error) {
-        toast(error.message);
+        errorToast(error);
       }
     });
   });
@@ -2363,7 +2589,7 @@ function bindAdmin() {
         toast("面单已由快递100确认取消，可重新加入批量打单。");
         render();
       } catch (error) {
-        toast(error.message);
+        errorToast(error);
       }
     });
   });
@@ -2375,7 +2601,7 @@ function bindAdmin() {
         toast("复打任务已发送到快递100云打印机。");
         render();
       } catch (error) {
-        toast(error.message);
+        errorToast(error);
       }
     });
   });
@@ -2387,7 +2613,7 @@ function bindAdmin() {
         toast("面单已标记为打印成功。");
         render();
       } catch (error) {
-        toast(error.message);
+        errorToast(error);
       }
     });
   });
@@ -2416,7 +2642,7 @@ function bindAdmin() {
         toast("已保存。");
         render();
       } catch (error) {
-        toast(error.message);
+        errorToast(error);
       }
     });
   });
@@ -2447,7 +2673,7 @@ function bindAdmin() {
         toast("订单备注已更新。");
         render();
       } catch (error) {
-        toast(error.message);
+        errorToast(error);
       }
     });
   });
@@ -2464,7 +2690,7 @@ function bindAdmin() {
         toast("未发货订单已删除。");
         render();
       } catch (error) {
-        toast(error.message);
+        errorToast(error);
       }
     });
   });
@@ -2643,7 +2869,7 @@ async function renderShippingSettings() {
       toast("电子面单设置已保存。");
       render();
     } catch (error) {
-      toast(error.message);
+      errorToast(error);
     }
   });
   document.getElementById("authorizeCainiao")?.addEventListener("click", async () => {
@@ -2657,7 +2883,7 @@ async function renderShippingSettings() {
         window.location.href = authorization.url;
       }
     } catch (error) {
-      toast(error.message);
+      errorToast(error);
     }
   });
   document.getElementById("refreshLabelBranches")?.addEventListener("click", async () => {
@@ -2667,7 +2893,7 @@ async function renderShippingSettings() {
       toast("授权网点和面单余额已刷新。");
       render();
     } catch (error) {
-      toast(error.message);
+      errorToast(error);
     }
   });
 }
@@ -2715,7 +2941,7 @@ function bindStores() {
       toast("门店已创建。");
       render();
     } catch (error) {
-      toast(error.message);
+      errorToast(error);
     }
   });
   document.querySelectorAll("[data-toggle-store]").forEach((node) => {
@@ -2727,7 +2953,7 @@ function bindStores() {
         toast("门店状态已更新。");
         render();
       } catch (error) {
-        toast(error.message);
+        errorToast(error);
       }
     });
   });
@@ -2861,7 +3087,7 @@ function bindProducts() {
       toast("商品已保存。");
       render({ refreshData: false });
     } catch (error) {
-      toast(error.message);
+      errorToast(error);
     }
   });
   document.getElementById("applyProductFilters").addEventListener("click", () => {
@@ -2893,7 +3119,7 @@ function bindProducts() {
       toast(`已刷新 ${data.result.imported} 个商品。`);
       render({ refreshData: false });
     } catch (error) {
-      toast(error.message);
+      errorToast(error);
     }
   });
   document.querySelectorAll("[data-delete-product]").forEach((node) => {
@@ -2908,7 +3134,7 @@ function bindProducts() {
         toast("商品已删除。");
         render({ refreshData: false });
       } catch (error) {
-        toast(error.message);
+        errorToast(error);
       }
     });
   });

@@ -185,12 +185,44 @@ class Kuaidi100LabelClient:
         try:
             with urllib.request.urlopen(request, timeout=25) as response:
                 raw = response.read().decode("utf-8", errors="replace")
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            return {"success": False, "error": f"快递100请求失败：{exc}", "raw": ""}
+        except urllib.error.HTTPError as exc:
+            retryable = exc.code == 429 or exc.code >= 500
+            message = (
+                f"快递100服务暂时繁忙（HTTP {exc.code}），请稍后重试。"
+                if retryable
+                else f"快递100拒绝了本次请求（HTTP {exc.code}），请检查面单设置。"
+            )
+            return {"success": False, "error": message, "raw": "", "retryable": retryable}
+        except TimeoutError:
+            return {
+                "success": False,
+                "error": "快递100响应超时，请稍后重试。",
+                "raw": "",
+                "retryable": True,
+            }
+        except urllib.error.URLError:
+            return {
+                "success": False,
+                "error": "暂时无法连接快递100，请检查网络后重试。",
+                "raw": "",
+                "retryable": True,
+            }
+        except OSError:
+            return {
+                "success": False,
+                "error": "电子面单请求遇到临时网络错误，请稍后重试。",
+                "raw": "",
+                "retryable": True,
+            }
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            return {"success": False, "error": "快递100返回内容不是有效 JSON。", "raw": raw}
+            return {
+                "success": False,
+                "error": "快递100返回内容异常，请稍后重试。",
+                "raw": raw,
+                "retryable": True,
+            }
         return {"success": True, "data": data, "raw": raw, "param": param_text}
 
     @staticmethod
@@ -264,15 +296,22 @@ class Kuaidi100LabelClient:
         if not response.get("success"):
             return response
         payload = response["data"]
-        if not bool(payload.get("success")) or str(payload.get("code")) not in {"200", "30011"}:
-            return {
-                "success": False,
-                "error": str(payload.get("message") or payload.get("code") or "电子面单下单失败"),
-                "raw": response["raw"],
-            }
+        code = str(payload.get("code") or "")
         result = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         tracking_no = str(result.get("kuaidinum") or "").strip()
         task_id = str(result.get("taskId") or "").strip()
+        # 快递100 code=30011 表示同一 orderId 的面单内容已重新取得；
+        # 部分通道同时返回 success=false，但只要关键结果完整就应按幂等成功处理。
+        recovered_existing_label = code == "30011" and bool(tracking_no and task_id)
+        if not recovered_existing_label and (not bool(payload.get("success")) or code != "200"):
+            provider_message = str(payload.get("message") or code or "电子面单下单失败")
+            if code == "30005":
+                provider_message = f"快递公司没有接受这笔面单：{provider_message}"
+            return {
+                "success": False,
+                "error": provider_message,
+                "raw": response["raw"],
+            }
         carrier_order_no = str(result.get("kdComOrderNum") or "").strip()
         if not tracking_no or not task_id:
             return {"success": False, "error": "电子面单响应缺少快递单号或 taskId。", "raw": response["raw"]}

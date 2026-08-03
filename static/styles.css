@@ -1059,6 +1059,9 @@ tr:last-child td {
   right: 18px;
   bottom: 18px;
   z-index: 20;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
   max-width: min(420px, calc(100vw - 36px));
   padding: 13px 15px;
   border: 1px solid rgba(0, 0, 0, 0.08);
@@ -1066,6 +1069,24 @@ tr:last-child td {
   background: rgba(29, 29, 31, 0.92);
   color: #ffffff;
   box-shadow: var(--shadow);
+}
+
+.toast.error {
+  border-color: rgba(255, 255, 255, 0.22);
+  background: rgba(157, 28, 25, 0.97);
+}
+
+.toast-close {
+  flex: 0 0 auto;
+  margin: -5px -5px -5px 0;
+  padding: 2px 5px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
 }
 
 .empty {
@@ -1109,6 +1130,72 @@ tr:last-child td {
 
 .shipping-batch-panel {
   margin-bottom: 16px;
+}
+
+.task-alert-panel {
+  margin-bottom: 16px;
+  border-color: rgba(201, 52, 47, 0.18);
+}
+
+.task-ok-message {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid rgba(35, 134, 54, 0.18);
+  border-radius: var(--radius);
+  background: rgba(35, 134, 54, 0.07);
+  color: #17662a;
+  font-size: 13px;
+}
+
+.task-alert-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.task-alert-item,
+.batch-error-item,
+.inline-failure {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid rgba(201, 52, 47, 0.2);
+  border-radius: var(--radius);
+  background: rgba(201, 52, 47, 0.055);
+}
+
+.task-alert-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 5px;
+}
+
+.task-alert-heading > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.task-alert-message,
+.task-alert-advice {
+  max-width: 100%;
+  margin-top: 8px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.task-alert-advice {
+  color: #5f3920;
+}
+
+.task-alert-item .inline-actions {
+  margin-top: 10px;
+}
+
+.inline-failure {
+  color: var(--red);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .batch-print-actions {
@@ -1209,10 +1296,15 @@ tr:last-child td {
 
 .batch-errors {
   display: grid;
-  gap: 7px;
+  gap: 10px;
   margin-top: 12px;
   color: var(--red);
   font-size: 13px;
+}
+
+.batch-error-item > div {
+  margin-top: 5px;
+  line-height: 1.5;
 }
 
 .notice {
@@ -1229,6 +1321,12 @@ tr:last-child td {
   border-color: rgba(201, 52, 47, 0.24);
   background: rgba(201, 52, 47, 0.07);
   color: var(--red);
+}
+
+.task-progress {
+  border-color: rgba(0, 102, 204, 0.2);
+  background: rgba(0, 102, 204, 0.07);
+  color: #075a9e;
 }
 
 .config-detail {
@@ -1348,6 +1446,21 @@ tr:last-child td {
   .user-strip {
     width: 100%;
     justify-content: space-between;
+  }
+
+  .task-alert-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .task-alert-item .inline-actions .btn {
+    width: 100%;
+  }
+
+  .toast {
+    right: 12px;
+    bottom: 12px;
+    max-width: calc(100vw - 24px);
   }
 }
 
