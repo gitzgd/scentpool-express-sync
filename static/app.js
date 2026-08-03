@@ -15,7 +15,7 @@ const state = {
   submitItems: [{ category: "", barcode: "", quantity: 1 }],
   submitDraft: { store_id: "", recipient_name: "", phone: "", address: "", store_order_no: "", remark: "" },
   returnItems: [{ category: "", barcode: "", quantity: 1 }],
-  returnDraft: { store_id: "", express_company: "圆通", tracking_no: "", sender_phone: "", remark: "" },
+  returnDraft: { store_id: "", tracking_no: "", sender_phone: "", remark: "" },
   adminFilters: { store_id: "", status: "待处理", date_from: "", date_to: "", q: "" },
   storeFilters: { status: "", date_from: "", date_to: "", q: "" },
   adminShipmentPage: 1,
@@ -890,8 +890,14 @@ function renderMiniShipments(shipments) {
 
 function renderTrackingDetailBlock(row, options = {}) {
   const showCopy = Boolean(options.showCopy);
-  const company = row.express_company || DEFAULT_EXPRESS_COMPANY;
-  const summary = cleanTrackingEvent(row.tracking_last_event) || row.tracking_status || (row.tracking_error ? "物流查询失败" : "物流待查询");
+  const isReturnTracking = Boolean(row.express_company_source);
+  const company = row.express_company || (isReturnTracking ? "快递公司待识别" : DEFAULT_EXPRESS_COMPANY);
+  const companyLabel = row.express_company_source === "kuaidi100"
+    ? `快递100识别（仅供参考）：${company}`
+    : company;
+  const summary = cleanTrackingEvent(row.tracking_last_event)
+    || (row.tracking_status === "查询失败" && row.tracking_error ? row.tracking_error : row.tracking_status)
+    || (row.tracking_error ? "物流查询失败" : "物流待查询");
   const detailParts = trackingDetailParts(row);
   const statusHtml = row.tracking_status
     ? `<span class="status ${trackingClass(row.tracking_status)}">${escapeHtml(row.tracking_status)}</span>`
@@ -903,7 +909,7 @@ function renderTrackingDetailBlock(row, options = {}) {
         <strong>${escapeHtml(summary)}</strong>
       </div>
       <div class="tracking-number-row">
-        <span>${escapeHtml(company)} ${escapeHtml(row.tracking_no)}</span>
+        <span>${escapeHtml(companyLabel)} ${escapeHtml(row.tracking_no)}</span>
         ${showCopy ? `<button class="btn secondary small" data-copy-tracking="${escapeHtml(row.tracking_no)}" type="button">复制</button>` : ""}
       </div>
       ${
@@ -1376,7 +1382,6 @@ function captureReturnDraft() {
   const data = new FormData(form);
   state.returnDraft = {
     store_id: data.get("store_id") || "",
-    express_company: data.get("express_company") || DEFAULT_EXPRESS_COMPANY,
     tracking_no: data.get("tracking_no") || "",
     sender_phone: data.get("sender_phone") || "",
     remark: data.get("remark") || "",
@@ -1430,22 +1435,20 @@ async function renderReturnNew() {
       <section class="panel panel-pad">
         <form id="returnForm">
           <div class="form-grid">
-            <div class="field">
+            <div class="field full">
               <label>门店</label>
               <span class="store-badge">${escapeHtml(state.user.store_name || "当前门店")}</span>
             </div>
-            <div class="field">
-              <label for="returnCompany">快递公司</label>
-              <select class="select" id="returnCompany" name="express_company">
-                ${expressCompanyOptions(state.returnDraft.express_company)}
-              </select>
+            <div class="field full">
+              <label>快递公司</label>
+              <div class="notice" style="margin-top: 0;">无需选择。提交后由快递100根据单号自动识别，并在退货看板显示识别结果（仅供参考）；识别或查询失败时会显示明确的红色原因和处理提示。</div>
             </div>
             <div class="field">
               <label for="returnTrackingNo">退货快递单号</label>
               <input class="input" id="returnTrackingNo" name="tracking_no" value="${escapeHtml(state.returnDraft.tracking_no)}" required />
             </div>
             <div class="field">
-              <label for="returnSenderPhone">联系电话/顺丰尾号</label>
+              <label for="returnSenderPhone">联系电话（顺丰查询建议填写）</label>
               <input class="input" id="returnSenderPhone" name="sender_phone" inputmode="tel" value="${escapeHtml(state.returnDraft.sender_phone)}" />
             </div>
             <div class="field full">
@@ -1521,18 +1524,26 @@ function bindReturnNew() {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const payload = {
-      express_company: form.get("express_company"),
       tracking_no: form.get("tracking_no"),
       sender_phone: form.get("sender_phone"),
       remark: form.get("remark"),
       items: validReturnItems(),
     };
     try {
-      await api("/api/returns", { method: "POST", body: JSON.stringify(payload) });
+      const submitButton = event.currentTarget.querySelector('button[type="submit"]');
+      const data = await withButtonBusy(submitButton, "正在识别并提交…", () =>
+        api("/api/returns", { method: "POST", body: JSON.stringify(payload) })
+      );
       state.returnItems = [{ category: "", barcode: "", quantity: 1 }];
-      state.returnDraft = { store_id: "", express_company: DEFAULT_EXPRESS_COMPANY, tracking_no: "", sender_phone: "", remark: "" };
-      toast("退货已提交。");
+      state.returnDraft = { store_id: "", tracking_no: "", sender_phone: "", remark: "" };
       navigate("/returns");
+      if (data.return_order?.tracking_status === "查询失败") {
+        toast("退货已保存，但快递公司识别或物流查询没有成功。请查看退货看板中的红色失败原因，核对单号后再重试。", { type: "error", duration: 9000 });
+      } else if (data.return_order?.express_company) {
+        toast(`退货已提交，快递100识别为“${data.return_order.express_company}”。`);
+      } else {
+        toast("退货已提交，快递公司正在识别。");
+      }
     } catch (error) {
       errorToast(error);
     }
@@ -1817,6 +1828,9 @@ function taskAlertAdvice(type, message = "") {
   }
   if (type === "面单打印失败") {
     return "请检查打印机或浏览器弹窗；PDF批量打印失败时减少单次数量后重试。";
+  }
+  if (type === "退货物流查询失败" && /识别|单号|快递公司/.test(String(message || ""))) {
+    return "请先核对退货看板显示的快递单号。单号录入错误或提示接口权限、不支持该快递公司时，请联系管理员处理；单号无误时等待30分钟后再查询。";
   }
   if (type === "物流查询失败" || type === "退货物流查询失败") {
     return "这不会删除快递单号。请稍后再次查询，或等待系统下一轮自动同步。";

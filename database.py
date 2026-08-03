@@ -232,7 +232,8 @@ class Database:
                     store_id INTEGER NOT NULL,
                     store_name_snapshot TEXT NOT NULL,
                     created_by INTEGER NOT NULL,
-                    express_company TEXT NOT NULL DEFAULT '圆通',
+                    express_company TEXT NOT NULL DEFAULT '',
+                    express_company_source TEXT NOT NULL DEFAULT 'manual',
                     tracking_no TEXT NOT NULL,
                     sender_phone TEXT NOT NULL DEFAULT '',
                     remark TEXT NOT NULL DEFAULT '',
@@ -359,6 +360,7 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_return_orders_store ON return_orders(store_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_return_orders_created ON return_orders(created_at)")
             self._ensure_shipment_tracking_columns(conn)
+            self._ensure_return_tracking_columns(conn)
             self._ensure_shipping_batch_columns(conn)
             self._ensure_label_columns(conn)
             self._normalize_shipments_with_tracking(conn)
@@ -582,6 +584,15 @@ class Database:
         for name, definition in columns.items():
             if name not in existing:
                 conn.execute(f"ALTER TABLE shipments ADD COLUMN {name} {definition}")
+
+    def _ensure_return_tracking_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(return_orders)").fetchall()}
+        columns = {
+            "express_company_source": "TEXT NOT NULL DEFAULT 'manual'",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE return_orders ADD COLUMN {name} {definition}")
 
     def _normalize_shipments_with_tracking(self, conn: sqlite3.Connection) -> None:
         now = now_text()
@@ -2404,9 +2415,6 @@ class Database:
         except (TypeError, ValueError):
             raise AppError("请选择门店。")
 
-        express_company = str(payload.get("express_company", "")).strip() or DEFAULT_EXPRESS_COMPANY
-        if express_company not in EXPRESS_COMPANIES:
-            raise AppError("请选择有效快递公司。")
         tracking_no = str(payload.get("tracking_no", "")).strip()
         sender_phone = str(payload.get("sender_phone", "")).strip()
         remark = str(payload.get("remark", "")).strip()
@@ -2430,16 +2438,15 @@ class Database:
                 cursor = conn.execute(
                     """
                     INSERT INTO return_orders (
-                        store_id, store_name_snapshot, created_by, express_company, tracking_no,
+                        store_id, store_name_snapshot, created_by, express_company, express_company_source, tracking_no,
                         sender_phone, remark, status, tracking_status, created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, '待查询', '待查询', ?, ?)
+                    VALUES (?, ?, ?, '', 'auto_pending', ?, ?, ?, '待查询', '待查询', ?, ?)
                     """,
                     (
                         store_id,
                         store["name"],
                         user["id"],
-                        express_company,
                         tracking_no,
                         sender_phone,
                         remark,
@@ -2578,13 +2585,19 @@ class Database:
             cursor = conn.execute(
                 """
                 UPDATE return_orders
-                SET tracking_provider = ?, tracking_status = ?, tracking_state_code = ?,
+                SET express_company = CASE WHEN ? <> '' THEN ? ELSE express_company END,
+                    express_company_source = CASE WHEN ? <> '' THEN ? ELSE express_company_source END,
+                    tracking_provider = ?, tracking_status = ?, tracking_state_code = ?,
                     tracking_last_event = ?, tracking_last_checked_at = ?,
                     tracking_signed_at = ?, tracking_error = ?, tracking_raw = ?,
                     status = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
+                    str(result.get("express_company") or ""),
+                    str(result.get("express_company") or ""),
+                    str(result.get("express_company_source") or ""),
+                    str(result.get("express_company_source") or ""),
                     str(result.get("provider") or ""),
                     tracking_status,
                     str(result.get("state_code") or ""),

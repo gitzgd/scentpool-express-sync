@@ -41,6 +41,7 @@ python3 server.py --host 0.0.0.0 --port 8765
 - `SCENTPOOL_RETURN_TRACKING_INTERVAL_MINUTES=720`：退货单自动查询间隔，默认 12 小时。
 - 总部“同步物流”会刷新全部超过 30 分钟未查询的已发货、未签收订单；30 分钟内已查询的订单会按快递100要求跳过。
 - `SCENTPOOL_KUAIDI100_ENDPOINT=https://poll.kuaidi100.com/poll/query.do`：快递100实时查询接口地址。
+- `SCENTPOOL_KUAIDI100_AUTODETECT_ENDPOINT=https://www.kuaidi100.com/autonumber/auto`：退货快递公司智能识别接口地址。
 - `SCENTPOOL_KUAIDI100_CUSTOMER`：快递100 customer，只放 Render 环境变量。
 - `SCENTPOOL_KUAIDI100_KEY`：快递100 key，只放 Render 环境变量。
 - `SCENTPOOL_KUAIDI100_LABEL_ENABLED=0`：快递100电子面单开关，测试完成前保持 `0`。
@@ -106,7 +107,7 @@ curl -b cookie.txt -c cookie.txt \
 
 ## 物流查询
 
-总部在发货后台为待处理订单填写快递单号后，系统会自动改为“已发货”并立即查询一次物流。开启快递100环境变量后，后台使用快递100实时查询接口（`https://poll.kuaidi100.com/poll/query.do`）每 6 小时查询一次未签收发货单；退货单默认每 12 小时查询一次。总部也可以在发货后台点击“同步物流”，或在退货看板点击“同步退货物流”手动刷新。
+总部在发货后台为待处理订单填写快递单号后，系统会自动改为“已发货”并立即查询一次物流。门店新增退货时只填写快递单号，系统先由快递100智能识别快递公司，再立即查询物流；历史查询失败的退货重试时也会重新识别。识别结果在退货看板标为“仅供参考”，识别或查询失败会保留退货记录并显示明确原因。开启快递100环境变量后，后台使用快递100实时查询接口（`https://poll.kuaidi100.com/poll/query.do`）每 6 小时查询一次未签收发货单；退货单默认每 12 小时查询一次。总部也可以在发货后台点击“同步物流”，或在退货看板点击“同步退货物流”手动刷新。
 
 快递100返回签收后，系统会自动更新：
 
