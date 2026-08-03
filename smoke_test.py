@@ -215,41 +215,105 @@ def main() -> None:
                 return SimpleSuccess()
             return FakeLabelResponse()
 
+        label_shipment = {
+            "express_company": "圆通",
+            "recipient_name": "测试收件人",
+            "phone": "13800138000",
+            "address": "上海市测试路1号",
+            "booking_salt": "salt-smoke",
+            "booking_request_id": "SP20260710S01N1",
+            "remark": "烟测",
+            "items": [
+                {"product_category": "睡眠喷雾", "product_name": "（喷雾）基诺山雨林与苔藓", "quantity": 2},
+                {"product_category": "香包", "product_name": "（香包）曼听墨玫瑰", "quantity": 1},
+            ],
+        }
+        label_settings = {
+            "sender_name": "总部",
+            "sender_mobile": "13900139000",
+            "sender_address": "云南省昆明市测试路1号",
+            "cargo_name": "香氛商品",
+            "partnerId": "CAINIAO-ID",
+            "partnerKey": "CAINIAO-KEY",
+            "net": "cainiao",
+            "tbNet": "测试网点,001",
+            "third_template_url": "https://cloudprint.cainiao.com/template/standard/850338",
+            "third_custom_template_url": "https://cloudprint.cainiao.com/template/customArea/77205369",
+            "pay_type": "MONTHLY",
+            "print_mode": "PDF",
+        }
         original_shipping_urlopen = shipping.urllib.request.urlopen
         try:
             shipping.urllib.request.urlopen = fake_label_urlopen
             order_result = shipping.Kuaidi100LabelClient("test-key", "test-label-secret").create_label(
-                {
-                    "express_company": "圆通",
-                    "recipient_name": "测试收件人",
-                    "phone": "13800138000",
-                    "address": "上海市测试路1号",
-                    "booking_salt": "salt-smoke",
-                    "booking_request_id": "SP20260710S01N1",
-                    "remark": "烟测",
-                    "items": [
-                        {"product_category": "睡眠喷雾", "product_name": "（喷雾）基诺山雨林与苔藓", "quantity": 2},
-                        {"product_category": "香包", "product_name": "（香包）曼听墨玫瑰", "quantity": 1},
-                    ],
-                },
-                {
-                    "sender_name": "总部",
-                    "sender_mobile": "13900139000",
-                    "sender_address": "云南省昆明市测试路1号",
-                    "cargo_name": "香氛商品",
-                    "partnerId": "CAINIAO-ID",
-                    "partnerKey": "CAINIAO-KEY",
-                    "net": "cainiao",
-                    "tbNet": "测试网点,001",
-                    "third_template_url": "https://cloudprint.cainiao.com/template/standard/850338",
-                    "third_custom_template_url": "https://cloudprint.cainiao.com/template/customArea/77205369",
-                    "pay_type": "MONTHLY",
-                    "print_mode": "PDF",
-                },
+                label_shipment,
+                label_settings,
             )
         finally:
             shipping.urllib.request.urlopen = original_shipping_urlopen
         assert order_result["success"] is True
+
+        class RecoveredLabelResponse(FakeLabelResponse):
+            def read(self):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "code": 30011,
+                        "message": "重新获取面单成功",
+                        "data": {
+                            "taskId": "TASK-RECOVERED",
+                            "kuaidinum": "YT-RECOVERED-001",
+                            "label": "https://example.test/label/recovered.pdf",
+                        },
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+
+        try:
+            shipping.urllib.request.urlopen = lambda _request, timeout=0: RecoveredLabelResponse()
+            recovered_order = shipping.Kuaidi100LabelClient(
+                "test-key", "test-label-secret"
+            ).create_label(label_shipment, label_settings)
+        finally:
+            shipping.urllib.request.urlopen = original_shipping_urlopen
+        assert recovered_order["success"] is True
+        assert recovered_order["tracking_no"] == "YT-RECOVERED-001"
+        assert recovered_order["task_id"] == "TASK-RECOVERED"
+
+        class IncompleteRecoveredLabelResponse(FakeLabelResponse):
+            def read(self):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "code": 30011,
+                        "message": "重新获取面单成功但缺少任务号",
+                        "data": {"kuaidinum": "YT-INCOMPLETE-001"},
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+
+        try:
+            shipping.urllib.request.urlopen = lambda _request, timeout=0: IncompleteRecoveredLabelResponse()
+            incomplete_order = shipping.Kuaidi100LabelClient(
+                "test-key", "test-label-secret"
+            ).create_label(label_shipment, label_settings)
+        finally:
+            shipping.urllib.request.urlopen = original_shipping_urlopen
+        assert incomplete_order["success"] is False
+
+        try:
+            def fail_label_urlopen(_request, timeout=0):
+                raise urllib.error.URLError("synthetic network failure")
+
+            shipping.urllib.request.urlopen = fail_label_urlopen
+            transient_result = shipping.Kuaidi100LabelClient(
+                "test-key", "test-label-secret"
+            )._post("https://api.kuaidi100.com/label/order", "order", {})
+        finally:
+            shipping.urllib.request.urlopen = original_shipping_urlopen
+        assert transient_result["success"] is False
+        assert transient_result["retryable"] is True
+        assert transient_result["error"] == "暂时无法连接快递100，请检查网络后重试。"
         order_form = urllib.parse.parse_qs(shipping_captured["payload"])
         order_param = order_form["param"][0]
         expected_order_sign = hashlib.md5(
@@ -441,8 +505,35 @@ def main() -> None:
             failed_job["batch_item_id"],
             {"success": False, "error": "模拟失败", "raw": "{}"},
         )
+        failure_alerts = legacy_db.task_alerts()
+        assert failure_alerts["counts"]["面单下单失败"] == 1
+        assert failure_alerts["items"][0]["message"] == "模拟失败"
+        assert "recipient_name" not in failure_alerts["items"][0]
+        assert "phone" not in failure_alerts["items"][0]
+        assert "address" not in failure_alerts["items"][0]
         retried_batch = legacy_db.retry_shipping_batch(large_batch["batch"]["id"])
         assert retried_batch["counts"]["排队中"] == 51
+        stale_job = legacy_db.claim_next_shipping_job()
+        assert stale_job is not None
+        with legacy_db.connect() as legacy_conn:
+            legacy_conn.execute(
+                "UPDATE shipping_batch_items SET updated_at = '2000-01-01T00:00:00+08:00' WHERE id = ?",
+                (stale_job["batch_item_id"],),
+            )
+        recovered = legacy_db.reset_stale_shipping_jobs()
+        assert recovered == {"requeued": 1, "failed": 0}
+        stale_job = legacy_db.claim_next_shipping_job()
+        assert stale_job is not None
+        with legacy_db.connect() as legacy_conn:
+            legacy_conn.execute(
+                "UPDATE shipping_batch_items SET updated_at = '2000-01-01T00:00:00+08:00' WHERE id = ?",
+                (stale_job["batch_item_id"],),
+            )
+        recovered = legacy_db.reset_stale_shipping_jobs()
+        assert recovered == {"requeued": 0, "failed": 1}
+        timeout_alerts = legacy_db.task_alerts()
+        assert timeout_alerts["counts"]["面单下单失败"] == 1
+        assert "停止自动重试" in timeout_alerts["items"][0]["message"]
 
         db_path = str(Path(tmp) / "test.db")
         server.DB = Database(db_path)
@@ -482,6 +573,11 @@ def main() -> None:
         assert body["storage"]["journal_mode"] == "wal"
         assert body["storage"]["table_counts"]["products"] == 52
         assert body["process"]["request_thread_limit"] == server.MAX_REQUEST_THREADS
+
+        status, body = request(admin, base, "GET", "/api/admin/task-alerts")
+        assert status == 200, body
+        assert body["counts"]["total"] == 0
+        assert body["items"] == []
 
         status, body = request(admin, base, "GET", "/api/admin/tracking/config")
         assert status == 200, body
@@ -553,6 +649,8 @@ def main() -> None:
         assert body["user"]["role"] == "staff"
 
         status, body = request(staff, base, "GET", "/api/admin/tracking/config")
+        assert status == 403, body
+        status, body = request(staff, base, "GET", "/api/admin/task-alerts")
         assert status == 403, body
 
         status, body = request(staff, base, "GET", "/shipments")
