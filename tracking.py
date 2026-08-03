@@ -13,6 +13,7 @@ from database import AppError, now_text
 
 
 KUAIDI100_ENDPOINT = "https://poll.kuaidi100.com/poll/query.do"
+KUAIDI100_AUTODETECT_ENDPOINT = "https://www.kuaidi100.com/autonumber/auto"
 SIGNED_STATE = "3"
 PROBLEM_STATE = "2"
 PENDING_TRACE_MESSAGES = ("查询无结果", "暂无轨迹", "暂无物流", "未查询到物流", "没有物流信息")
@@ -21,6 +22,7 @@ EXPRESS_COMPANY_CODES = {
     "顺丰": "shunfeng",
     "京东": "jd",
 }
+EXPRESS_CODE_COMPANIES = {code: company for company, code in EXPRESS_COMPANY_CODES.items()}
 
 
 def env_flag(name: str) -> bool:
@@ -60,10 +62,17 @@ def mask_secret(value: str) -> str:
 
 
 class Kuaidi100Client:
-    def __init__(self, customer: str, key: str, endpoint: str = KUAIDI100_ENDPOINT):
+    def __init__(
+        self,
+        customer: str,
+        key: str,
+        endpoint: str = KUAIDI100_ENDPOINT,
+        autodetect_endpoint: str = KUAIDI100_AUTODETECT_ENDPOINT,
+    ):
         self.customer = customer.strip()
         self.key = key.strip()
         self.endpoint = endpoint.strip() or KUAIDI100_ENDPOINT
+        self.autodetect_endpoint = autodetect_endpoint.strip() or KUAIDI100_AUTODETECT_ENDPOINT
 
     @classmethod
     def from_env(cls) -> "Kuaidi100Client":
@@ -71,10 +80,57 @@ class Kuaidi100Client:
             os.environ.get("SCENTPOOL_KUAIDI100_CUSTOMER", ""),
             os.environ.get("SCENTPOOL_KUAIDI100_KEY", ""),
             os.environ.get("SCENTPOOL_KUAIDI100_ENDPOINT", KUAIDI100_ENDPOINT),
+            os.environ.get("SCENTPOOL_KUAIDI100_AUTODETECT_ENDPOINT", KUAIDI100_AUTODETECT_ENDPOINT),
         )
 
     def is_configured(self) -> bool:
         return bool(self.customer and self.key)
+
+    def detect_company(self, tracking_no: str) -> Dict[str, str]:
+        if not self.key:
+            raise AppError("快递100智能识别未配置，请联系管理员检查接口密钥。", 503)
+
+        tracking_no = str(tracking_no or "").strip()
+        if not tracking_no:
+            raise AppError("请输入退货快递单号。")
+
+        query = urllib.parse.urlencode({"num": tracking_no, "key": self.key})
+        request = urllib.request.Request(f"{self.autodetect_endpoint}?{query}", method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise AppError("快递100智能识别服务暂时无法连接，请稍后在退货看板点击“查物流”。", 503) from exc
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise AppError("快递100智能识别返回异常，请稍后在退货看板点击“查物流”。", 503) from exc
+
+        if isinstance(data, dict):
+            code = str(data.get("returnCode") or "").strip()
+            message = str(data.get("message") or "").strip()
+            if code in {"601", "701"}:
+                raise AppError("快递100账号尚未开通智能单号识别，请联系管理员检查接口权限。", 503)
+            if code == "201":
+                raise AppError("快递100无法识别这个单号，请核对单号是否完整、准确。")
+            detail = message[:160] if message else "没有返回候选快递公司"
+            raise AppError(f"快递100暂时无法识别快递公司：{detail}。请核对单号后重试。")
+
+        if not isinstance(data, list) or not data:
+            raise AppError("快递100暂时无法识别该单号对应的快递公司，请核对单号是否完整；确认无误后稍后重试。")
+
+        candidate = data[0] if isinstance(data[0], dict) else {}
+        company_code = str(candidate.get("comCode") or "").strip().lower()
+        company = EXPRESS_CODE_COMPANIES.get(company_code)
+        provider_name = str(candidate.get("name") or company_code or "未知快递").strip()
+        if not company:
+            raise AppError(f"快递100识别为“{provider_name}”，但系统暂不支持该快递公司，请联系总部处理。")
+        return {
+            "express_company": company,
+            "company_code": company_code,
+            "provider_name": provider_name,
+        }
 
     def query(self, shipment: Dict[str, Any]) -> Dict[str, Any]:
         if not self.is_configured():
@@ -120,13 +176,15 @@ class Kuaidi100Client:
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
                 raw = response.read().decode("utf-8")
-        except urllib.error.URLError as exc:
+        except (urllib.error.URLError, TimeoutError) as exc:
             return tracking_error_result(f"快递100请求失败：{exc}", provider="kuaidi100")
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
             return tracking_error_result("快递100返回内容不是有效 JSON。", provider="kuaidi100", raw=raw)
+        if not isinstance(data, dict):
+            return tracking_error_result("快递100返回格式异常，请稍后重试。", provider="kuaidi100", raw=raw)
         return normalize_kuaidi100_response(data, raw)
 
     def sign(self, param: str) -> str:
@@ -248,6 +306,10 @@ def query_tracking(shipment: Dict[str, Any]) -> Dict[str, Any]:
     return tracking_client().query(shipment)
 
 
+def detect_tracking_company(tracking_no: str) -> Dict[str, str]:
+    return tracking_client().detect_company(tracking_no)
+
+
 def tracking_config_public() -> Dict[str, Any]:
     client = Kuaidi100Client.from_env()
     return {
@@ -255,6 +317,7 @@ def tracking_config_public() -> Dict[str, Any]:
         "configured": client.is_configured(),
         "customer": mask_secret(client.customer),
         "endpoint": client.endpoint,
+        "autodetect_endpoint": client.autodetect_endpoint,
         "auto": tracking_auto_enabled(),
         "interval_minutes": tracking_interval_minutes(),
     }

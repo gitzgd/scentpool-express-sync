@@ -342,6 +342,8 @@ a {
 .store-badge {
   background: #eef5ff;
   color: var(--blue-ink);
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .count-pill {
@@ -883,12 +885,18 @@ tr:last-child td {
 .tracking-summary-row strong {
   min-width: 0;
   line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .tracking-number-row {
   justify-content: flex-start;
   color: var(--muted);
   font-size: 12px;
+}
+
+.tracking-number-row span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .tracking-number-row strong {

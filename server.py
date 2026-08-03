@@ -32,7 +32,7 @@ from shipping import (
     parse_auth_callback,
     verify_callback_signature,
 )
-from tracking import manual_refresh_stale_before, query_tracking, tracking_auto_enabled, tracking_config_public, tracking_interval_minutes, tracking_stale_before
+from tracking import detect_tracking_company, manual_refresh_stale_before, query_tracking, tracking_auto_enabled, tracking_config_public, tracking_interval_minutes, tracking_stale_before
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -449,6 +449,38 @@ def refresh_tracking_for_shipment(shipment: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
+    company = str(return_order.get("express_company") or "").strip()
+    company_source = str(return_order.get("express_company_source") or "manual").strip()
+    tracking_status = str(return_order.get("tracking_status") or "").strip()
+    needs_detection = not company or company_source == "auto_pending" or tracking_status == "查询失败"
+    detection_error: Optional[AppError] = None
+
+    if needs_detection:
+        try:
+            detected = detect_tracking_company(str(return_order.get("tracking_no") or ""))
+            company = str(detected.get("express_company") or "").strip()
+            company_source = "kuaidi100"
+            return_order = {
+                **return_order,
+                "express_company": company,
+                "express_company_source": company_source,
+            }
+        except AppError as exc:
+            detection_error = exc
+            if company_source != "kuaidi100" or not company:
+                result = {
+                    "provider": "kuaidi100",
+                    "tracking_status": "查询失败",
+                    "state_code": "",
+                    "last_event": return_order.get("tracking_last_event") or "",
+                    "checked_at": now_text(),
+                    "signed_at": "",
+                    "error": f"快递公司自动识别失败：{exc.message}",
+                    "raw": "",
+                    "is_signed": False,
+                }
+                return DB.apply_return_tracking_result(int(return_order["id"]), result)
+
     try:
         result = query_tracking(return_order)
     except AppError as exc:
@@ -462,6 +494,18 @@ def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
             "error": exc.message,
             "raw": "",
             "is_signed": False,
+        }
+    if detection_error and result.get("tracking_status") == "查询失败":
+        query_error = str(result.get("error") or "暂时没有取得物流信息。")
+        result = {
+            **result,
+            "error": f"快递公司重新识别失败：{detection_error.message}；按上次识别的“{company}”查询也失败：{query_error}",
+        }
+    if company_source == "kuaidi100" and company:
+        result = {
+            **result,
+            "express_company": company,
+            "express_company_source": company_source,
         }
     return DB.apply_return_tracking_result(int(return_order["id"]), result)
 
@@ -1083,6 +1127,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/returns" and self.command == "POST":
             return_order = DB.create_return_order(user, self.read_json())
+            refresh_tracking_for_return(return_order)
+            return_order = DB.get_return_order(int(return_order["id"]), user)
             self.send_json({"return_order": return_order}, status=201)
             return
 
