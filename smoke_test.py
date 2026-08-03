@@ -1175,8 +1175,8 @@ def main() -> None:
             conn.execute(
                 """
                 UPDATE return_orders
-                SET express_company = '圆通', express_company_source = 'manual', tracking_status = '查询失败',
-                    tracking_error = '旧记录快递公司不匹配', tracking_last_checked_at = '2000-01-01T00:00:00+08:00'
+                SET express_company = '圆通', express_company_source = 'manual', tracking_status = '等待揽收',
+                    tracking_error = '', tracking_last_checked_at = '2000-01-01T00:00:00+08:00'
                 WHERE id = ?
                 """,
                 (return_id,),
@@ -1208,6 +1208,70 @@ def main() -> None:
         assert body["return_order"]["express_company_source"] == "auto_pending"
         assert "快递公司自动识别失败" in body["return_order"]["tracking_error"]
         assert "核对单号" in body["return_order"]["tracking_error"]
+
+        test_staff_user = server.DB.authenticate("store01", "scentpool2026")
+        assert test_staff_user is not None
+        fallback_return = server.DB.create_return_order(
+            test_staff_user,
+            {
+                "tracking_no": "LEGACY-FALLBACK-SMOKE-003",
+                "items": [{"barcode": product["barcode"], "quantity": 1}],
+            },
+        )
+        with server.DB.connect() as conn:
+            conn.execute(
+                """
+                UPDATE return_orders
+                SET express_company = '圆通', express_company_source = 'manual', tracking_status = '等待揽收'
+                WHERE id = ?
+                """,
+                (fallback_return["id"],),
+            )
+        fallback_return = server.DB.get_return_order(
+            fallback_return["id"],
+            test_staff_user,
+        )
+
+        def fake_fallback_query(return_order):
+            assert return_order["express_company"] == "圆通"
+            return {
+                "provider": "kuaidi100",
+                "tracking_status": "运输中",
+                "state_code": "0",
+                "last_event": "2026-07-07 12:00:00 旧公司兜底查询成功",
+                "checked_at": "2026-07-07T12:05:00+08:00",
+                "signed_at": "",
+                "error": "",
+                "raw": "{}",
+                "is_signed": False,
+            }
+
+        server.detect_tracking_company = fake_detection_failure
+        server.query_tracking = fake_fallback_query
+        fallback_result = server.refresh_tracking_for_return(fallback_return)
+        assert fallback_result["status"] == "运输中"
+        fallback_updated = server.DB.get_return_order(
+            fallback_return["id"],
+            test_staff_user,
+        )
+        assert fallback_updated["express_company"] == "圆通"
+        assert fallback_updated["express_company_source"] == "manual"
+
+        unexpected_return = server.DB.create_return_order(
+            test_staff_user,
+            {
+                "tracking_no": "UNEXPECTED-SMOKE-004",
+                "items": [{"barcode": product["barcode"], "quantity": 1}],
+            },
+        )
+        server.detect_tracking_company = lambda _tracking_no: (_ for _ in ()).throw(RuntimeError("synthetic provider fault"))
+        unexpected_result = server.refresh_tracking_for_return(unexpected_return)
+        assert unexpected_result["tracking_status"] == "查询失败"
+        unexpected_updated = server.DB.get_return_order(
+            unexpected_return["id"],
+            test_staff_user,
+        )
+        assert "系统暂时无法完成快递公司识别" in unexpected_updated["tracking_error"]
 
         status, body = request(
             staff,

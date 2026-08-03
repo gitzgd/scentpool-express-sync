@@ -452,8 +452,12 @@ def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
     company = str(return_order.get("express_company") or "").strip()
     company_source = str(return_order.get("express_company_source") or "manual").strip()
     tracking_status = str(return_order.get("tracking_status") or "").strip()
-    needs_detection = not company or company_source == "auto_pending" or tracking_status == "查询失败"
-    detection_error: Optional[AppError] = None
+    needs_detection = (
+        not company
+        or company_source in {"manual", "auto_pending"}
+        or tracking_status == "查询失败"
+    )
+    detection_error = ""
 
     if needs_detection:
         try:
@@ -466,20 +470,23 @@ def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
                 "express_company_source": company_source,
             }
         except AppError as exc:
-            detection_error = exc
-            if company_source != "kuaidi100" or not company:
-                result = {
-                    "provider": "kuaidi100",
-                    "tracking_status": "查询失败",
-                    "state_code": "",
-                    "last_event": return_order.get("tracking_last_event") or "",
-                    "checked_at": now_text(),
-                    "signed_at": "",
-                    "error": f"快递公司自动识别失败：{exc.message}",
-                    "raw": "",
-                    "is_signed": False,
-                }
-                return DB.apply_return_tracking_result(int(return_order["id"]), result)
+            detection_error = exc.message
+        except Exception as exc:
+            print(f"[tracking] 退货快递公司识别异常：{type(exc).__name__}")
+            detection_error = "系统暂时无法完成快递公司识别，请稍后在退货看板重试。"
+        if detection_error and not company:
+            result = {
+                "provider": "kuaidi100",
+                "tracking_status": "查询失败",
+                "state_code": "",
+                "last_event": return_order.get("tracking_last_event") or "",
+                "checked_at": now_text(),
+                "signed_at": "",
+                "error": f"快递公司自动识别失败：{detection_error}",
+                "raw": "",
+                "is_signed": False,
+            }
+            return DB.apply_return_tracking_result(int(return_order["id"]), result)
 
     try:
         result = query_tracking(return_order)
@@ -495,11 +502,24 @@ def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
             "raw": "",
             "is_signed": False,
         }
+    except Exception as exc:
+        print(f"[tracking] 退货物流查询异常：{type(exc).__name__}")
+        result = {
+            "provider": "kuaidi100",
+            "tracking_status": "查询失败",
+            "state_code": "",
+            "last_event": return_order.get("tracking_last_event") or "",
+            "checked_at": now_text(),
+            "signed_at": "",
+            "error": "系统暂时无法完成退货物流查询，请稍后在退货看板重试。",
+            "raw": "",
+            "is_signed": False,
+        }
     if detection_error and result.get("tracking_status") == "查询失败":
         query_error = str(result.get("error") or "暂时没有取得物流信息。")
         result = {
             **result,
-            "error": f"快递公司重新识别失败：{detection_error.message}；按上次识别的“{company}”查询也失败：{query_error}",
+            "error": f"快递公司重新识别失败：{detection_error}；按已保存的“{company}”查询也失败：{query_error}",
         }
     if company_source == "kuaidi100" and company:
         result = {
