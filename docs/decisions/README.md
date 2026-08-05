@@ -15,3 +15,4 @@
 - [`ADR-0001-sqlite-single-instance.md`](ADR-0001-sqlite-single-instance.md)：单实例阶段继续使用 SQLite。
 - [`ADR-0002-provider-confirmed-label-cancellation.md`](ADR-0002-provider-confirmed-label-cancellation.md)：只有供应商确认后才释放电子面单。
 - [`ADR-0003-default-delivery-and-local-acceptance.md`](ADR-0003-default-delivery-and-local-acceptance.md)：普通改动默认提交、发布，并提供合成数据本地验收界面。
+- [`ADR-0004-daily-audit-readonly-boundary.md`](ADR-0004-daily-audit-readonly-boundary.md)：日报使用独立令牌、独立只读连接和汇总白名单。

@@ -35,6 +35,7 @@ python3 server.py --host 0.0.0.0 --port 8765
 - `SCENTPOOL_SESSION_SECURE=1`：Cookie 增加 `Secure`。
 - `SCENTPOOL_ADMIN_PASSWORD`：生产首次启动且没有迁移数据库时，用它创建总部账号。
 - `SCENTPOOL_ALLOW_DB_RESTORE=1`：临时开启数据库恢复接口，恢复完成后应改回 `0`。
+- `SCENTPOOL_AUDIT_TOKEN`：脱敏业务日报接口的独立 Bearer 令牌。只在获授权的部署操作中配置，不写入仓库，也不能替代总部会话访问其他接口。
 - `SCENTPOOL_TRACKING_PROVIDER=kuaidi100`：物流查询服务商。
 - `SCENTPOOL_TRACKING_AUTO=1`：开启自动物流查询。
 - `SCENTPOOL_TRACKING_INTERVAL_MINUTES=360`：发货单自动查询间隔，默认 6 小时。
@@ -58,6 +59,14 @@ python3 server.py --host 0.0.0.0 --port 8765
 - 菜鸟授权面单使用每家快递公司自己的 `thirdTemplateURL`。圆通当前配置为一联单模板 `https://cloudprint.cainiao.com/template/standard/850338` 和货物自定义区模板 `https://cloudprint.cainiao.com/template/customArea/77205369`；京东和顺丰暂不配置模板。系统通过 `thirdCustomTemplateUrl` 和 `customParam.itemSummary` 传入按分类换行的商品名称与数量。
 - 电子面单的物品名称和备注会从发货单商品明细自动生成，格式为“【分类】商品名*数量”；同分类商品合并展示，不同分类自动换行，订单备注在全部货品信息后另起一行显示。物品栏超过 50 字时会清理重复品类前缀并逐级缩写每个商品的主关键词，但不会省略任何商品。自定义区内容最多 100 字。
 - 发货后台可从当前筛选结果中选择全部或部分“待打印”订单，服务端合并快递100返回的 PDF 后一次打开打印窗口；合并成功的订单会统一标记为“打印成功”，后续仍可从单个订单查看原面单。
+
+## 脱敏业务日报（已开发、未部署/待验收）
+
+`GET /api/admin/system/daily-audit?date=YYYY-MM-DD` 供每日盘点任务读取汇总数据。它不接受总部登录会话替代鉴权，只接受 `Authorization: Bearer <SCENTPOOL_AUDIT_TOKEN>`；该 Bearer 令牌也不能访问其他管理员接口。
+
+接口使用独立的 SQLite URI `mode=ro` 连接并启用 `PRAGMA query_only=ON`，只返回日期、时区、门店名和汇总数量，不返回个人信息、订单或物流标识、原始第三方报文、会话、密钥、环境变量值或数据库路径。完整字段、7 日窗口、当前快照限制、测试和部署步骤见 `docs/features/daily-audit.md`。
+
+当前仓库功能分支只完成代码与合成数据验收；尚未部署，也未配置或生成 `SCENTPOOL_AUDIT_TOKEN`。
 
 ## 发布到 Render
 

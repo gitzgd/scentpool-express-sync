@@ -107,6 +107,23 @@ class Database:
         conn.execute("PRAGMA wal_autocheckpoint = 1000")
         return conn
 
+    def connect_readonly(self) -> sqlite3.Connection:
+        """Open a reporting connection that cannot initialize, migrate, or write the database."""
+        database_uri = Path(self.path).expanduser().resolve().as_uri()
+        conn = sqlite3.connect(f"{database_uri}?mode=ro", uri=True, timeout=15)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 15000")
+            conn.execute("PRAGMA cache_size = -2048")
+            conn.execute("PRAGMA temp_store = FILE")
+            conn.execute("PRAGMA query_only = ON")
+            if int(conn.execute("PRAGMA query_only").fetchone()[0]) != 1:
+                raise sqlite3.OperationalError("read-only reporting connection is unavailable")
+            return conn
+        except Exception:
+            conn.close()
+            raise
+
     def initialize(
         self,
         product_file: str = DEFAULT_PRODUCT_FILE,
@@ -880,6 +897,194 @@ class Database:
         counts["total"] = len(items)
         visible_items = items[: max(1, min(int(limit or 50), 100))]
         return {"counts": counts, "items": visible_items, "stale_after_minutes": 30}
+
+    def daily_audit(self, date_text: str) -> Dict[str, Any]:
+        """Return aggregate-only audit metrics through an independent read-only connection."""
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", str(date_text or "")):
+            raise AppError("日期格式不正确。")
+        try:
+            day_start_dt = datetime.strptime(date_text, "%Y-%m-%d").replace(tzinfo=APP_TZ)
+        except ValueError as exc:
+            raise AppError("日期格式不正确。") from exc
+
+        day_start = day_start_dt.isoformat(timespec="seconds")
+        day_end = (day_start_dt + timedelta(days=1)).isoformat(timespec="seconds")
+        recent_start = (day_start_dt - timedelta(days=6)).isoformat(timespec="seconds")
+        stale_before = (datetime.now(APP_TZ) - timedelta(minutes=30)).isoformat(timespec="seconds")
+
+        with self.connect_readonly() as conn:
+            totals = dict(
+                conn.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(CASE WHEN julianday(created_at) >= julianday(?)
+                            AND julianday(created_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS new_shipments,
+                        COALESCE(SUM(CASE WHEN julianday(shipped_at) >= julianday(?)
+                            AND julianday(shipped_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS shipped_shipments,
+                        COALESCE(SUM(CASE WHEN julianday(tracking_signed_at) >= julianday(?)
+                            AND julianday(tracking_signed_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS signed_shipments,
+                        COALESCE(SUM(CASE WHEN status = '待处理'
+                            AND julianday(created_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS backlog_current_snapshot
+                    FROM shipments
+                    """,
+                    (day_start, day_end, day_start, day_end, day_start, day_end, day_end),
+                ).fetchone()
+            )
+
+            store_rows = conn.execute(
+                """
+                SELECT
+                    COALESCE(NULLIF(TRIM(stores.name), ''), '未知门店') AS store_name,
+                    COALESCE(SUM(CASE WHEN julianday(shipments.created_at) >= julianday(?)
+                        AND julianday(shipments.created_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS new_shipments,
+                    COALESCE(SUM(CASE WHEN julianday(shipments.shipped_at) >= julianday(?)
+                        AND julianday(shipments.shipped_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS shipped_shipments,
+                    COALESCE(SUM(CASE WHEN julianday(shipments.tracking_signed_at) >= julianday(?)
+                        AND julianday(shipments.tracking_signed_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS signed_shipments,
+                    COALESCE(SUM(CASE WHEN shipments.status = '待处理'
+                        AND julianday(shipments.created_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS backlog_current_snapshot
+                FROM shipments
+                LEFT JOIN stores ON stores.id = shipments.store_id
+                GROUP BY shipments.store_id, store_name
+                HAVING new_shipments + shipped_shipments + signed_shipments + backlog_current_snapshot > 0
+                ORDER BY store_name
+                """,
+                (day_start, day_end, day_start, day_end, day_start, day_end, day_end),
+            ).fetchall()
+
+            recent_totals = dict(
+                conn.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(CASE WHEN julianday(created_at) >= julianday(?)
+                            AND julianday(created_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS new_shipments,
+                        COALESCE(SUM(CASE WHEN julianday(shipped_at) >= julianday(?)
+                            AND julianday(shipped_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS shipped_shipments,
+                        COALESCE(SUM(CASE WHEN julianday(tracking_signed_at) >= julianday(?)
+                            AND julianday(tracking_signed_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS signed_shipments
+                    FROM shipments
+                    """,
+                    (recent_start, day_end, recent_start, day_end, recent_start, day_end),
+                ).fetchone()
+            )
+
+            shipment_exceptions = dict(
+                conn.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(CASE WHEN booking_status = '下单失败' THEN 1 ELSE 0 END), 0) AS label_booking_failures,
+                        COALESCE(SUM(CASE WHEN booking_status = '下单失败'
+                            AND julianday(booking_updated_at) >= julianday(?)
+                            AND julianday(booking_updated_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS label_booking_failures_on_date,
+                        COALESCE(SUM(CASE WHEN tracking_status = '查询失败' THEN 1 ELSE 0 END), 0) AS shipment_tracking_failures,
+                        COALESCE(SUM(CASE WHEN tracking_status = '查询失败'
+                            AND julianday(tracking_last_checked_at) >= julianday(?)
+                            AND julianday(tracking_last_checked_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS shipment_tracking_failures_on_date,
+                        COALESCE(SUM(CASE WHEN label_print_status = '打印失败' THEN 1 ELSE 0 END), 0) AS printing_failures,
+                        COALESCE(SUM(CASE WHEN label_print_status = '打印失败'
+                            AND julianday(updated_at) >= julianday(?)
+                            AND julianday(updated_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS printing_failures_on_date,
+                        COALESCE(SUM(CASE WHEN booking_status IN ('排队中', '提交中')
+                            AND booking_updated_at <> ''
+                            AND julianday(booking_updated_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS long_waiting
+                    FROM shipments
+                    """,
+                    (day_start, day_end, day_start, day_end, day_start, day_end, stale_before),
+                ).fetchone()
+            )
+            return_exceptions = dict(
+                conn.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(CASE WHEN tracking_status = '查询失败' THEN 1 ELSE 0 END), 0) AS return_tracking_failures,
+                        COALESCE(SUM(CASE WHEN tracking_status = '查询失败'
+                            AND julianday(tracking_last_checked_at) >= julianday(?)
+                            AND julianday(tracking_last_checked_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS return_tracking_failures_on_date
+                    FROM return_orders
+                    """,
+                    (day_start, day_end),
+                ).fetchone()
+            )
+
+            quality_counts = {
+                key: int(value or 0)
+                for key, value in dict(
+                    conn.execute(
+                        """
+                        SELECT
+                            COALESCE(SUM(CASE WHEN shipments.created_at = '' OR julianday(shipments.created_at) IS NULL THEN 1 ELSE 0 END), 0) AS invalid_created_at,
+                            COALESCE(SUM(CASE WHEN shipments.shipped_at <> '' AND julianday(shipments.shipped_at) IS NULL THEN 1 ELSE 0 END), 0) AS invalid_shipped_at,
+                            COALESCE(SUM(CASE WHEN shipments.tracking_signed_at <> '' AND julianday(shipments.tracking_signed_at) IS NULL THEN 1 ELSE 0 END), 0) AS invalid_tracking_signed_at,
+                            COALESCE(SUM(CASE WHEN shipments.status IN ('已发货', '已签收') AND shipments.shipped_at = '' THEN 1 ELSE 0 END), 0) AS shipped_state_missing_shipped_at,
+                            COALESCE(SUM(CASE WHEN shipments.status = '已签收' AND shipments.tracking_signed_at = '' THEN 1 ELSE 0 END), 0) AS signed_state_missing_tracking_signed_at,
+                            COALESCE(SUM(CASE WHEN julianday(shipments.shipped_at) < julianday(shipments.created_at) THEN 1 ELSE 0 END), 0) AS shipped_before_created,
+                            COALESCE(SUM(CASE WHEN julianday(shipments.tracking_signed_at) < julianday(shipments.shipped_at) THEN 1 ELSE 0 END), 0) AS signed_before_shipped,
+                            COALESCE(SUM(CASE WHEN TRIM(COALESCE(stores.name, '')) = '' THEN 1 ELSE 0 END), 0) AS missing_store_name
+                        FROM shipments
+                        LEFT JOIN stores ON stores.id = shipments.store_id
+                        """
+                    ).fetchone()
+                ).items()
+            }
+
+        current_tracking_failures = int(shipment_exceptions["shipment_tracking_failures"] or 0) + int(
+            return_exceptions["return_tracking_failures"] or 0
+        )
+        dated_tracking_failures = int(shipment_exceptions["shipment_tracking_failures_on_date"] or 0) + int(
+            return_exceptions["return_tracking_failures_on_date"] or 0
+        )
+        return {
+            "date": date_text,
+            "timezone": "Asia/Shanghai",
+            "metrics": {key: int(value or 0) for key, value in totals.items()},
+            "by_store": [
+                {
+                    "store_name": str(row["store_name"]),
+                    "new_shipments": int(row["new_shipments"] or 0),
+                    "shipped_shipments": int(row["shipped_shipments"] or 0),
+                    "signed_shipments": int(row["signed_shipments"] or 0),
+                    "backlog_current_snapshot": int(row["backlog_current_snapshot"] or 0),
+                }
+                for row in store_rows
+            ],
+            "exceptions": {
+                "current_snapshot": {
+                    "label_booking_failures": int(shipment_exceptions["label_booking_failures"] or 0),
+                    "tracking_failures": current_tracking_failures,
+                    "shipment_tracking_failures": int(shipment_exceptions["shipment_tracking_failures"] or 0),
+                    "return_tracking_failures": int(return_exceptions["return_tracking_failures"] or 0),
+                    "printing_failures": int(shipment_exceptions["printing_failures"] or 0),
+                },
+                "current_snapshot_updated_on_date": {
+                    "label_booking_failures": int(shipment_exceptions["label_booking_failures_on_date"] or 0),
+                    "tracking_failures": dated_tracking_failures,
+                    "shipment_tracking_failures": int(shipment_exceptions["shipment_tracking_failures_on_date"] or 0),
+                    "return_tracking_failures": int(return_exceptions["return_tracking_failures_on_date"] or 0),
+                    "printing_failures": int(shipment_exceptions["printing_failures_on_date"] or 0),
+                },
+            },
+            "long_waiting": {
+                "label_tasks_over_30_minutes_current_snapshot": int(shipment_exceptions["long_waiting"] or 0)
+            },
+            "recent_7_day_average": {
+                "calendar_days": 7,
+                "new_shipments": round(int(recent_totals["new_shipments"] or 0) / 7, 2),
+                "shipped_shipments": round(int(recent_totals["shipped_shipments"] or 0) / 7, 2),
+                "signed_shipments": round(int(recent_totals["signed_shipments"] or 0) / 7, 2),
+            },
+            "data_quality": {
+                "total_issues": sum(quality_counts.values()),
+                **quality_counts,
+            },
+            "basis": {
+                "event_metrics": "timestamp_events_in_shanghai_calendar_day",
+                "backlog": "current_pending_snapshot_created_before_requested_day_end_not_historical",
+                "exceptions": "current_failure_snapshot_not_historical_event_log",
+                "recent_7_day_average": "seven_calendar_days_including_date_fixed_denominator_empty_is_zero",
+                "data_quality": "current_snapshot_all_shipments",
+                "data_quality_total": "sum_of_issue_counts_a_record_may_contribute_multiple_issues",
+            },
+        }
 
     def default_credentials_active(self) -> bool:
         return bool(

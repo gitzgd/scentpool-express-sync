@@ -3,10 +3,14 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import hashlib
 import io
 import json
 import mimetypes
 import os
+import re
+import secrets
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -61,6 +65,9 @@ MAX_REQUEST_THREADS = bounded_env_int("SCENTPOOL_MAX_REQUEST_THREADS", 8, 2, 16)
 LABEL_MERGE_TIMEOUT_SECONDS = bounded_env_int("SCENTPOOL_LABEL_MERGE_TIMEOUT_SECONDS", 600, 60, 1200)
 SLOW_REQUEST_MILLISECONDS = bounded_env_int("SCENTPOOL_SLOW_REQUEST_MILLISECONDS", 1000, 250, 10000)
 SHIPPING_TRANSIENT_RETRIES = bounded_env_int("SCENTPOOL_SHIPPING_TRANSIENT_RETRIES", 2, 0, 3)
+DAILY_AUDIT_PATH = "/api/admin/system/daily-audit"
+MAX_AUDIT_QUERY_LENGTH = 64
+MAX_AUDIT_AUTHORIZATION_LENGTH = 512
 TRACKING_SYNC_LOCK = threading.Lock()
 RETURN_TRACKING_SYNC_LOCK = threading.Lock()
 
@@ -837,6 +844,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"result": True, "returnCode": "200", "message": "成功"})
             return
 
+        if path == DAILY_AUDIT_PATH:
+            self.require_audit_token()
+            if self.command != "GET":
+                self.send_json({"error": "该接口仅支持 GET 请求。"}, status=405, headers={"Allow": "GET"})
+                return
+            date_text = self.audit_date_parameter()
+            try:
+                report = DB.daily_audit(date_text)
+            except (OSError, sqlite3.Error):
+                raise AppError("业务日报暂时不可用。", 503) from None
+            self.send_json(report)
+            return
+
         user = self.require_user()
 
         if path == "/api/me" and self.command == "GET":
@@ -1364,6 +1384,54 @@ class Handler(BaseHTTPRequestHandler):
         jar = cookies.SimpleCookie(self.headers.get("Cookie", ""))
         morsel = jar.get("scentpool_session")
         return morsel.value if morsel else ""
+
+    def require_audit_token(self) -> None:
+        authorization_values = self.headers.get_all("Authorization") or []
+        supplied = ""
+        valid_header = False
+        if len(authorization_values) == 1:
+            authorization = str(authorization_values[0])
+            if len(authorization) <= MAX_AUDIT_AUTHORIZATION_LENGTH:
+                scheme, separator, candidate = authorization.partition(" ")
+                valid_header = bool(
+                    separator
+                    and scheme.lower() == "bearer"
+                    and candidate
+                    and candidate == candidate.strip()
+                    and " " not in candidate
+                )
+                if valid_header:
+                    supplied = candidate
+
+        configured = os.environ.get("SCENTPOOL_AUDIT_TOKEN", "")
+        configured_valid = bool(configured.strip()) and len(configured) <= MAX_AUDIT_AUTHORIZATION_LENGTH
+        expected = configured if configured_valid else ""
+        supplied_digest = hashlib.sha256(supplied.encode("utf-8")).digest()
+        expected_digest = hashlib.sha256(expected.encode("utf-8")).digest()
+        authenticated = secrets.compare_digest(supplied_digest, expected_digest)
+        if not (valid_header and configured_valid and authenticated):
+            raise AppError("审计接口认证失败。", 401)
+
+    def audit_date_parameter(self) -> str:
+        raw_query = urlparse(self.path).query
+        if len(raw_query) > MAX_AUDIT_QUERY_LENGTH:
+            raise AppError("date 参数必须是 YYYY-MM-DD 格式。")
+        try:
+            params = parse_qs(raw_query, keep_blank_values=True, strict_parsing=True, max_num_fields=2)
+        except ValueError:
+            raise AppError("date 参数必须是 YYYY-MM-DD 格式。") from None
+        if set(params) != {"date"} or len(params["date"]) != 1:
+            raise AppError("date 参数必须是 YYYY-MM-DD 格式。")
+        date_text = params["date"][0]
+        if len(date_text) != 10 or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date_text):
+            raise AppError("date 参数必须是 YYYY-MM-DD 格式。")
+        try:
+            parsed_date = datetime.strptime(date_text, "%Y-%m-%d")
+        except ValueError:
+            raise AppError("date 参数必须是有效日期。") from None
+        if parsed_date.strftime("%Y-%m-%d") != date_text:
+            raise AppError("date 参数必须是有效日期。")
+        return date_text
 
     def require_user(self) -> Dict[str, Any]:
         user = DB.user_for_session(self.session_token())
