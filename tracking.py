@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +24,8 @@ EXPRESS_COMPANY_CODES = {
     "京东": "jd",
 }
 EXPRESS_CODE_COMPANIES = {code: company for company, code in EXPRESS_COMPANY_CODES.items()}
+COMPANY_CODE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+PHONE_REQUIRED_COMPANY_CODES = {"shunfeng", "shunfengkuaiyun", "zhongtong"}
 
 
 def env_flag(name: str) -> bool:
@@ -59,6 +62,11 @@ def mask_secret(value: str) -> str:
     if len(value) <= 8:
         return "****" if value else ""
     return f"{value[:4]}...{value[-4:]}"
+
+
+def normalize_company_code(value: Any) -> str:
+    code = str(value or "").strip().lower()
+    return code if COMPANY_CODE_PATTERN.fullmatch(code) else ""
 
 
 class Kuaidi100Client:
@@ -121,11 +129,11 @@ class Kuaidi100Client:
             raise AppError("快递100暂时无法识别该单号对应的快递公司，请核对单号是否完整；确认无误后稍后重试。")
 
         candidate = data[0] if isinstance(data[0], dict) else {}
-        company_code = str(candidate.get("comCode") or "").strip().lower()
-        company = EXPRESS_CODE_COMPANIES.get(company_code)
-        provider_name = str(candidate.get("name") or company_code or "未知快递").strip()
-        if not company:
-            raise AppError(f"快递100识别为“{provider_name}”，但系统暂不支持该快递公司，请联系总部处理。")
+        company_code = normalize_company_code(candidate.get("comCode"))
+        provider_name = str(candidate.get("name") or company_code or "未知快递").strip()[:80]
+        if not company_code:
+            raise AppError("快递100没有返回有效的快递公司编码，请核对单号后稍后重试。")
+        company = EXPRESS_CODE_COMPANIES.get(company_code) or provider_name
         return {
             "express_company": company,
             "company_code": company_code,
@@ -137,9 +145,12 @@ class Kuaidi100Client:
             raise AppError("快递100接口未配置，请在 Render 环境变量中设置 SCENTPOOL_KUAIDI100_CUSTOMER 和 SCENTPOOL_KUAIDI100_KEY。", 503)
 
         express_company = str(shipment.get("express_company") or "").strip()
-        shipper_code = EXPRESS_COMPANY_CODES.get(express_company)
+        shipper_code = normalize_company_code(shipment.get("express_company_code"))
         if not shipper_code:
-            raise AppError(f"暂不支持这个快递公司：{express_company}")
+            shipper_code = EXPRESS_COMPANY_CODES.get(express_company, "")
+        if not shipper_code:
+            company_label = express_company or "未知快递公司"
+            raise AppError(f"缺少“{company_label}”对应的快递100公司编码，请重新识别快递公司后再查询。")
 
         tracking_no = str(shipment.get("tracking_no") or "").strip()
         if not tracking_no:
@@ -152,10 +163,9 @@ class Kuaidi100Client:
             "show": "0",
             "order": "desc",
         }
-        if shipper_code == "shunfeng":
-            phone = str(shipment.get("phone") or shipment.get("sender_phone") or "").strip()
-            if phone:
-                request_data["phone"] = phone
+        phone = str(shipment.get("phone") or shipment.get("sender_phone") or "").strip()
+        if phone and shipper_code in PHONE_REQUIRED_COMPANY_CODES:
+            request_data["phone"] = phone
 
         param = json.dumps(request_data, ensure_ascii=False, separators=(",", ":"))
         form = {

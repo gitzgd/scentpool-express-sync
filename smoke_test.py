@@ -166,10 +166,44 @@ def main() -> None:
         assert params["sign"][0] == expected_sign
         assert request_data == {"com": "yuantong", "num": "YT123456", "resultv2": "1", "show": "0", "order": "desc"}
 
+        try:
+            tracking.urllib.request.urlopen = fake_urlopen
+            tracking.Kuaidi100Client("test-customer", "test-key").query(
+                {
+                    "express_company": "申通快递",
+                    "express_company_code": "shentong",
+                    "tracking_no": "STO123456",
+                    "sender_phone": "13800138000",
+                }
+            )
+        finally:
+            tracking.urllib.request.urlopen = original_urlopen
+        params = urllib.parse.parse_qs(captured["payload"])
+        request_data = json.loads(params["param"][0])
+        assert request_data == {
+            "com": "shentong",
+            "num": "STO123456",
+            "resultv2": "1",
+            "show": "0",
+            "order": "desc",
+        }, request_data
+
+        try:
+            tracking.Kuaidi100Client("test-customer", "test-key").query(
+                {
+                    "express_company": "伪造快递",
+                    "express_company_code": "../shentong",
+                    "tracking_no": "INVALID-COMPANY-CODE",
+                }
+            )
+            raise AssertionError("invalid company code should fail before querying")
+        except AppError as exc:
+            assert "公司编码" in exc.message
+
         class FakeDetectResponse(FakeResponse):
             def read(self):
                 return json.dumps(
-                    [{"comCode": "jd", "name": "京东物流", "lengthPre": 15}],
+                    [{"comCode": "shentong", "name": "申通快递", "lengthPre": 15}],
                     ensure_ascii=False,
                 ).encode("utf-8")
 
@@ -180,16 +214,16 @@ def main() -> None:
 
         try:
             tracking.urllib.request.urlopen = fake_detect_urlopen
-            detected = tracking.Kuaidi100Client("test-customer", "test-key").detect_company("JD-SMOKE-001")
+            detected = tracking.Kuaidi100Client("test-customer", "test-key").detect_company("STO-SMOKE-001")
         finally:
             tracking.urllib.request.urlopen = original_urlopen
         detect_url = urllib.parse.urlparse(captured["detect_url"])
         detect_params = urllib.parse.parse_qs(detect_url.query)
         assert f"{detect_url.scheme}://{detect_url.netloc}{detect_url.path}" == tracking.KUAIDI100_AUTODETECT_ENDPOINT
-        assert detect_params == {"num": ["JD-SMOKE-001"], "key": ["test-key"]}
+        assert detect_params == {"num": ["STO-SMOKE-001"], "key": ["test-key"]}
         assert captured["detect_timeout"] == 10
-        assert detected["express_company"] == "京东"
-        assert detected["company_code"] == "jd"
+        assert detected["express_company"] == "申通快递"
+        assert detected["company_code"] == "shentong"
 
         class FakeDetectErrorResponse(FakeResponse):
             def read(self):
@@ -518,6 +552,7 @@ def main() -> None:
             assert legacy_conn.execute("SELECT COUNT(*) FROM shipment_items WHERE shipment_id = 1").fetchone()[0] == 1
             migrated_return = legacy_conn.execute("SELECT * FROM return_orders WHERE id = 1").fetchone()
             assert migrated_return["express_company_source"] == "manual"
+            assert migrated_return["express_company_code"] == "yuantong"
         assert list((Path(tmp) / "backups").glob("legacy-before-order-date-*.db"))
         legacy_product = legacy_db.list_products()[0]
         created_next_day = legacy_db.create_shipment(
@@ -1125,11 +1160,12 @@ def main() -> None:
         assert status == 200
 
         def fake_detect_return_company(tracking_no):
-            assert tracking_no == "JD-SMOKE-001"
-            return {"express_company": "京东", "company_code": "jd", "provider_name": "京东物流"}
+            assert tracking_no == "STO-SMOKE-001"
+            return {"express_company": "申通快递", "company_code": "shentong", "provider_name": "申通快递"}
 
         def fake_return_in_transit(return_order):
-            assert return_order["express_company"] == "京东"
+            assert return_order["express_company"] == "申通快递"
+            assert return_order["express_company_code"] == "shentong"
             return {
                 "provider": "kuaidi100",
                 "tracking_status": "运输中",
@@ -1146,7 +1182,7 @@ def main() -> None:
         server.query_tracking = fake_return_in_transit
         return_payload = {
             "express_company": "圆通",
-            "tracking_no": "JD-SMOKE-001",
+            "tracking_no": "STO-SMOKE-001",
             "sender_phone": "13800138000",
             "remark": "退货烟测",
             "items": [{"barcode": product["barcode"], "quantity": 1}],
@@ -1155,19 +1191,20 @@ def main() -> None:
         assert status == 201, body
         return_id = body["return_order"]["id"]
         assert body["return_order"]["status"] == "运输中"
-        assert body["return_order"]["express_company"] == "京东"
+        assert body["return_order"]["express_company"] == "申通快递"
+        assert body["return_order"]["express_company_code"] == "shentong"
         assert body["return_order"]["express_company_source"] == "kuaidi100"
         assert body["return_order"]["items"][0]["product_barcode"] == product["barcode"]
 
         status, body = request(staff, base, "POST", "/api/returns", return_payload)
         assert status == 409, body
 
-        status, body = request(staff, base, "GET", "/api/returns?q=JD-SMOKE-001")
+        status, body = request(staff, base, "GET", "/api/returns?q=STO-SMOKE-001")
         assert status == 200, body
         assert len(body["returns"]) == 1
-        assert body["returns"][0]["tracking_no"] == "JD-SMOKE-001"
+        assert body["returns"][0]["tracking_no"] == "STO-SMOKE-001"
 
-        status, body = request(admin, base, "GET", "/api/returns?q=JD-SMOKE-001")
+        status, body = request(admin, base, "GET", "/api/returns?q=STO-SMOKE-001")
         assert status == 200, body
         assert len(body["returns"]) == 1
 
@@ -1175,8 +1212,9 @@ def main() -> None:
             conn.execute(
                 """
                 UPDATE return_orders
-                SET express_company = '圆通', express_company_source = 'manual', tracking_status = '等待揽收',
-                    tracking_error = '', tracking_last_checked_at = '2000-01-01T00:00:00+08:00'
+                SET express_company = '圆通', express_company_code = 'yuantong',
+                    express_company_source = 'manual', tracking_status = '等待揽收', tracking_error = '',
+                    tracking_last_checked_at = '2000-01-01T00:00:00+08:00'
                 WHERE id = ?
                 """,
                 (return_id,),
@@ -1187,7 +1225,8 @@ def main() -> None:
         assert status == 200, body
         assert body["return_order"]["status"] == "已签收"
         assert body["return_order"]["tracking_status"] == "已签收"
-        assert body["return_order"]["express_company"] == "京东"
+        assert body["return_order"]["express_company"] == "申通快递"
+        assert body["return_order"]["express_company_code"] == "shentong"
         assert body["return_order"]["express_company_source"] == "kuaidi100"
 
         def fake_detection_failure(_tracking_no):

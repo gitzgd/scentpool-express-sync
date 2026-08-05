@@ -233,6 +233,7 @@ class Database:
                     store_name_snapshot TEXT NOT NULL,
                     created_by INTEGER NOT NULL,
                     express_company TEXT NOT NULL DEFAULT '',
+                    express_company_code TEXT NOT NULL DEFAULT '',
                     express_company_source TEXT NOT NULL DEFAULT 'manual',
                     tracking_no TEXT NOT NULL,
                     sender_phone TEXT NOT NULL DEFAULT '',
@@ -588,11 +589,24 @@ class Database:
     def _ensure_return_tracking_columns(self, conn: sqlite3.Connection) -> None:
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(return_orders)").fetchall()}
         columns = {
+            "express_company_code": "TEXT NOT NULL DEFAULT ''",
             "express_company_source": "TEXT NOT NULL DEFAULT 'manual'",
         }
         for name, definition in columns.items():
             if name not in existing:
                 conn.execute(f"ALTER TABLE return_orders ADD COLUMN {name} {definition}")
+        conn.execute(
+            """
+            UPDATE return_orders
+            SET express_company_code = CASE express_company
+                WHEN '圆通' THEN 'yuantong'
+                WHEN '顺丰' THEN 'shunfeng'
+                WHEN '京东' THEN 'jd'
+                ELSE express_company_code
+            END
+            WHERE express_company_code = '' AND express_company IN ('圆通', '顺丰', '京东')
+            """
+        )
 
     def _normalize_shipments_with_tracking(self, conn: sqlite3.Connection) -> None:
         now = now_text()
@@ -2586,6 +2600,7 @@ class Database:
                 """
                 UPDATE return_orders
                 SET express_company = CASE WHEN ? <> '' THEN ? ELSE express_company END,
+                    express_company_code = CASE WHEN ? <> '' THEN ? ELSE express_company_code END,
                     express_company_source = CASE WHEN ? <> '' THEN ? ELSE express_company_source END,
                     tracking_provider = ?, tracking_status = ?, tracking_state_code = ?,
                     tracking_last_event = ?, tracking_last_checked_at = ?,
@@ -2596,6 +2611,8 @@ class Database:
                 (
                     str(result.get("express_company") or ""),
                     str(result.get("express_company") or ""),
+                    str(result.get("express_company_code") or ""),
+                    str(result.get("express_company_code") or ""),
                     str(result.get("express_company_source") or ""),
                     str(result.get("express_company_source") or ""),
                     str(result.get("provider") or ""),
