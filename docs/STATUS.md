@@ -33,11 +33,13 @@
 
 退货承运商编码热修复说明：PR #5 已合并到 `main`，合并提交 `2ee1c5f`。Python 编译、前端 JavaScript 语法检查和完整 `smoke_test.py` 均通过；对抗性覆盖包含申通 `shentong`、非法公司编码、旧库增量迁移和历史错误公司纠正。
 
-## 已开发、未部署/待验收
+## 脱敏只读业务日报已上线
 
-- `feat/daily-audit-report` 已实现脱敏只读业务日报接口：独立 Bearer 鉴权、严格上海时区日期、SQLite URI `mode=ro` + `PRAGMA query_only=ON`、只返回允许的汇总字段。
+- `main` 提交 `74066c1` 已实现并上线脱敏只读业务日报接口：独立 Bearer 鉴权、严格上海时区日期、SQLite URI `mode=ro` + `PRAGMA query_only=ON`、只返回允许的汇总字段。
 - 专项合成数据测试覆盖日期边界、门店汇总、7 日均值、异常与长等待、数据质量、递归隐私检查、令牌不进入响应或日志、总部会话与审计令牌双向隔离，以及只读连接拒绝写入。
-- 本条只描述当前功能分支的仓库状态，不代表 `main` 已合并或生产已上线。尚未部署，尚未生成或配置 `SCENTPOOL_AUDIT_TOKEN`，仍需统一工作台验收。
+- 2026-08-05 19:22（Asia/Shanghai），正确生产服务 `scentpool-express-sync-ec7c` 的部署 `dep-d9phphoae00c73d5s980` 将 `74066c1` 标记为 `live`；公开健康检查返回 `ok=true`、`database=true`。
+- 生产只读验收确认：正确令牌返回脱敏汇总；缺失或错误令牌返回 `401`；非 `GET` 返回 `405`；日报令牌访问普通管理员诊断接口仍返回 `401`；递归隐私扫描通过。`SCENTPOOL_AUDIT_TOKEN` 仅保存在正确生产服务环境变量和 Mac 登录钥匙串中，未进入仓库、日志或任务输出。
+- 同仓库的历史重复服务 `scentpool-express-sync` 仍存在，但本次没有修改或部署该副本。
 
 ## 生产历史观察
 
