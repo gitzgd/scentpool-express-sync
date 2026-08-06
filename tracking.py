@@ -18,6 +18,8 @@ KUAIDI100_AUTODETECT_ENDPOINT = "https://www.kuaidi100.com/autonumber/auto"
 SIGNED_STATE = "3"
 PROBLEM_STATE = "2"
 PENDING_TRACE_MESSAGES = ("查询无结果", "暂无轨迹", "暂无物流", "未查询到物流", "没有物流信息")
+SYSTEM_HTTP_STATUSES = {401, 403, 408, 429, 500, 502, 503, 504}
+SYSTEM_RESPONSE_STATUSES = {str(value) for value in SYSTEM_HTTP_STATUSES}
 EXPRESS_COMPANY_CODES = {
     "圆通": "yuantong",
     "顺丰": "shunfeng",
@@ -96,7 +98,9 @@ class Kuaidi100Client:
 
     def detect_company(self, tracking_no: str) -> Dict[str, str]:
         if not self.key:
-            raise AppError("快递100智能识别未配置，请联系管理员检查接口密钥。", 503)
+            raise tracking_service_app_error(
+                message="快递100智能识别未配置，请管理员检查接口密钥。"
+            )
 
         tracking_no = str(tracking_no or "").strip()
         if not tracking_no:
@@ -107,19 +111,27 @@ class Kuaidi100Client:
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
                 raw = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            if int(exc.code or 0) in SYSTEM_HTTP_STATUSES:
+                raise tracking_service_app_error(int(exc.code or 0)) from exc
+            raise AppError("快递100智能识别请求未成功，请稍后重试。", 503) from exc
         except (urllib.error.URLError, TimeoutError) as exc:
-            raise AppError("快递100智能识别服务暂时无法连接，请稍后在退货看板点击“查物流”。", 503) from exc
+            raise tracking_service_app_error() from exc
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise AppError("快递100智能识别返回异常，请稍后在退货看板点击“查物流”。", 503) from exc
+            raise tracking_service_app_error(
+                message="快递100智能识别返回异常，系统已暂停本轮查询。"
+            ) from exc
 
         if isinstance(data, dict):
             code = str(data.get("returnCode") or "").strip()
             message = str(data.get("message") or "").strip()
             if code in {"601", "701"}:
-                raise AppError("快递100账号尚未开通智能单号识别，请联系管理员检查接口权限。", 503)
+                raise tracking_service_app_error(
+                    message="快递100账号尚未开通智能单号识别，请管理员检查接口权限。"
+                )
             if code == "201":
                 raise AppError("快递100无法识别这个单号，请核对单号是否完整、准确。")
             detail = message[:160] if message else "没有返回候选快递公司"
@@ -142,7 +154,9 @@ class Kuaidi100Client:
 
     def query(self, shipment: Dict[str, Any]) -> Dict[str, Any]:
         if not self.is_configured():
-            raise AppError("快递100接口未配置，请在 Render 环境变量中设置 SCENTPOOL_KUAIDI100_CUSTOMER 和 SCENTPOOL_KUAIDI100_KEY。", 503)
+            raise tracking_service_app_error(
+                message="快递100接口配置不完整，系统已暂停批量查询，请管理员检查生产环境配置。"
+            )
 
         express_company = str(shipment.get("express_company") or "").strip()
         shipper_code = normalize_company_code(shipment.get("express_company_code"))
@@ -186,15 +200,19 @@ class Kuaidi100Client:
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
                 raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            if int(exc.code or 0) in SYSTEM_HTTP_STATUSES:
+                return tracking_service_error_result(http_status=int(exc.code or 0))
+            return tracking_error_result("快递100查询请求未成功，请稍后重试。", provider="kuaidi100")
         except (urllib.error.URLError, TimeoutError) as exc:
-            return tracking_error_result(f"快递100请求失败：{exc}", provider="kuaidi100")
+            return tracking_service_error_result()
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            return tracking_error_result("快递100返回内容不是有效 JSON。", provider="kuaidi100", raw=raw)
+            return tracking_service_error_result("快递100返回内容异常，系统已暂停本轮批量查询。")
         if not isinstance(data, dict):
-            return tracking_error_result("快递100返回格式异常，请稍后重试。", provider="kuaidi100", raw=raw)
+            return tracking_service_error_result("快递100返回格式异常，系统已暂停本轮批量查询。")
         return normalize_kuaidi100_response(data, raw)
 
     def sign(self, param: str) -> str:
@@ -216,6 +234,13 @@ def normalize_kuaidi100_response(data: Dict[str, Any], raw: str) -> Dict[str, An
         message = str(data.get("message") or data.get("result") or data.get("returnCode") or "快递100查询失败。")
         if status == "500" and any(text in message for text in PENDING_TRACE_MESSAGES):
             return tracking_pending_result(raw=raw, state=state)
+        if status in SYSTEM_RESPONSE_STATUSES:
+            detail = message.strip()[:120]
+            return tracking_service_error_result(
+                f"快递100接口返回系统错误（状态 {status}）{f'：{detail}' if detail else ''}。"
+                "系统已停止本轮批量查询并将在下一轮自动重试。",
+                http_status=int(status),
+            )
         return tracking_error_result(message, provider="kuaidi100", raw=raw, state=state, last_event=last_event)
 
     if not traces and state in {"", "0"}:
@@ -260,6 +285,47 @@ def tracking_error_result(message: str, *, provider: str, raw: str = "", state: 
         "raw": raw[:5000],
         "is_signed": False,
     }
+
+
+def tracking_service_message(http_status: int = 0) -> str:
+    if http_status == 403:
+        return (
+            "快递100接口暂时拒绝访问（HTTP 403）。这不是单个快递单号错误；"
+            "系统已停止本轮批量查询，请管理员检查接口权限、账号状态或访问限制。"
+        )
+    if http_status == 429:
+        return "快递100接口当前请求过多，系统已停止本轮批量查询并将在下一轮自动重试。"
+    if http_status:
+        return f"快递100接口暂时不可用（HTTP {http_status}），系统已停止本轮批量查询并将在下一轮自动重试。"
+    return "快递100接口暂时无法连接，系统已停止本轮批量查询并将在下一轮自动重试。"
+
+
+def tracking_service_error_result(message: str = "", *, http_status: int = 0) -> Dict[str, Any]:
+    result = tracking_error_result(
+        message or tracking_service_message(http_status),
+        provider="kuaidi100",
+    )
+    result.update(
+        {
+            "system_error": True,
+            "error_scope": "tracking_provider",
+            "http_status": int(http_status or 0),
+            "provider_reached": False,
+        }
+    )
+    return result
+
+
+def tracking_service_app_error(http_status: int = 0, *, message: str = "") -> AppError:
+    return AppError(
+        message or tracking_service_message(http_status),
+        503,
+        {
+            "tracking_service_error": True,
+            "provider": "kuaidi100",
+            "http_status": int(http_status or 0),
+        },
+    )
 
 
 def latest_trace(traces: Iterable[Dict[str, Any]]) -> Dict[str, Any]:

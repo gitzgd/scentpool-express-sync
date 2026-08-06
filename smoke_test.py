@@ -166,6 +166,23 @@ def main() -> None:
         assert params["sign"][0] == expected_sign
         assert request_data == {"com": "yuantong", "num": "YT123456", "resultv2": "1", "show": "0", "order": "desc"}
 
+        def fake_forbidden_urlopen(request, timeout=0):
+            raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", hdrs=None, fp=None)
+
+        try:
+            tracking.urllib.request.urlopen = fake_forbidden_urlopen
+            forbidden = tracking.Kuaidi100Client("test-customer", "test-key").query(
+                {"express_company": "圆通", "tracking_no": "YT-SYSTEM-403"}
+            )
+            assert forbidden["system_error"] is True
+            assert forbidden["error_scope"] == "tracking_provider"
+            assert forbidden["http_status"] == 403
+            assert forbidden["provider_reached"] is False
+            assert "不是单个快递单号错误" in forbidden["error"]
+            assert forbidden["tracking_status"] == "查询失败"
+        finally:
+            tracking.urllib.request.urlopen = original_urlopen
+
         try:
             tracking.urllib.request.urlopen = fake_urlopen
             tracking.Kuaidi100Client("test-customer", "test-key").query(
@@ -241,6 +258,17 @@ def main() -> None:
         finally:
             tracking.urllib.request.urlopen = original_urlopen
 
+        try:
+            tracking.urllib.request.urlopen = fake_forbidden_urlopen
+            tracking.Kuaidi100Client("test-customer", "test-key").detect_company("STO-SYSTEM-403")
+            raise AssertionError("provider HTTP 403 should be a system-level auto-detection failure")
+        except AppError as exc:
+            assert exc.status == 503
+            assert exc.details["tracking_service_error"] is True
+            assert exc.details["http_status"] == 403
+        finally:
+            tracking.urllib.request.urlopen = original_urlopen
+
         pending = tracking.normalize_kuaidi100_response(
             {"status": "500", "message": "查询无结果，请隔段时间再查", "state": "0", "data": []},
             '{"status":"500"}',
@@ -253,6 +281,12 @@ def main() -> None:
             '{"status":"200"}',
         )
         assert pending["tracking_status"] == "等待揽收"
+        body_forbidden = tracking.normalize_kuaidi100_response(
+            {"status": "403", "message": "Forbidden", "state": "", "data": []},
+            '{"status":"403"}',
+        )
+        assert body_forbidden["system_error"] is True
+        assert body_forbidden["http_status"] == 403
 
         shipping_captured = {}
 
@@ -556,6 +590,9 @@ def main() -> None:
             assert legacy_conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_alert_acknowledgements'"
             ).fetchone()
+            assert legacy_conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'operational_incidents'"
+            ).fetchone()
         assert list((Path(tmp) / "backups").glob("legacy-before-order-date-*.db"))
         legacy_product = legacy_db.list_products()[0]
         created_next_day = legacy_db.create_shipment(
@@ -611,6 +648,65 @@ def main() -> None:
         assert "phone" not in failure_alerts["items"][0]
         assert "address" not in failure_alerts["items"][0]
         original_alert = failure_alerts["items"][0]
+
+        with legacy_db.connect() as legacy_conn:
+            legacy_conn.execute(
+                """
+                UPDATE shipments
+                SET tracking_status = '查询失败', tracking_error = '单号或快递公司不匹配',
+                    tracking_last_checked_at = '2031-01-01T00:00:00+08:00',
+                    booking_updated_at = CASE
+                        WHEN booking_status IN ('排队中', '提交中') THEN '2031-01-01T00:00:00+08:00'
+                        ELSE booking_updated_at
+                    END
+                WHERE store_order_no LIKE 'BATCH-%'
+                """
+            )
+        skewed_alerts = legacy_db.task_alerts(limit=10)
+        assert skewed_alerts["category_counts"]["电子面单"] == 1, skewed_alerts["category_counts"]
+        assert all(item["category"] == "物流查询" for item in skewed_alerts["items"])
+        assert len(skewed_alerts["category_items"]["电子面单"]) == 1
+        assert skewed_alerts["category_items"]["电子面单"][0]["alert_key"] == original_alert["alert_key"]
+
+        with legacy_db.connect() as legacy_conn:
+            legacy_conn.execute(
+                """
+                UPDATE shipments
+                SET tracking_error = '快递100请求失败：HTTP Error 403: Forbidden'
+                WHERE store_order_no LIKE 'BATCH-%'
+                """
+            )
+        grouped_alerts = legacy_db.task_alerts(limit=10)
+        grouped_system_alerts = [item for item in grouped_alerts["items"] if item.get("system_scope")]
+        assert len(grouped_system_alerts) == 1
+        assert grouped_system_alerts[0]["type"] == "物流服务异常"
+        assert grouped_system_alerts[0]["affected_count"] == 51
+        assert grouped_alerts["category_counts"]["物流查询"] == 1
+        assert grouped_alerts["counts"]["total"] == 2
+
+        legacy_db.record_operational_incident(
+            "tracking:kuaidi100",
+            category="物流查询",
+            incident_type="物流服务异常",
+            status="系统检查中",
+            message="快递100接口暂时拒绝访问（HTTP 403）。",
+            affected_count=51,
+        )
+        legacy_db.clear_operational_incident("tracking:kuaidi100")
+        with legacy_db.connect() as legacy_conn:
+            still_failed = legacy_conn.execute(
+                "SELECT COUNT(*) FROM shipments WHERE store_order_no LIKE 'BATCH-%' AND tracking_status = '查询失败'"
+            ).fetchone()[0]
+            assert still_failed == 51
+            legacy_conn.execute(
+                """
+                UPDATE shipments
+                SET tracking_status = '', tracking_error = '', tracking_last_checked_at = ''
+                WHERE store_order_no LIKE 'BATCH-%'
+                """
+            )
+        assert legacy_db.task_alerts()["counts"]["total"] == 1
+
         acknowledged_alerts = legacy_db.resolve_task_alert(
             original_alert["alert_key"], original_alert["fingerprint"], 1
         )
@@ -999,6 +1095,67 @@ def main() -> None:
         )
         assert status == 200, detail_body
         assert detail_body["shipments"][0]["tracking_raw"] == "{}"
+
+        breaker_user = server.DB.authenticate("store01", "scentpool2026")
+        assert breaker_user is not None
+        breaker_shipment = server.DB.create_shipment(
+            breaker_user,
+            {
+                "recipient_name": "熔断测试",
+                "phone": "13800138000",
+                "address": "系统故障不会写入订单",
+                "store_order_no": "TRACKING-BREAKER-002",
+                "items": [{"barcode": product["barcode"], "quantity": 1}],
+            },
+        )
+        with server.DB.connect() as conn:
+            conn.execute(
+                """
+                UPDATE shipments
+                SET status = '已发货', express_company = '圆通', tracking_no = 'YT-BREAKER-002',
+                    tracking_status = '等待揽收', tracking_error = '', tracking_last_checked_at = ''
+                WHERE id = ?
+                """,
+                (breaker_shipment["id"],),
+            )
+        protected_ids = [shipment_id, breaker_shipment["id"]]
+        with server.DB.connect() as conn:
+            protected_before = {
+                int(row["id"]): dict(row)
+                for row in conn.execute(
+                    "SELECT id, tracking_status, tracking_error, tracking_last_checked_at FROM shipments WHERE id IN (?, ?)",
+                    protected_ids,
+                ).fetchall()
+            }
+        breaker_calls = {"count": 0}
+
+        def fake_provider_incident(_shipment):
+            breaker_calls["count"] += 1
+            return tracking.tracking_service_error_result(http_status=403)
+
+        server.query_tracking = fake_provider_incident
+        breaker_result = server.sync_tracking_batch(force=True, limit=0)
+        assert breaker_result["provider_incident"] is True
+        assert breaker_result["attempted"] == 1
+        assert breaker_result["checked"] == 0
+        assert breaker_calls["count"] == 1
+        with server.DB.connect() as conn:
+            protected_after = {
+                int(row["id"]): dict(row)
+                for row in conn.execute(
+                    "SELECT id, tracking_status, tracking_error, tracking_last_checked_at FROM shipments WHERE id IN (?, ?)",
+                    protected_ids,
+                ).fetchall()
+            }
+        assert protected_after == protected_before
+        breaker_alerts = server.DB.task_alerts()
+        provider_alerts = [item for item in breaker_alerts["items"] if item.get("system_scope")]
+        assert len(provider_alerts) == 1
+        assert provider_alerts[0]["affected_count"] >= 2
+        server.clear_tracking_service_incident()
+        with server.DB.connect() as conn:
+            conn.execute("UPDATE shipments SET status = '已取消' WHERE id = ?", (breaker_shipment["id"],))
+
         compressed_request = urllib.request.Request(
             base + "/api/shipments",
             method="GET",

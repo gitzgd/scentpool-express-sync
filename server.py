@@ -71,6 +71,7 @@ MAX_AUDIT_QUERY_LENGTH = 64
 MAX_AUDIT_AUTHORIZATION_LENGTH = 512
 TRACKING_SYNC_LOCK = threading.Lock()
 RETURN_TRACKING_SYNC_LOCK = threading.Lock()
+TRACKING_INCIDENT_KEY = "tracking:kuaidi100"
 
 
 def json_bytes(data: Any) -> bytes:
@@ -423,21 +424,58 @@ def restore_database(payload: bytes) -> None:
         raise
 
 
+def record_tracking_service_incident(result: Dict[str, Any], affected_count: int = 1) -> None:
+    DB.record_operational_incident(
+        TRACKING_INCIDENT_KEY,
+        category="物流查询",
+        incident_type="物流服务异常",
+        status="系统检查中",
+        message=str(result.get("error") or "快递100接口暂时不可用，系统将在下一轮自动重试。"),
+        affected_count=max(1, int(affected_count or 1)),
+    )
+
+
+def clear_tracking_service_incident() -> None:
+    DB.clear_operational_incident(TRACKING_INCIDENT_KEY)
+
+
+def tracking_service_result_from_error(exc: AppError, last_event: str = "") -> Dict[str, Any]:
+    system_error = bool(exc.details.get("tracking_service_error"))
+    return {
+        "provider": str(exc.details.get("provider") or "kuaidi100"),
+        "tracking_status": "查询失败",
+        "state_code": "",
+        "last_event": last_event,
+        "checked_at": now_text(),
+        "signed_at": "",
+        "error": exc.message,
+        "raw": "",
+        "is_signed": False,
+        "system_error": system_error,
+        "error_scope": "tracking_provider" if system_error else "shipment",
+        "http_status": int(exc.details.get("http_status") or 0),
+        "provider_reached": False,
+    }
+
+
 def refresh_tracking_for_shipment(shipment: Dict[str, Any]) -> Dict[str, Any]:
     try:
         result = query_tracking(shipment)
     except AppError as exc:
-        result = {
-            "provider": "kuaidi100",
-            "tracking_status": "查询失败",
-            "state_code": "",
-            "last_event": shipment.get("tracking_last_event") or "",
-            "checked_at": now_text(),
-            "signed_at": "",
-            "error": exc.message,
-            "raw": "",
-            "is_signed": False,
+        result = tracking_service_result_from_error(
+            exc,
+            str(shipment.get("tracking_last_event") or ""),
+        )
+    if result.get("system_error"):
+        record_tracking_service_incident(result)
+        return {
+            **result,
+            "id": int(shipment["id"]),
+            "status": str(shipment.get("status") or "已发货"),
+            "tracking_status": str(shipment.get("tracking_status") or "待查询"),
         }
+    if result.get("provider_reached", True):
+        clear_tracking_service_incident()
     if (
         result.get("tracking_status") == "查询失败"
         and shipment.get("booking_status") == "已出单"
@@ -468,6 +506,7 @@ def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
         or tracking_status == "查询失败"
     )
     detection_error = ""
+    detection_service_error = False
 
     if needs_detection:
         try:
@@ -483,6 +522,7 @@ def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
             }
         except AppError as exc:
             detection_error = exc.message
+            detection_service_error = bool(exc.details.get("tracking_service_error"))
         except Exception as exc:
             print(f"[tracking] 退货快递公司识别异常：{type(exc).__name__}")
             detection_error = "系统暂时无法完成快递公司识别，请稍后在退货看板重试。"
@@ -497,23 +537,27 @@ def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
                 "error": f"快递公司自动识别失败：{detection_error}",
                 "raw": "",
                 "is_signed": False,
+                "system_error": detection_service_error,
+                "error_scope": "tracking_provider" if detection_service_error else "return",
+                "provider_reached": False,
             }
+            if detection_service_error:
+                record_tracking_service_incident(result)
+                return {
+                    **result,
+                    "id": int(return_order["id"]),
+                    "status": str(return_order.get("status") or "待查询"),
+                    "tracking_status": str(return_order.get("tracking_status") or "待查询"),
+                }
             return DB.apply_return_tracking_result(int(return_order["id"]), result)
 
     try:
         result = query_tracking(return_order)
     except AppError as exc:
-        result = {
-            "provider": "kuaidi100",
-            "tracking_status": "查询失败",
-            "state_code": "",
-            "last_event": return_order.get("tracking_last_event") or "",
-            "checked_at": now_text(),
-            "signed_at": "",
-            "error": exc.message,
-            "raw": "",
-            "is_signed": False,
-        }
+        result = tracking_service_result_from_error(
+            exc,
+            str(return_order.get("tracking_last_event") or ""),
+        )
     except Exception as exc:
         print(f"[tracking] 退货物流查询异常：{type(exc).__name__}")
         result = {
@@ -527,7 +571,17 @@ def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
             "raw": "",
             "is_signed": False,
         }
-    if detection_error and result.get("tracking_status") == "查询失败":
+    if result.get("system_error"):
+        record_tracking_service_incident(result)
+        return {
+            **result,
+            "id": int(return_order["id"]),
+            "status": str(return_order.get("status") or "待查询"),
+            "tracking_status": str(return_order.get("tracking_status") or "待查询"),
+        }
+    if result.get("provider_reached", True):
+        clear_tracking_service_incident()
+    if detection_error and not detection_service_error and result.get("tracking_status") == "查询失败":
         detection_detail = detection_error.rstrip("。；; ")
         query_error = str(result.get("error") or "暂时没有取得物流信息。").rstrip("。；; ")
         saved_company = company or company_code or "未知快递公司"
@@ -569,17 +623,27 @@ def sync_tracking_batch(*, force: bool = False, limit: int = 20) -> Dict[str, An
         eligible = DB.tracking_candidate_count(stale_before=stale_before)
         candidates = DB.tracking_candidates(stale_before=stale_before, limit=limit)
         checked = 0
+        attempted = 0
         signed = 0
         errors = 0
+        service_error = ""
         for shipment in candidates:
             result = refresh_tracking_for_shipment(shipment)
+            attempted += 1
+            if result.get("system_error"):
+                service_error = str(result.get("error") or "物流查询服务暂时不可用。")
+                record_tracking_service_incident(result, affected_count=eligible)
+                break
             checked += 1
             signed += 1 if result.get("status") == "已签收" else 0
             errors += 1 if result.get("tracking_status") == "查询失败" else 0
         return {
             "checked": checked,
+            "attempted": attempted,
             "signed": signed,
             "errors": errors,
+            "service_error": service_error,
+            "provider_incident": bool(service_error),
             "skipped_recent": max(0, total - eligible),
             "remaining": max(0, eligible - checked),
             "busy": False,
@@ -596,14 +660,29 @@ def sync_return_tracking_batch(*, force: bool = False, limit: int = 20) -> Dict[
             stale_before="" if force else return_tracking_stale_before(), limit=limit
         )
         checked = 0
+        attempted = 0
         signed = 0
         errors = 0
+        service_error = ""
         for return_order in candidates:
             result = refresh_tracking_for_return(return_order)
+            attempted += 1
+            if result.get("system_error"):
+                service_error = str(result.get("error") or "物流查询服务暂时不可用。")
+                record_tracking_service_incident(result, affected_count=len(candidates))
+                break
             checked += 1
             signed += 1 if result.get("status") == "已签收" else 0
             errors += 1 if result.get("tracking_status") == "查询失败" else 0
-        return {"checked": checked, "signed": signed, "errors": errors, "busy": False}
+        return {
+            "checked": checked,
+            "attempted": attempted,
+            "signed": signed,
+            "errors": errors,
+            "service_error": service_error,
+            "provider_incident": bool(service_error),
+            "busy": False,
+        }
     finally:
         RETURN_TRACKING_SYNC_LOCK.release()
 
@@ -612,8 +691,9 @@ def tracking_worker() -> None:
     time.sleep(60)
     while True:
         try:
-            sync_tracking_batch(force=False, limit=50)
-            sync_return_tracking_batch(force=False, limit=50)
+            shipment_result = sync_tracking_batch(force=False, limit=20)
+            if not shipment_result.get("provider_incident"):
+                sync_return_tracking_batch(force=False, limit=20)
         except Exception as exc:
             print(f"[tracking] 自动同步失败：{exc}")
         time.sleep(1800)
@@ -1106,7 +1186,9 @@ class Handler(BaseHTTPRequestHandler):
             shipment_id = int(path.split("/")[3])
             shipment = DB.get_shipment(shipment_id, user)
             require_manual_tracking_allowed(shipment)
-            refresh_tracking_for_shipment(shipment)
+            refresh_result = refresh_tracking_for_shipment(shipment)
+            if refresh_result.get("system_error"):
+                raise AppError(str(refresh_result.get("error") or "物流查询服务暂时不可用。"), 503)
             self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
             return
 
@@ -1210,7 +1292,9 @@ class Handler(BaseHTTPRequestHandler):
             return_id = int(path.split("/")[3])
             return_order = DB.get_return_order(return_id, user)
             require_manual_tracking_allowed(return_order)
-            refresh_tracking_for_return(return_order)
+            refresh_result = refresh_tracking_for_return(return_order)
+            if refresh_result.get("system_error"):
+                raise AppError(str(refresh_result.get("error") or "物流查询服务暂时不可用。"), 503)
             self.send_json({"return_order": DB.get_return_order(return_id, user)})
             return
 

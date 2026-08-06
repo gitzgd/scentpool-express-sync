@@ -371,6 +371,18 @@ class Database:
                     resolved_by INTEGER NOT NULL,
                     resolved_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS operational_incidents (
+                    incident_key TEXT PRIMARY KEY,
+                    category TEXT NOT NULL,
+                    incident_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    affected_count INTEGER NOT NULL DEFAULT 0,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    resolved_at TEXT NOT NULL DEFAULT ''
+                );
                 """
             )
 
@@ -742,6 +754,7 @@ class Database:
             "shipping_batch_items",
             "shipping_callback_events",
             "task_alert_acknowledgements",
+            "operational_incidents",
             "return_orders",
             "return_items",
         )
@@ -777,10 +790,95 @@ class Database:
             "raw_sizes": {key: int(value or 0) for key, value in raw_sizes.items()},
         }
 
+    def record_operational_incident(
+        self,
+        incident_key: str,
+        *,
+        category: str,
+        incident_type: str,
+        status: str,
+        message: str,
+        affected_count: int = 0,
+    ) -> None:
+        """Persist one system-level incident without order or recipient data."""
+        normalized_key = str(incident_key or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9:_-]{2,95}", normalized_key):
+            raise AppError("系统异常标识无效。")
+        now = now_text()
+        normalized_count = max(0, int(affected_count or 0))
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO operational_incidents (
+                    incident_key, category, incident_type, status, message, affected_count,
+                    first_seen_at, last_seen_at, resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '')
+                ON CONFLICT(incident_key) DO UPDATE SET
+                    category = excluded.category,
+                    incident_type = excluded.incident_type,
+                    status = excluded.status,
+                    message = excluded.message,
+                    affected_count = CASE
+                        WHEN operational_incidents.resolved_at <> '' THEN excluded.affected_count
+                        ELSE MAX(operational_incidents.affected_count, excluded.affected_count)
+                    END,
+                    first_seen_at = CASE
+                        WHEN operational_incidents.resolved_at <> '' THEN excluded.first_seen_at
+                        ELSE operational_incidents.first_seen_at
+                    END,
+                    last_seen_at = excluded.last_seen_at,
+                    resolved_at = ''
+                """,
+                (
+                    normalized_key,
+                    str(category or "其他")[:40],
+                    str(incident_type or "系统服务异常")[:80],
+                    str(status or "系统检查中")[:40],
+                    str(message or "系统服务暂时不可用。")[:500],
+                    normalized_count,
+                    now,
+                    now,
+                ),
+            )
+
+    def clear_operational_incident(
+        self,
+        incident_key: str,
+    ) -> None:
+        """Resolve only the system-level incident; business records are never bulk-mutated."""
+        normalized_key = str(incident_key or "").strip().lower()
+        now = now_text()
+        with self.connect() as conn:
+            active = conn.execute(
+                "SELECT 1 FROM operational_incidents WHERE incident_key = ? AND resolved_at = ''",
+                (normalized_key,),
+            ).fetchone()
+            if not active:
+                return
+            conn.execute(
+                """
+                UPDATE operational_incidents
+                SET resolved_at = ?
+                WHERE incident_key = ? AND resolved_at = ''
+                """,
+                (now, normalized_key),
+            )
+
     def task_alerts(self, limit: int = 50) -> Dict[str, Any]:
         """Return current operational failures without recipient personal data."""
         stale_before = (datetime.now(APP_TZ) - timedelta(minutes=30)).isoformat(timespec="seconds")
         items: List[Dict[str, Any]] = []
+        tracking_service_failures: List[Dict[str, str]] = []
+
+        def is_tracking_service_failure(message: str) -> bool:
+            normalized = str(message or "")
+            return bool(
+                re.search(
+                    r"快递100请求失败：|快递100接口.*(?:拒绝访问|请求过多|不可用|无法连接)"
+                    r"|快递100返回(?:内容|格式).*(?:异常|有效 JSON)",
+                    normalized,
+                )
+            )
 
         def classify(alert_type: str, message: str) -> tuple[str, str, bool]:
             normalized = str(message or "")
@@ -896,6 +994,18 @@ class Database:
                     "SELECT alert_key, source_fingerprint FROM task_alert_acknowledgements"
                 ).fetchall()
             }
+            operational_incidents = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT incident_key, category, incident_type, status, message, affected_count,
+                           first_seen_at, last_seen_at
+                    FROM operational_incidents
+                    WHERE resolved_at = ''
+                    ORDER BY last_seen_at DESC
+                    """
+                ).fetchall()
+            ]
 
         for row in shipment_rows:
             if row["booking_status"] == "下单失败":
@@ -908,7 +1018,11 @@ class Database:
                     str(row["booking_updated_at"] or row["updated_at"]),
                     batch_id=row["latest_batch_id"],
                 )
-            elif row["booking_status"] in BOOKING_ACTIVE_STATUSES:
+            elif (
+                row["booking_status"] in BOOKING_ACTIVE_STATUSES
+                and str(row["booking_updated_at"] or "")
+                and str(row["booking_updated_at"]) < stale_before
+            ):
                 add_alert(
                     row,
                     f"shipment:{int(row['id'])}:booking_wait",
@@ -919,14 +1033,23 @@ class Database:
                     batch_id=row["latest_batch_id"],
                 )
             if row["tracking_status"] == "查询失败":
-                add_alert(
-                    row,
-                    f"shipment:{int(row['id'])}:tracking",
-                    "物流查询失败",
-                    "稍后重试",
-                    str(row["tracking_error"] or "暂时没有取得物流信息。"),
-                    str(row["tracking_last_checked_at"] or row["updated_at"]),
-                )
+                tracking_message = str(row["tracking_error"] or "暂时没有取得物流信息。")
+                if is_tracking_service_failure(tracking_message):
+                    tracking_service_failures.append(
+                        {
+                            "message": tracking_message,
+                            "updated_at": str(row["tracking_last_checked_at"] or row["updated_at"]),
+                        }
+                    )
+                else:
+                    add_alert(
+                        row,
+                        f"shipment:{int(row['id'])}:tracking",
+                        "物流查询失败",
+                        "稍后重试",
+                        tracking_message,
+                        str(row["tracking_last_checked_at"] or row["updated_at"]),
+                    )
             if row["label_print_status"] == "打印失败":
                 add_alert(
                     row,
@@ -938,13 +1061,97 @@ class Database:
                 )
 
         for row in return_rows:
-            add_alert(
-                row,
-                f"return:{int(row['id'])}:tracking",
-                "退货物流查询失败",
-                "稍后重试",
-                str(row["tracking_error"] or "暂时没有取得退货物流信息。"),
-                str(row["tracking_last_checked_at"] or row["updated_at"]),
+            tracking_message = str(row["tracking_error"] or "暂时没有取得退货物流信息。")
+            if is_tracking_service_failure(tracking_message):
+                tracking_service_failures.append(
+                    {
+                        "message": tracking_message,
+                        "updated_at": str(row["tracking_last_checked_at"] or row["updated_at"]),
+                    }
+                )
+            else:
+                add_alert(
+                    row,
+                    f"return:{int(row['id'])}:tracking",
+                    "退货物流查询失败",
+                    "稍后重试",
+                    tracking_message,
+                    str(row["tracking_last_checked_at"] or row["updated_at"]),
+                )
+
+        tracking_incident = next(
+            (
+                incident
+                for incident in operational_incidents
+                if str(incident.get("incident_key") or "") == "tracking:kuaidi100"
+            ),
+            None,
+        )
+        if tracking_incident or tracking_service_failures:
+            legacy_count = len(tracking_service_failures)
+            latest_legacy = max(
+                (str(item.get("updated_at") or "") for item in tracking_service_failures),
+                default="",
+            )
+            updated_at = str((tracking_incident or {}).get("last_seen_at") or latest_legacy or now_text())
+            affected_count = max(
+                legacy_count,
+                int((tracking_incident or {}).get("affected_count") or 0),
+            )
+            message = str(
+                (tracking_incident or {}).get("message")
+                or "此前快递100接口层查询失败。系统已把同一故障合并显示，并会按每个单号原定节奏重新查询。"
+            )
+            alert_key = "system:tracking:kuaidi100"
+            fingerprint_source = "\x00".join((alert_key, message, updated_at, str(affected_count)))
+            items.append(
+                {
+                    "alert_key": alert_key,
+                    "fingerprint": hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest(),
+                    "type": "物流服务异常",
+                    "category": "物流查询",
+                    "reason": "快递100接口异常",
+                    "auto_retry": True,
+                    "system_scope": True,
+                    "incident_active": bool(tracking_incident),
+                    "record_id": None,
+                    "business_id": "快递100批量查询",
+                    "store_name": "全部门店",
+                    "status": str((tracking_incident or {}).get("status") or "等待下轮验证"),
+                    "message": message,
+                    "updated_at": updated_at,
+                    "batch_id": None,
+                    "affected_count": affected_count,
+                }
+            )
+
+        for incident in operational_incidents:
+            if str(incident.get("incident_key") or "") == "tracking:kuaidi100":
+                continue
+            incident_key = str(incident.get("incident_key") or "")
+            updated_at = str(incident.get("last_seen_at") or now_text())
+            message = str(incident.get("message") or "系统服务暂时不可用。")
+            alert_key = f"system:{incident_key}"
+            fingerprint_source = "\x00".join((alert_key, message, updated_at))
+            items.append(
+                {
+                    "alert_key": alert_key,
+                    "fingerprint": hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest(),
+                    "type": str(incident.get("incident_type") or "系统服务异常"),
+                    "category": str(incident.get("category") or "其他"),
+                    "reason": "系统服务异常",
+                    "auto_retry": True,
+                    "system_scope": True,
+                    "incident_active": True,
+                    "record_id": None,
+                    "business_id": "系统服务",
+                    "store_name": "全部门店",
+                    "status": str(incident.get("status") or "系统检查中"),
+                    "message": message,
+                    "updated_at": updated_at,
+                    "batch_id": None,
+                    "affected_count": int(incident.get("affected_count") or 0),
+                }
             )
 
         items = [
@@ -959,11 +1166,18 @@ class Database:
             category = str(item["category"])
             category_counts[category] = category_counts.get(category, 0) + 1
         counts["total"] = len(items)
-        visible_items = items[: max(1, min(int(limit or 50), 100))]
+        visible_limit = max(1, min(int(limit or 50), 100))
+        visible_items = items[:visible_limit]
+        category_items = {
+            category: [item for item in items if item["category"] == category][:visible_limit]
+            for category in category_counts
+        }
         return {
             "counts": counts,
             "category_counts": category_counts,
             "items": visible_items,
+            "category_items": category_items,
+            "affected_total": sum(max(1, int(item.get("affected_count") or 0)) for item in items),
             "stale_after_minutes": 30,
             "generated_at": now_text(),
         }
@@ -982,9 +1196,13 @@ class Database:
         if not re.fullmatch(r"[0-9a-f]{64}", normalized_fingerprint):
             raise AppError("异常提醒版本无效。")
 
+        alert_payload = self.task_alerts(limit=100)
+        candidate_items = list(alert_payload["items"])
+        for category_rows in alert_payload.get("category_items", {}).values():
+            candidate_items.extend(category_rows)
         current = next(
             (
-                item for item in self.task_alerts(limit=100)["items"]
+                item for item in candidate_items
                 if item["alert_key"] == normalized_key
                 and item["fingerprint"] == normalized_fingerprint
             ),
