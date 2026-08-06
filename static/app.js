@@ -1741,6 +1741,8 @@ function bindReturnBoard(admin = false) {
         const result = data.result || {};
         if (result.busy) {
           errorToast("退货物流同步正在运行，本次没有重复启动。请稍后刷新查看结果。");
+        } else if (result.provider_incident) {
+          errorToast(result.service_error || "快递100服务暂时不可用，本轮同步已停止；无需逐个处理订单。");
         } else if (result.errors) {
           errorToast(`退货物流同步完成，但有 ${result.errors} 单查询失败。请查看页面上的红色错误提示。`);
         } else {
@@ -1857,6 +1859,12 @@ function taskAlertAdvice(type, message = "") {
   if (type === "物流查询失败" || type === "退货物流查询失败") {
     return "这不会删除快递单号。请稍后再次查询，或等待系统下一轮自动同步。";
   }
+  if (type === "物流服务异常") {
+    if (/此前|逐单/.test(String(message || ""))) {
+      return "历史平台故障已合并显示。系统会按每个单号原定节奏重新查询；某一单查询成功后，会自动从受影响数量中移除。";
+    }
+    return "这是快递100接口层故障，不需要逐个修改订单。系统已停止本轮批量查询，会在下一轮先探测服务是否恢复。";
+  }
   return "请刷新后重试；问题持续存在时联系管理员并提供业务ID。";
 }
 
@@ -1888,9 +1896,11 @@ function renderTaskAlertDialog() {
   const data = state.taskAlerts || { counts: { total: 0 }, items: [] };
   const items = Array.isArray(data.items) ? data.items : [];
   const total = taskAlertTotal();
+  const affectedTotal = Number(data.affected_total || total);
   const categories = ["全部", "电子面单", "物流查询", "打印"];
   const selected = categories.includes(state.taskAlertsCategory) ? state.taskAlertsCategory : "全部";
-  const visibleItems = selected === "全部" ? items : items.filter((item) => item.category === selected);
+  const categoryItems = Array.isArray(data.category_items?.[selected]) ? data.category_items[selected] : [];
+  const visibleItems = selected === "全部" ? items : categoryItems;
   const refresh = data.refresh || {};
   return `
     <div class="task-alert-backdrop" id="taskAlertDialogBackdrop">
@@ -1898,7 +1908,7 @@ function renderTaskAlertDialog() {
         <div class="task-alert-dialog-head">
           <div>
             <h2 id="taskAlertDialogTitle">异常提醒</h2>
-            <div class="muted mini">当前 ${total} 项；恢复的异常会自动消失，人工确认只隐藏本次异常。</div>
+            <div class="muted mini">当前 ${total} 条提醒${affectedTotal > total ? `，涉及 ${affectedTotal} 项任务` : ""}；恢复后自动消失。</div>
           </div>
           <button class="task-alert-close" id="closeTaskAlerts" type="button" aria-label="关闭异常提醒">×</button>
         </div>
@@ -1917,9 +1927,9 @@ function renderTaskAlertDialog() {
           ${visibleItems.length ? `
             <div class="task-alert-list">
               ${visibleItems.map((item) => `
-                <article class="task-alert-item">
+                <article class="task-alert-item ${item.system_scope ? "system-scope" : ""}">
                   <div class="task-alert-heading">
-                    <div><strong>${escapeHtml(item.type)}</strong> · <span translate="no">${escapeHtml(item.business_id)}</span></div>
+                    <div><strong>${escapeHtml(item.type)}</strong> · <span translate="no">${escapeHtml(item.business_id)}</span>${Number(item.affected_count || 0) > 1 ? ` · 影响 ${Number(item.affected_count)} 项` : ""}</div>
                     <span class="status exception">${escapeHtml(item.status)}</span>
                   </div>
                   <div class="task-alert-tags">
@@ -1930,13 +1940,17 @@ function renderTaskAlertDialog() {
                   <div class="muted mini">${escapeHtml(item.store_name)} · ${escapeHtml(formatDate(item.updated_at))}</div>
                   <div class="task-alert-message"><strong>失败原因：</strong>${escapeHtml(item.message || "任务没有成功完成。")}</div>
                   <div class="task-alert-advice"><strong>怎么处理：</strong>${escapeHtml(taskAlertAdvice(item.type, item.message))}</div>
-                  <div class="inline-actions">
-                    ${item.type === "面单下单失败" && item.batch_id ? `<button class="btn primary small" data-retry-alert-batch="${Number(item.batch_id)}" type="button">重新提交失败订单</button>` : ""}
-                    ${item.type === "退货物流查询失败"
-                      ? `<button class="btn secondary small" data-locate-return-alert="${escapeHtml(item.business_id)}" type="button">在退货看板中查看</button>`
-                      : `<button class="btn secondary small" data-locate-task-alert="${escapeHtml(item.business_id)}" type="button">在订单列表中查看</button>`}
-                    <button class="btn ghost small" data-resolve-task-alert="${escapeHtml(item.alert_key)}" data-alert-fingerprint="${escapeHtml(item.fingerprint)}" type="button">标记人工已处理</button>
-                  </div>
+                  ${item.system_scope
+                    ? `<div class="task-alert-system-note">${item.incident_active
+                        ? "无需逐单处理，也不要重复点击同步；服务恢复后提醒会自动更新。"
+                        : "无需批量修改订单；每个单号重新查询成功后，受影响数量会自动减少。"}</div>`
+                    : `<div class="inline-actions">
+                        ${item.type === "面单下单失败" && item.batch_id ? `<button class="btn primary small" data-retry-alert-batch="${Number(item.batch_id)}" type="button">重新提交失败订单</button>` : ""}
+                        ${item.type === "退货物流查询失败"
+                          ? `<button class="btn secondary small" data-locate-return-alert="${escapeHtml(item.business_id)}" type="button">在退货看板中查看</button>`
+                          : `<button class="btn secondary small" data-locate-task-alert="${escapeHtml(item.business_id)}" type="button">在订单列表中查看</button>`}
+                        <button class="btn secondary small" data-resolve-task-alert="${escapeHtml(item.alert_key)}" data-alert-fingerprint="${escapeHtml(item.fingerprint)}" type="button">标记人工已处理</button>
+                      </div>`}
                 </article>
               `).join("")}
             </div>
@@ -2706,6 +2720,8 @@ function bindAdmin() {
       const failed = result.errors || 0;
       if (result.busy) {
         errorToast("物流同步任务正在运行，本次没有重复启动。请稍后刷新查看结果。");
+      } else if (result.provider_incident) {
+        errorToast(result.service_error || "快递100服务暂时不可用，本轮同步已停止；无需逐个处理订单。");
       } else if (failed) {
         errorToast(`物流同步完成，但有 ${failed} 单查询失败。请打开页面顶部“异常提醒”查看。`);
       } else {

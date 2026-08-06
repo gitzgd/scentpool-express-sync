@@ -1202,8 +1202,9 @@ tr:last-child td {
 .task-alert-dialog {
   display: flex;
   flex-direction: column;
-  width: min(820px, 100%);
-  max-height: min(86vh, 860px);
+  width: min(920px, 100%);
+  max-height: min(calc(100dvh - 48px), 880px);
+  min-height: 0;
   overflow: hidden;
   border: 1px solid rgba(216, 216, 222, 0.95);
   border-radius: 14px;
@@ -1222,6 +1223,7 @@ tr:last-child td {
   gap: 18px;
   padding: 20px 22px 14px;
   border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
 }
 
 .task-alert-dialog-head h2 {
@@ -1249,12 +1251,15 @@ tr:last-child td {
   background: #f8f8fa;
   color: #5d5d62;
   font-size: 12px;
+  flex: 0 0 auto;
 }
 
 .task-alert-categories {
   display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
   gap: 8px;
-  overflow-x: auto;
+  overflow: visible;
   padding: 12px 22px;
   border-bottom: 1px solid rgba(216, 216, 222, 0.72);
 }
@@ -1289,9 +1294,11 @@ tr:last-child td {
 }
 
 .task-alert-dialog-body {
-  min-height: 180px;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   padding: 0 22px 22px;
+  overscroll-behavior: contain;
 }
 
 .task-ok-message {
@@ -1350,6 +1357,27 @@ tr:last-child td {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 10px;
+}
+
+.task-alert-item .inline-actions .btn {
+  flex: 0 0 auto;
+  white-space: normal;
+}
+
+.task-alert-item.system-scope {
+  border-color: rgba(0, 102, 204, 0.22);
+  background: rgba(0, 122, 255, 0.055);
+}
+
+.task-alert-system-note {
+  margin-top: 10px;
+  padding: 9px 10px;
+  border: 1px solid rgba(0, 102, 204, 0.16);
+  border-radius: 9px;
+  background: #ffffff;
+  color: var(--blue-ink);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .task-alert-tags {
@@ -1654,7 +1682,7 @@ tr:last-child td {
 
   .task-alert-dialog {
     width: 100%;
-    max-height: 92vh;
+    max-height: 92dvh;
     border-radius: 16px 16px 0 0;
   }
 
@@ -1671,7 +1699,18 @@ tr:last-child td {
 
   .task-alert-dialog-body {
     padding-right: 16px;
+    padding-bottom: 20px;
     padding-left: 16px;
+  }
+
+  .task-alert-categories {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .task-alert-category {
+    justify-content: space-between;
+    width: 100%;
   }
 
   .toast {
