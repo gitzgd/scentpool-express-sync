@@ -65,6 +65,7 @@ MAX_REQUEST_THREADS = bounded_env_int("SCENTPOOL_MAX_REQUEST_THREADS", 8, 2, 16)
 LABEL_MERGE_TIMEOUT_SECONDS = bounded_env_int("SCENTPOOL_LABEL_MERGE_TIMEOUT_SECONDS", 600, 60, 1200)
 SLOW_REQUEST_MILLISECONDS = bounded_env_int("SCENTPOOL_SLOW_REQUEST_MILLISECONDS", 1000, 250, 10000)
 SHIPPING_TRANSIENT_RETRIES = bounded_env_int("SCENTPOOL_SHIPPING_TRANSIENT_RETRIES", 2, 0, 3)
+TASK_ALERT_REFRESH_SECONDS = 60
 DAILY_AUDIT_PATH = "/api/admin/system/daily-audit"
 MAX_AUDIT_QUERY_LENGTH = 64
 MAX_AUDIT_AUTHORIZATION_LENGTH = 512
@@ -967,7 +968,29 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/admin/task-alerts" and self.command == "GET":
             self.require_admin(user)
-            self.send_json(DB.task_alerts())
+            alerts = DB.task_alerts()
+            alerts["refresh"] = {
+                "alerts_seconds": TASK_ALERT_REFRESH_SECONDS,
+                "shipment_tracking_minutes": tracking_interval_minutes(),
+                "return_tracking_minutes": return_tracking_interval_minutes(),
+            }
+            self.send_json(alerts)
+            return
+
+        if path == "/api/admin/task-alerts/resolve" and self.command == "POST":
+            self.require_admin(user)
+            body = self.read_json()
+            alerts = DB.resolve_task_alert(
+                str(body.get("alert_key") or ""),
+                str(body.get("fingerprint") or ""),
+                int(user["id"]),
+            )
+            alerts["refresh"] = {
+                "alerts_seconds": TASK_ALERT_REFRESH_SECONDS,
+                "shipment_tracking_minutes": tracking_interval_minutes(),
+                "return_tracking_minutes": return_tracking_interval_minutes(),
+            }
+            self.send_json(alerts)
             return
 
         if path == "/api/admin/shipping-settings" and self.command == "GET":

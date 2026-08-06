@@ -362,6 +362,15 @@ class Database:
                     used_at TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS task_alert_acknowledgements (
+                    alert_key TEXT PRIMARY KEY,
+                    alert_type TEXT NOT NULL,
+                    record_id INTEGER NOT NULL,
+                    source_fingerprint TEXT NOT NULL,
+                    resolved_by INTEGER NOT NULL,
+                    resolved_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -732,6 +741,7 @@ class Database:
             "shipping_batches",
             "shipping_batch_items",
             "shipping_callback_events",
+            "task_alert_acknowledgements",
             "return_orders",
             "return_items",
         )
@@ -772,8 +782,37 @@ class Database:
         stale_before = (datetime.now(APP_TZ) - timedelta(minutes=30)).isoformat(timespec="seconds")
         items: List[Dict[str, Any]] = []
 
+        def classify(alert_type: str, message: str) -> tuple[str, str, bool]:
+            normalized = str(message or "")
+            if alert_type == "面单下单失败":
+                if re.search(r"固话|手机|电话|号码|格式", normalized):
+                    return "电子面单", "联系方式格式", False
+                if re.search(r"停发|暂停服务|超区|服务范围|不派送|无法配送|内部整顿", normalized):
+                    return "电子面单", "停发或超范围", False
+                if re.search(r"行政区|省市区|地址.*解析|地址.*格式", normalized):
+                    return "电子面单", "地址信息", False
+                if re.search(r"余额|欠费|单量|数量不足|授权|网点|账号|账户|配置", normalized):
+                    return "电子面单", "授权或余额", False
+                if re.search(r"网络|超时|服务暂时|繁忙|限流|自动重试", normalized):
+                    return "电子面单", "网络或平台", False
+                return "电子面单", "其他下单问题", False
+            if alert_type == "面单等待过久":
+                return "电子面单", "任务等待过久", True
+            if alert_type == "面单打印失败":
+                return "打印", "打印设备或文件", False
+            if alert_type in {"物流查询失败", "退货物流查询失败"}:
+                if re.search(r"查询无结果|暂无轨迹|暂无物流|未查询到|没有物流", normalized):
+                    return "物流查询", "暂未查到物流", True
+                if re.search(r"识别|单号|快递公司|不支持", normalized):
+                    return "物流查询", "单号或快递公司", True
+                if re.search(r"网络|超时|服务|繁忙|限流", normalized):
+                    return "物流查询", "查询服务异常", True
+                return "物流查询", "其他物流问题", True
+            return "其他", "其他问题", False
+
         def add_alert(
             row: sqlite3.Row,
+            alert_key: str,
             alert_type: str,
             status: str,
             message: str,
@@ -781,9 +820,16 @@ class Database:
             *,
             batch_id: Any = None,
         ) -> None:
+            category, reason, auto_retry = classify(alert_type, message)
+            fingerprint_source = "\x00".join((alert_key, alert_type, status, message, updated_at))
             items.append(
                 {
+                    "alert_key": alert_key,
+                    "fingerprint": hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest(),
                     "type": alert_type,
+                    "category": category,
+                    "reason": reason,
+                    "auto_retry": auto_retry,
                     "record_id": int(row["id"]),
                     "business_id": str(row["business_id"]),
                     "store_name": str(row["store_name"]),
@@ -844,11 +890,18 @@ class Database:
                 WHERE return_orders.tracking_status = '查询失败'
                 """
             ).fetchall()
+            acknowledged = {
+                str(row["alert_key"]): str(row["source_fingerprint"])
+                for row in conn.execute(
+                    "SELECT alert_key, source_fingerprint FROM task_alert_acknowledgements"
+                ).fetchall()
+            }
 
         for row in shipment_rows:
             if row["booking_status"] == "下单失败":
                 add_alert(
                     row,
+                    f"shipment:{int(row['id'])}:booking",
                     "面单下单失败",
                     "需要处理",
                     str(row["booking_error"] or "电子面单没有取得快递单号。"),
@@ -858,6 +911,7 @@ class Database:
             elif row["booking_status"] in BOOKING_ACTIVE_STATUSES:
                 add_alert(
                     row,
+                    f"shipment:{int(row['id'])}:booking_wait",
                     "面单等待过久",
                     "等待超过30分钟",
                     "电子面单任务长时间没有完成，系统会自动尝试恢复；刷新后仍未变化请联系管理员。",
@@ -867,6 +921,7 @@ class Database:
             if row["tracking_status"] == "查询失败":
                 add_alert(
                     row,
+                    f"shipment:{int(row['id'])}:tracking",
                     "物流查询失败",
                     "稍后重试",
                     str(row["tracking_error"] or "暂时没有取得物流信息。"),
@@ -875,6 +930,7 @@ class Database:
             if row["label_print_status"] == "打印失败":
                 add_alert(
                     row,
+                    f"shipment:{int(row['id'])}:print",
                     "面单打印失败",
                     "需要重新打印",
                     str(row["label_print_error"] or "打印机没有确认打印成功。"),
@@ -884,19 +940,82 @@ class Database:
         for row in return_rows:
             add_alert(
                 row,
+                f"return:{int(row['id'])}:tracking",
                 "退货物流查询失败",
                 "稍后重试",
                 str(row["tracking_error"] or "暂时没有取得退货物流信息。"),
                 str(row["tracking_last_checked_at"] or row["updated_at"]),
             )
 
+        items = [
+            item for item in items
+            if acknowledged.get(str(item["alert_key"])) != str(item["fingerprint"])
+        ]
         items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         counts: Dict[str, int] = {}
+        category_counts: Dict[str, int] = {}
         for item in items:
             counts[item["type"]] = counts.get(item["type"], 0) + 1
+            category = str(item["category"])
+            category_counts[category] = category_counts.get(category, 0) + 1
         counts["total"] = len(items)
         visible_items = items[: max(1, min(int(limit or 50), 100))]
-        return {"counts": counts, "items": visible_items, "stale_after_minutes": 30}
+        return {
+            "counts": counts,
+            "category_counts": category_counts,
+            "items": visible_items,
+            "stale_after_minutes": 30,
+            "generated_at": now_text(),
+        }
+
+    def resolve_task_alert(
+        self,
+        alert_key: str,
+        source_fingerprint: str,
+        resolved_by: int,
+    ) -> Dict[str, Any]:
+        """Acknowledge one exact alert occurrence without mutating its business record."""
+        normalized_key = str(alert_key or "").strip()
+        normalized_fingerprint = str(source_fingerprint or "").strip().lower()
+        if not re.fullmatch(r"(?:shipment|return):[1-9][0-9]*:[a-z_]+", normalized_key):
+            raise AppError("异常提醒标识无效。")
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized_fingerprint):
+            raise AppError("异常提醒版本无效。")
+
+        current = next(
+            (
+                item for item in self.task_alerts(limit=100)["items"]
+                if item["alert_key"] == normalized_key
+                and item["fingerprint"] == normalized_fingerprint
+            ),
+            None,
+        )
+        if not current:
+            raise AppError("这条异常已经恢复或发生变化，请刷新后再确认。", 409)
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO task_alert_acknowledgements (
+                    alert_key, alert_type, record_id, source_fingerprint, resolved_by, resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(alert_key) DO UPDATE SET
+                    alert_type = excluded.alert_type,
+                    record_id = excluded.record_id,
+                    source_fingerprint = excluded.source_fingerprint,
+                    resolved_by = excluded.resolved_by,
+                    resolved_at = excluded.resolved_at
+                """,
+                (
+                    normalized_key,
+                    str(current["type"]),
+                    int(current["record_id"]),
+                    normalized_fingerprint,
+                    int(resolved_by),
+                    now_text(),
+                ),
+            )
+        return self.task_alerts()
 
     def daily_audit(self, date_text: str) -> Dict[str, Any]:
         """Return aggregate-only audit metrics through an independent read-only connection."""

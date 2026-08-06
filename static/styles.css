@@ -28,6 +28,10 @@ body {
   line-height: 1.45;
 }
 
+body.task-alert-dialog-open {
+  overflow: hidden;
+}
+
 html.app-loading body::before {
   content: "";
   position: fixed;
@@ -1145,6 +1149,151 @@ tr:last-child td {
   border-color: rgba(201, 52, 47, 0.18);
 }
 
+.task-alert-trigger {
+  position: relative;
+  border: 1px solid transparent;
+  background: #ffffff;
+}
+
+.task-alert-trigger.has-alerts {
+  border-color: rgba(201, 52, 47, 0.26);
+  background: rgba(201, 52, 47, 0.08);
+  color: #a3221e;
+}
+
+.task-alert-trigger.is-clear {
+  border-color: rgba(35, 134, 54, 0.22);
+  background: rgba(35, 134, 54, 0.07);
+  color: #17662a;
+}
+
+.task-alert-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #66666c;
+  color: #ffffff;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.task-alert-trigger.has-alerts .task-alert-badge {
+  background: var(--red);
+}
+
+.task-alert-trigger.is-clear .task-alert-badge {
+  background: var(--green);
+}
+
+.task-alert-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(20, 20, 24, 0.42);
+  backdrop-filter: blur(5px);
+}
+
+.task-alert-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(820px, 100%);
+  max-height: min(86vh, 860px);
+  overflow: hidden;
+  border: 1px solid rgba(216, 216, 222, 0.95);
+  border-radius: 14px;
+  background: #ffffff;
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.24);
+}
+
+.task-alert-dialog:focus {
+  outline: none;
+}
+
+.task-alert-dialog-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 20px 22px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.task-alert-dialog-head h2 {
+  margin: 0 0 4px;
+  font-size: 23px;
+}
+
+.task-alert-close {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: #f1f1f4;
+  color: #4a4a4f;
+  cursor: pointer;
+  font-size: 24px;
+  line-height: 1;
+}
+
+.task-alert-refresh-note {
+  padding: 10px 22px;
+  border-bottom: 1px solid rgba(216, 216, 222, 0.72);
+  background: #f8f8fa;
+  color: #5d5d62;
+  font-size: 12px;
+}
+
+.task-alert-categories {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 12px 22px;
+  border-bottom: 1px solid rgba(216, 216, 222, 0.72);
+}
+
+.task-alert-category {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+  color: #4a4a4f;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.task-alert-category span {
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #f1f1f4;
+  font-size: 11px;
+}
+
+.task-alert-category.active {
+  border-color: rgba(201, 52, 47, 0.24);
+  background: rgba(201, 52, 47, 0.08);
+  color: #a3221e;
+  font-weight: 700;
+}
+
+.task-alert-dialog-body {
+  min-height: 180px;
+  overflow-y: auto;
+  padding: 0 22px 22px;
+}
+
 .task-ok-message {
   margin-top: 14px;
   padding: 12px;
@@ -1197,7 +1346,36 @@ tr:last-child td {
 }
 
 .task-alert-item .inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-top: 10px;
+}
+
+.task-alert-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 8px;
+}
+
+.task-alert-tags span {
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: #f1f1f4;
+  color: #55555b;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.task-alert-tags span.auto {
+  background: rgba(0, 122, 255, 0.08);
+  color: var(--blue-ink);
+}
+
+.task-alert-tags span.manual {
+  background: rgba(178, 93, 0, 0.1);
+  color: #884800;
 }
 
 .inline-failure {
@@ -1461,8 +1639,39 @@ tr:last-child td {
     flex-direction: column;
   }
 
+  .task-alert-heading .status {
+    align-self: flex-start;
+  }
+
   .task-alert-item .inline-actions .btn {
     width: 100%;
+  }
+
+  .task-alert-backdrop {
+    place-items: end center;
+    padding: 0;
+  }
+
+  .task-alert-dialog {
+    width: 100%;
+    max-height: 92vh;
+    border-radius: 16px 16px 0 0;
+  }
+
+  .task-alert-dialog-head,
+  .task-alert-categories {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .task-alert-refresh-note {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .task-alert-dialog-body {
+    padding-right: 16px;
+    padding-left: 16px;
   }
 
   .toast {
