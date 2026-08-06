@@ -553,6 +553,9 @@ def main() -> None:
             migrated_return = legacy_conn.execute("SELECT * FROM return_orders WHERE id = 1").fetchone()
             assert migrated_return["express_company_source"] == "manual"
             assert migrated_return["express_company_code"] == "yuantong"
+            assert legacy_conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_alert_acknowledgements'"
+            ).fetchone()
         assert list((Path(tmp) / "backups").glob("legacy-before-order-date-*.db"))
         legacy_product = legacy_db.list_products()[0]
         created_next_day = legacy_db.create_shipment(
@@ -601,9 +604,25 @@ def main() -> None:
         failure_alerts = legacy_db.task_alerts()
         assert failure_alerts["counts"]["面单下单失败"] == 1
         assert failure_alerts["items"][0]["message"] == "模拟失败"
+        assert failure_alerts["items"][0]["category"] == "电子面单"
+        assert failure_alerts["items"][0]["reason"] == "其他下单问题"
+        assert failure_alerts["items"][0]["auto_retry"] is False
         assert "recipient_name" not in failure_alerts["items"][0]
         assert "phone" not in failure_alerts["items"][0]
         assert "address" not in failure_alerts["items"][0]
+        original_alert = failure_alerts["items"][0]
+        acknowledged_alerts = legacy_db.resolve_task_alert(
+            original_alert["alert_key"], original_alert["fingerprint"], 1
+        )
+        assert acknowledged_alerts["counts"]["total"] == 0
+        with legacy_db.connect() as legacy_conn:
+            legacy_conn.execute(
+                "UPDATE shipments SET booking_updated_at = ? WHERE id = ?",
+                ("2030-01-01T00:00:00+08:00", original_alert["record_id"]),
+            )
+        repeated_alerts = legacy_db.task_alerts()
+        assert repeated_alerts["counts"]["total"] == 1
+        assert repeated_alerts["items"][0]["fingerprint"] != original_alert["fingerprint"]
         retried_batch = legacy_db.retry_shipping_batch(large_batch["batch"]["id"])
         assert retried_batch["counts"]["排队中"] == 51
         stale_job = legacy_db.claim_next_shipping_job()
@@ -671,6 +690,11 @@ def main() -> None:
         assert status == 200, body
         assert body["counts"]["total"] == 0
         assert body["items"] == []
+        assert body["refresh"] == {
+            "alerts_seconds": 60,
+            "shipment_tracking_minutes": 360,
+            "return_tracking_minutes": 720,
+        }
 
         status, body = request(admin, base, "GET", "/api/admin/tracking/config")
         assert status == 200, body
@@ -746,6 +770,14 @@ def main() -> None:
         assert status == 403, body
         status, body = request(staff, base, "GET", "/api/admin/task-alerts")
         assert status == 403, body
+        status, body = request(
+            staff,
+            base,
+            "POST",
+            "/api/admin/task-alerts/resolve",
+            {"alert_key": "shipment:1:tracking", "fingerprint": "0" * 64},
+        )
+        assert status == 403, body
 
         status, body = request(staff, base, "GET", "/shipments")
         assert status == 200
@@ -766,6 +798,57 @@ def main() -> None:
         assert status == 201, body
         shipment_id = body["shipment"]["id"]
         assert body["shipment"]["items"][0]["quantity"] == 2
+
+        with server.DB.connect() as conn:
+            conn.execute(
+                """
+                UPDATE shipments
+                SET tracking_status = '查询失败', tracking_error = '查询无结果，请隔段时间再查',
+                    tracking_last_checked_at = '2026-08-06T15:00:00+08:00'
+                WHERE id = ?
+                """,
+                (shipment_id,),
+            )
+        status, body = request(admin, base, "GET", "/api/admin/task-alerts")
+        assert status == 200, body
+        assert body["counts"]["total"] == 1
+        assert body["category_counts"]["物流查询"] == 1
+        tracking_alert = body["items"][0]
+        assert tracking_alert["reason"] == "暂未查到物流"
+        assert tracking_alert["auto_retry"] is True
+        status, body = request(
+            admin,
+            base,
+            "POST",
+            "/api/admin/task-alerts/resolve",
+            {"alert_key": tracking_alert["alert_key"], "fingerprint": "0" * 64},
+        )
+        assert status == 409, body
+        status, body = request(
+            admin,
+            base,
+            "POST",
+            "/api/admin/task-alerts/resolve",
+            {"alert_key": tracking_alert["alert_key"], "fingerprint": tracking_alert["fingerprint"]},
+        )
+        assert status == 200, body
+        assert body["counts"]["total"] == 0
+        with server.DB.connect() as conn:
+            conn.execute(
+                "UPDATE shipments SET tracking_last_checked_at = ? WHERE id = ?",
+                ("2026-08-06T15:01:00+08:00", shipment_id),
+            )
+        status, body = request(admin, base, "GET", "/api/admin/task-alerts")
+        assert status == 200, body
+        assert body["counts"]["total"] == 1
+        with server.DB.connect() as conn:
+            conn.execute(
+                "UPDATE shipments SET tracking_status = '', tracking_error = '', tracking_last_checked_at = '' WHERE id = ?",
+                (shipment_id,),
+            )
+        status, body = request(admin, base, "GET", "/api/admin/task-alerts")
+        assert status == 200, body
+        assert body["counts"]["total"] == 0
 
         status, body = request(
             staff,

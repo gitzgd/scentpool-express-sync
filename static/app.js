@@ -40,6 +40,9 @@ const state = {
   shippingBatchPollError: "",
   taskAlerts: { counts: { total: 0 }, items: [] },
   taskAlertsLoadError: "",
+  taskAlertsOpen: false,
+  taskAlertsCategory: "全部",
+  taskAlertsPollTimer: null,
 };
 
 const EXPRESS_COMPANIES = ["圆通", "京东", "顺丰"];
@@ -539,8 +542,27 @@ async function loadTaskAlerts() {
     state.taskAlerts = data || { counts: { total: 0 }, items: [] };
     state.taskAlertsLoadError = "";
   } catch (error) {
-    state.taskAlertsLoadError = error.message || "任务状态暂时无法读取。";
+    state.taskAlertsLoadError = error.message || "异常提醒暂时无法读取。";
   }
+}
+
+function stopTaskAlertPoll() {
+  if (state.taskAlertsPollTimer) clearTimeout(state.taskAlertsPollTimer);
+  state.taskAlertsPollTimer = null;
+}
+
+function scheduleTaskAlertPoll() {
+  stopTaskAlertPoll();
+  if (location.pathname !== "/admin" || state.user?.role !== "admin") return;
+  const seconds = Math.max(15, Number(state.taskAlerts?.refresh?.alerts_seconds || 60));
+  state.taskAlertsPollTimer = setTimeout(async () => {
+    if (location.pathname !== "/admin" || state.user?.role !== "admin") return;
+    if (document.visibilityState === "visible") {
+      await loadTaskAlerts();
+      updateTaskAlertUi();
+    }
+    scheduleTaskAlertPoll();
+  }, seconds * 1000);
 }
 
 async function loadActiveShippingBatch() {
@@ -578,7 +600,7 @@ function scheduleShippingBatchPoll() {
       if (["排队中", "处理中"].includes(previousStatus) && !["排队中", "处理中"].includes(nextStatus)) {
         const failed = state.activeShippingBatch?.counts?.["失败"] || 0;
         if (failed) {
-          errorToast(`电子面单批次已结束，其中 ${failed} 单失败。请查看页面顶部“任务状态”的红色提示。`);
+          errorToast(`电子面单批次已结束，其中 ${failed} 单失败。请打开页面顶部“异常提醒”查看。`);
         } else {
           toast("电子面单批次已全部完成。");
         }
@@ -1838,48 +1860,219 @@ function taskAlertAdvice(type, message = "") {
   return "请刷新后重试；问题持续存在时联系管理员并提供业务ID。";
 }
 
-function renderTaskAlerts() {
+function taskAlertTotal() {
+  return Number(state.taskAlerts?.counts?.total || 0);
+}
+
+function renderTaskAlertTrigger() {
+  const total = taskAlertTotal();
+  const failed = Boolean(state.taskAlertsLoadError);
+  const label = failed ? "异常状态未更新" : total ? "异常提醒" : "任务正常";
+  return `
+    <button class="btn task-alert-trigger ${failed || total ? "has-alerts" : "is-clear"}" id="openTaskAlerts" type="button" aria-haspopup="dialog">
+      <span>${label}</span>
+      <span class="task-alert-badge" aria-label="${failed ? "状态读取失败" : `${total} 条待处理异常`}">${failed ? "!" : total}</span>
+    </button>
+  `;
+}
+
+function formatTaskInterval(minutes) {
+  const value = Number(minutes || 0);
+  if (!value) return "按系统配置";
+  if (value % 60 === 0) return `${value / 60} 小时`;
+  return `${value} 分钟`;
+}
+
+function renderTaskAlertDialog() {
+  if (!state.taskAlertsOpen) return "";
   const data = state.taskAlerts || { counts: { total: 0 }, items: [] };
   const items = Array.isArray(data.items) ? data.items : [];
-  const total = Number(data.counts?.total || 0);
-  const visibleItems = items.slice(0, 12);
+  const total = taskAlertTotal();
+  const categories = ["全部", "电子面单", "物流查询", "打印"];
+  const selected = categories.includes(state.taskAlertsCategory) ? state.taskAlertsCategory : "全部";
+  const visibleItems = selected === "全部" ? items : items.filter((item) => item.category === selected);
+  const refresh = data.refresh || {};
   return `
-    <section class="panel panel-pad task-alert-panel" aria-live="polite">
-      <div class="section-title">
-        <div>
-          <h2>任务状态</h2>
-          <div class="muted mini">电子面单、物流和打印任务的当前结果；失败不会静默消失。</div>
+    <div class="task-alert-backdrop" id="taskAlertDialogBackdrop">
+      <section class="task-alert-dialog" id="taskAlertDialog" role="dialog" aria-modal="true" aria-labelledby="taskAlertDialogTitle" tabindex="-1">
+        <div class="task-alert-dialog-head">
+          <div>
+            <h2 id="taskAlertDialogTitle">异常提醒</h2>
+            <div class="muted mini">当前 ${total} 项；恢复的异常会自动消失，人工确认只隐藏本次异常。</div>
+          </div>
+          <button class="task-alert-close" id="closeTaskAlerts" type="button" aria-label="关闭异常提醒">×</button>
         </div>
-        <span class="status ${total || state.taskAlertsLoadError ? "exception" : "signed"}">
-          ${state.taskAlertsLoadError ? "状态读取失败" : total ? `需要处理 ${total} 项` : "运行正常"}
-        </span>
-      </div>
-      ${state.taskAlertsLoadError ? `<div class="notice danger-notice"><strong>无法确认后台任务是否正常。</strong><br>${escapeHtml(state.taskAlertsLoadError)}<br>请检查网络后刷新页面；在状态恢复前不要重复提交同一批任务。</div>` : ""}
-      ${!state.taskAlertsLoadError && !total ? `<div class="task-ok-message">当前没有面单下单失败、物流查询失败、打印失败或等待超过30分钟的任务。</div>` : ""}
-      ${visibleItems.length ? `
-        <div class="task-alert-list">
-          ${visibleItems.map((item) => `
-            <article class="task-alert-item">
-              <div class="task-alert-heading">
-                <div><strong>${escapeHtml(item.type)}</strong> · <span translate="no">${escapeHtml(item.business_id)}</span></div>
-                <span class="status exception">${escapeHtml(item.status)}</span>
-              </div>
-              <div class="muted mini">${escapeHtml(item.store_name)} · ${escapeHtml(formatDate(item.updated_at))}</div>
-              <div class="task-alert-message"><strong>失败原因：</strong>${escapeHtml(item.message || "任务没有成功完成。")}</div>
-              <div class="task-alert-advice"><strong>怎么处理：</strong>${escapeHtml(taskAlertAdvice(item.type, item.message))}</div>
-              <div class="inline-actions">
-                ${item.type === "面单下单失败" && item.batch_id ? `<button class="btn primary small" data-retry-alert-batch="${Number(item.batch_id)}" type="button">重新提交该批次失败订单</button>` : ""}
-                ${item.type === "退货物流查询失败"
-                  ? `<button class="btn secondary small" data-locate-return-alert="${escapeHtml(item.business_id)}" type="button">在退货看板中查看</button>`
-                  : `<button class="btn secondary small" data-locate-task-alert="${escapeHtml(item.business_id)}" type="button">在订单列表中查看</button>`}
-              </div>
-            </article>
-          `).join("")}
+        <div class="task-alert-refresh-note">
+          提醒每 ${Number(refresh.alerts_seconds || 60)} 秒自动刷新；发货物流每 ${formatTaskInterval(refresh.shipment_tracking_minutes || 360)}查询，退货物流每 ${formatTaskInterval(refresh.return_tracking_minutes || 720)}查询。
         </div>
-        ${total > visibleItems.length ? `<div class="notice">还有 ${total - visibleItems.length} 项未展开，可处理当前项目后刷新查看。</div>` : ""}
-      ` : ""}
-    </section>
+        <div class="task-alert-categories" role="tablist" aria-label="异常分类">
+          ${categories.map((category) => {
+            const count = category === "全部" ? total : Number(data.category_counts?.[category] || 0);
+            return `<button class="task-alert-category ${selected === category ? "active" : ""}" data-task-alert-category="${category}" type="button" aria-pressed="${selected === category}">${category}<span>${count}</span></button>`;
+          }).join("")}
+        </div>
+        <div class="task-alert-dialog-body" aria-live="polite">
+          ${state.taskAlertsLoadError ? `<div class="notice danger-notice"><strong>异常状态暂时无法更新。</strong><br>${escapeHtml(state.taskAlertsLoadError)}<br>请检查网络；状态恢复前不要重复提交同一批任务。</div>` : ""}
+          ${!state.taskAlertsLoadError && !visibleItems.length ? `<div class="task-ok-message">${selected === "全部" ? "当前没有需要处理的任务异常。" : `当前没有“${escapeHtml(selected)}”类异常。`}</div>` : ""}
+          ${visibleItems.length ? `
+            <div class="task-alert-list">
+              ${visibleItems.map((item) => `
+                <article class="task-alert-item">
+                  <div class="task-alert-heading">
+                    <div><strong>${escapeHtml(item.type)}</strong> · <span translate="no">${escapeHtml(item.business_id)}</span></div>
+                    <span class="status exception">${escapeHtml(item.status)}</span>
+                  </div>
+                  <div class="task-alert-tags">
+                    <span>${escapeHtml(item.category || "其他")}</span>
+                    <span>${escapeHtml(item.reason || "其他问题")}</span>
+                    <span class="${item.auto_retry ? "auto" : "manual"}">${item.auto_retry ? "系统继续检查" : "需要人工处理"}</span>
+                  </div>
+                  <div class="muted mini">${escapeHtml(item.store_name)} · ${escapeHtml(formatDate(item.updated_at))}</div>
+                  <div class="task-alert-message"><strong>失败原因：</strong>${escapeHtml(item.message || "任务没有成功完成。")}</div>
+                  <div class="task-alert-advice"><strong>怎么处理：</strong>${escapeHtml(taskAlertAdvice(item.type, item.message))}</div>
+                  <div class="inline-actions">
+                    ${item.type === "面单下单失败" && item.batch_id ? `<button class="btn primary small" data-retry-alert-batch="${Number(item.batch_id)}" type="button">重新提交失败订单</button>` : ""}
+                    ${item.type === "退货物流查询失败"
+                      ? `<button class="btn secondary small" data-locate-return-alert="${escapeHtml(item.business_id)}" type="button">在退货看板中查看</button>`
+                      : `<button class="btn secondary small" data-locate-task-alert="${escapeHtml(item.business_id)}" type="button">在订单列表中查看</button>`}
+                    <button class="btn ghost small" data-resolve-task-alert="${escapeHtml(item.alert_key)}" data-alert-fingerprint="${escapeHtml(item.fingerprint)}" type="button">标记人工已处理</button>
+                  </div>
+                </article>
+              `).join("")}
+            </div>
+            ${total > items.length ? `<div class="notice">本次先显示最近 ${items.length} 项；处理后列表会自动补充。</div>` : ""}
+          ` : ""}
+        </div>
+      </section>
+    </div>
   `;
+}
+
+function updateTaskAlertUi({ focusDialog = false, restoreTriggerFocus = false } = {}) {
+  const trigger = document.getElementById("openTaskAlerts");
+  const triggerHadFocus = trigger === document.activeElement;
+  const dialogHadFocus = document.getElementById("taskAlertDialog")?.contains(document.activeElement);
+  if (trigger) trigger.outerHTML = renderTaskAlertTrigger();
+  const host = document.getElementById("taskAlertDialogHost");
+  if (host) host.innerHTML = renderTaskAlertDialog();
+  document.body.classList.toggle("task-alert-dialog-open", state.taskAlertsOpen);
+  bindTaskAlertControls();
+  if (focusDialog || dialogHadFocus) document.getElementById("taskAlertDialog")?.focus();
+  if (restoreTriggerFocus || (triggerHadFocus && !state.taskAlertsOpen)) document.getElementById("openTaskAlerts")?.focus();
+}
+
+function bindTaskAlertControls() {
+  document.getElementById("openTaskAlerts")?.addEventListener("click", () => {
+    state.taskAlertsOpen = true;
+    updateTaskAlertUi({ focusDialog: true });
+  });
+  document.getElementById("closeTaskAlerts")?.addEventListener("click", () => {
+    state.taskAlertsOpen = false;
+    updateTaskAlertUi({ restoreTriggerFocus: true });
+  });
+  const backdrop = document.getElementById("taskAlertDialogBackdrop");
+  backdrop?.addEventListener("click", (event) => {
+    if (event.target !== event.currentTarget) return;
+    state.taskAlertsOpen = false;
+    updateTaskAlertUi({ restoreTriggerFocus: true });
+  });
+  document.getElementById("taskAlertDialog")?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      state.taskAlertsOpen = false;
+      updateTaskAlertUi({ restoreTriggerFocus: true });
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = Array.from(
+      event.currentTarget.querySelectorAll("button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled])")
+    );
+    if (!focusable.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && (document.activeElement === first || document.activeElement === event.currentTarget)) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
+  document.querySelectorAll("[data-task-alert-category]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      state.taskAlertsCategory = event.currentTarget.dataset.taskAlertCategory || "全部";
+      updateTaskAlertUi({ focusDialog: true });
+    });
+  });
+  document.querySelectorAll("[data-locate-return-alert]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      state.taskAlertsOpen = false;
+      state.adminReturnFilters = {
+        store_id: "",
+        status: "",
+        date_from: "",
+        date_to: "",
+        q: event.currentTarget.dataset.locateReturnAlert || "",
+      };
+      navigate("/admin/returns");
+    });
+  });
+  document.querySelectorAll("[data-locate-task-alert]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      state.taskAlertsOpen = false;
+      state.adminFilters = {
+        store_id: "",
+        status: "",
+        date_from: "",
+        date_to: "",
+        q: event.currentTarget.dataset.locateTaskAlert || "",
+      };
+      state.adminShipmentPage = 1;
+      await render();
+      document.querySelector(".shipments-table")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  });
+  document.querySelectorAll("[data-retry-alert-batch]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const batchId = Number(event.currentTarget.dataset.retryAlertBatch);
+      if (!batchId || !confirm("确认重新提交这个批次中的失败订单？系统只会重试失败项，不会重复处理成功订单。")) return;
+      try {
+        state.activeShippingBatch = await withButtonBusy(event.currentTarget, "重新排队中…", () =>
+          api(`/api/admin/shipping-batches/${batchId}/retry`, { method: "POST", body: JSON.stringify({}) })
+        );
+        sessionStorage.setItem("scentpool_shipping_batch_id", String(batchId));
+        await Promise.all([loadShipments(), loadTaskAlerts()]);
+        toast("失败订单已重新加入队列，页面会持续显示处理结果。");
+        render({ refreshData: false });
+      } catch (error) {
+        errorToast(error, "失败订单重新提交失败。");
+      }
+    });
+  });
+  document.querySelectorAll("[data-resolve-task-alert]").forEach((node) => {
+    node.addEventListener("click", async (event) => {
+      const alertKey = event.currentTarget.dataset.resolveTaskAlert || "";
+      const fingerprint = event.currentTarget.dataset.alertFingerprint || "";
+      if (!confirm("确认这条异常已经在线下或第三方平台处理完成？这只会隐藏当前这一次提醒，不会修改订单或快递状态；如果系统之后再次检测到失败，会重新提醒。")) return;
+      try {
+        state.taskAlerts = await withButtonBusy(event.currentTarget, "确认中…", () =>
+          api("/api/admin/task-alerts/resolve", {
+            method: "POST",
+            body: JSON.stringify({ alert_key: alertKey, fingerprint }),
+          })
+        );
+        state.taskAlertsLoadError = "";
+        updateTaskAlertUi({ focusDialog: true });
+        toast("已标记为人工处理；如果问题再次出现，系统会重新提醒。");
+      } catch (error) {
+        errorToast(error, "无法确认这条异常，请刷新后再试。");
+        await loadTaskAlerts();
+        updateTaskAlertUi({ focusDialog: true });
+      }
+    });
+  });
 }
 
 function batchPrintableShipments() {
@@ -1975,6 +2168,7 @@ async function renderAdmin({ refreshData = true } = {}) {
       "发货后台",
       "总部统一处理门店提交的发货需求。",
       `<div class="actions">
+        ${renderTaskAlertTrigger()}
         <button class="btn primary" id="previewShippingBatch" type="button">批量打单</button>
         <button class="btn secondary" id="openBatchPrint" type="button" ${batchPrintableShipments().length ? "" : "disabled"}>批量打印面单</button>
         <button class="btn secondary" id="syncTracking" type="button">同步物流</button>
@@ -1983,7 +2177,7 @@ async function renderAdmin({ refreshData = true } = {}) {
         <a class="btn secondary" href="/api/admin/backup.db">备份数据库</a>
       </div>`
     )}
-    ${renderTaskAlerts()}
+    <div id="taskAlertDialogHost">${renderTaskAlertDialog()}</div>
     ${renderBatchPrintPanel()}
     ${renderShippingBatchPreview()}
     ${renderShippingBatchProgress()}
@@ -2039,6 +2233,7 @@ async function renderAdmin({ refreshData = true } = {}) {
   bindCommon();
   bindAdmin();
   scheduleShippingBatchPoll();
+  scheduleTaskAlertPoll();
 }
 
 function renderShipmentBoard(shipments) {
@@ -2238,49 +2433,7 @@ function renderShipmentTable(shipments) {
 }
 
 function bindAdmin() {
-  document.querySelectorAll("[data-locate-return-alert]").forEach((node) => {
-    node.addEventListener("click", (event) => {
-      state.adminReturnFilters = {
-        store_id: "",
-        status: "",
-        date_from: "",
-        date_to: "",
-        q: event.currentTarget.dataset.locateReturnAlert || "",
-      };
-      navigate("/admin/returns");
-    });
-  });
-  document.querySelectorAll("[data-locate-task-alert]").forEach((node) => {
-    node.addEventListener("click", async (event) => {
-      state.adminFilters = {
-        store_id: "",
-        status: "",
-        date_from: "",
-        date_to: "",
-        q: event.currentTarget.dataset.locateTaskAlert || "",
-      };
-      state.adminShipmentPage = 1;
-      await render();
-      document.querySelector(".shipments-table")?.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
-  });
-  document.querySelectorAll("[data-retry-alert-batch]").forEach((node) => {
-    node.addEventListener("click", async (event) => {
-      const batchId = Number(event.currentTarget.dataset.retryAlertBatch);
-      if (!batchId || !confirm("确认重新提交这个批次中的失败订单？系统只会重试失败项，不会重复处理成功订单。")) return;
-      try {
-        state.activeShippingBatch = await withButtonBusy(event.currentTarget, "重新排队中…", () =>
-          api(`/api/admin/shipping-batches/${batchId}/retry`, { method: "POST", body: JSON.stringify({}) })
-        );
-        sessionStorage.setItem("scentpool_shipping_batch_id", String(batchId));
-        await Promise.all([loadShipments(), loadTaskAlerts()]);
-        toast("失败订单已重新加入队列，页面会持续显示处理结果。");
-        render({ refreshData: false });
-      } catch (error) {
-        errorToast(error, "失败订单重新提交失败。");
-      }
-    });
-  });
+  bindTaskAlertControls();
   document.getElementById("openBatchPrint")?.addEventListener("click", () => {
     state.batchPrintSelectedIds = batchPrintableShipments().map((row) => Number(row.id));
     state.batchPrintOpen = true;
@@ -2554,7 +2707,7 @@ function bindAdmin() {
       if (result.busy) {
         errorToast("物流同步任务正在运行，本次没有重复启动。请稍后刷新查看结果。");
       } else if (failed) {
-        errorToast(`物流同步完成，但有 ${failed} 单查询失败。请查看页面顶部“任务状态”的红色提示。`);
+        errorToast(`物流同步完成，但有 ${failed} 单查询失败。请打开页面顶部“异常提醒”查看。`);
       } else {
         toast(`已同步 ${result.checked || 0} 单，签收 ${result.signed || 0} 单${skipped ? `；另有 ${skipped} 单在 30 分钟保护期内` : ""}。`);
       }
@@ -3176,6 +3329,11 @@ function bindCommon() {
 
 async function render({ refreshData = true } = {}) {
   const path = location.pathname;
+  if (path !== "/admin") {
+    stopTaskAlertPoll();
+    state.taskAlertsOpen = false;
+    document.body.classList.remove("task-alert-dialog-open");
+  }
   const showsLoading = refreshData && path !== "/login";
   if (showsLoading) {
     activeDataLoads += 1;
