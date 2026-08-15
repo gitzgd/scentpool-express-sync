@@ -34,6 +34,13 @@ BOOKING_EDITABLE_STATUSES = ("未下单", "下单失败", "已取消")
 BOOKING_ACTIVE_STATUSES = ("排队中", "提交中")
 SHIPPING_STALE_MINUTES = 10
 SHIPPING_STALE_MAX_ATTEMPTS = 3
+AUDIT_HISTORY_SCHEMA_VERSION = 1
+AUDIT_FAILURE_ACTION_HINTS = {
+    "provider_or_api_rejected": "请先核对承运范围或供应商规则；确认可继续后再重试，避免重复提交。",
+    "system_error_or_timeout": "请先等待系统自动恢复；持续失败时联系管理员检查服务状态，不要连续重复提交。",
+    "data_or_configuration": "请检查地址、联系方式、承运商、网点、余额及相关配置后再重试。",
+    "insufficient_historical_evidence": "现有脱敏证据不足以判断原因，请由管理员在受控后台核对后处理。",
+}
 
 
 class AppError(Exception):
@@ -46,6 +53,34 @@ class AppError(Exception):
 
 def now_text() -> str:
     return datetime.now(APP_TZ).isoformat(timespec="seconds")
+
+
+def classify_audit_failure(message: str, *, evidence: str = "observed") -> str:
+    """Map an internal failure message to a fixed privacy-safe category."""
+    if evidence != "observed":
+        return "insufficient_historical_evidence"
+    text = str(message or "").strip().lower()
+    if not text:
+        return "insufficient_historical_evidence"
+    data_markers = (
+        "地址", "行政区", "手机号", "电话", "配置", "授权", "网点", "余额", "参数",
+        "单号", "快递公司", "格式", "缺少", "不能为空", "不匹配",
+    )
+    provider_markers = (
+        "明确拒绝", "拒绝", "停发", "超出范围", "超区", "http error 4", "http 4",
+        "供应商返回", "api 返回", "api拒绝", "api 拒绝",
+    )
+    system_markers = (
+        "timeout", "timed out", "超时", "网络", "连接", "http error 5", "http 5",
+        "系统异常", "内部错误", "服务异常", "暂时无法", "unexpected", "traceback",
+    )
+    if any(marker in text for marker in data_markers):
+        return "data_or_configuration"
+    if any(marker in text for marker in provider_markers):
+        return "provider_or_api_rejected"
+    if any(marker in text for marker in system_markers):
+        return "system_error_or_timeout"
+    return "insufficient_historical_evidence"
 
 
 def local_day_start(date_text: str) -> str:
@@ -403,6 +438,7 @@ class Database:
             self._ensure_shipping_batch_columns(conn)
             self._ensure_label_columns(conn)
             self._normalize_shipments_with_tracking(conn)
+            self._ensure_audit_history(conn)
             conn.execute(
                 """
                 INSERT INTO shipping_settings (id, default_company, cargo_name, updated_at)
@@ -415,6 +451,426 @@ class Database:
 
         if self.count_products() == 0 and os.path.exists(product_file):
             self.import_products(product_file)
+
+    def _ensure_audit_history(self, conn: sqlite3.Connection) -> None:
+        """Create privacy-safe append-only state evidence and seed one legacy snapshot."""
+        started_at = now_text()
+        started_dt = datetime.fromisoformat(started_at).astimezone(APP_TZ)
+        full_day_coverage_from = (started_dt + timedelta(days=1)).date().isoformat()
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS audit_event_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                started_at TEXT NOT NULL,
+                full_day_coverage_from TEXT NOT NULL,
+                schema_version INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_state_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                domain TEXT NOT NULL CHECK (
+                    domain IN ('shipment_state', 'label', 'tracking', 'printing')
+                ),
+                entity_kind TEXT NOT NULL CHECK (entity_kind IN ('shipment', 'return')),
+                entity_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL CHECK (
+                    event_type IN ('created', 'changed', 'deleted', 'snapshot')
+                ),
+                state TEXT NOT NULL,
+                reason_category TEXT NOT NULL DEFAULT '',
+                entity_created_at TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                evidence TEXT NOT NULL CHECK (evidence IN ('observed', 'legacy_snapshot'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_audit_state_events_domain_time
+                ON audit_state_events(domain, julianday(occurred_at), id);
+            CREATE INDEX IF NOT EXISTS idx_audit_state_events_entity
+                ON audit_state_events(
+                    domain, entity_kind, entity_id, julianday(occurred_at), id
+                );
+
+            CREATE TRIGGER IF NOT EXISTS audit_state_events_no_update
+            BEFORE UPDATE ON audit_state_events
+            BEGIN
+                SELECT RAISE(ABORT, 'audit state events are append-only');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS audit_state_events_no_delete
+            BEFORE DELETE ON audit_state_events
+            BEGIN
+                SELECT RAISE(ABORT, 'audit state events are append-only');
+            END;
+            """
+        )
+        inserted_meta = conn.execute(
+            """
+            INSERT INTO audit_event_meta (id, started_at, full_day_coverage_from, schema_version)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO NOTHING
+            """,
+            (started_at, full_day_coverage_from, AUDIT_HISTORY_SCHEMA_VERSION),
+        ).rowcount
+        if inserted_meta:
+            conn.execute(
+                """
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                )
+                SELECT 'shipment_state', 'shipment', id, 'snapshot',
+                    CASE
+                        WHEN tracking_signed_at <> '' OR status = '已签收' THEN 'signed'
+                        WHEN shipped_at <> '' OR status = '已发货' THEN 'shipped'
+                        WHEN status = '待处理' THEN 'pending'
+                        WHEN status = '异常' THEN 'exception'
+                        WHEN status = '已取消' THEN 'cancelled'
+                        ELSE 'unknown'
+                    END,
+                    '', created_at, ?, 'legacy_snapshot'
+                FROM shipments
+                """,
+                (started_at,),
+            )
+            conn.execute(
+                """
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                )
+                SELECT 'label', 'shipment', id, 'snapshot',
+                    CASE booking_status
+                        WHEN '排队中' THEN 'queued'
+                        WHEN '提交中' THEN 'submitting'
+                        WHEN '下单失败' THEN 'failed'
+                        WHEN '已出单' THEN 'completed'
+                        WHEN '已取消' THEN 'cancelled'
+                        ELSE 'idle'
+                    END,
+                    CASE WHEN booking_status = '下单失败'
+                        THEN 'insufficient_historical_evidence' ELSE '' END,
+                    created_at, ?, 'legacy_snapshot'
+                FROM shipments
+                """,
+                (started_at,),
+            )
+            conn.execute(
+                """
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                )
+                SELECT 'tracking', 'shipment', id, 'snapshot',
+                    CASE WHEN tracking_status = '查询失败' THEN 'failed'
+                        WHEN tracking_status = '已签收' THEN 'signed'
+                        WHEN tracking_status = '运输中' THEN 'in_transit'
+                        WHEN tracking_status = '等待揽收' THEN 'waiting_pickup'
+                        ELSE 'idle' END,
+                    CASE WHEN tracking_status = '查询失败'
+                        THEN 'insufficient_historical_evidence' ELSE '' END,
+                    created_at, ?, 'legacy_snapshot'
+                FROM shipments
+                """,
+                (started_at,),
+            )
+            conn.execute(
+                """
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                )
+                SELECT 'tracking', 'return', id, 'snapshot',
+                    CASE WHEN tracking_status = '查询失败' THEN 'failed'
+                        WHEN tracking_status = '已签收' THEN 'signed'
+                        WHEN tracking_status = '运输中' THEN 'in_transit'
+                        WHEN tracking_status = '等待揽收' THEN 'waiting_pickup'
+                        ELSE 'idle' END,
+                    CASE WHEN tracking_status = '查询失败'
+                        THEN 'insufficient_historical_evidence' ELSE '' END,
+                    created_at, ?, 'legacy_snapshot'
+                FROM return_orders
+                """,
+                (started_at,),
+            )
+            conn.execute(
+                """
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                )
+                SELECT 'printing', 'shipment', id, 'snapshot',
+                    CASE label_print_status
+                        WHEN '待打印' THEN 'waiting'
+                        WHEN '打印中' THEN 'processing'
+                        WHEN '打印成功' THEN 'succeeded'
+                        WHEN '打印失败' THEN 'failed'
+                        ELSE 'idle'
+                    END,
+                    CASE WHEN label_print_status = '打印失败'
+                        THEN 'insufficient_historical_evidence' ELSE '' END,
+                    created_at, ?, 'legacy_snapshot'
+                FROM shipments
+                """,
+                (started_at,),
+            )
+
+        error_category_sql = """
+            CASE
+                WHEN TRIM(COALESCE({error}, '')) = '' THEN 'insufficient_historical_evidence'
+                WHEN LOWER(COALESCE({error}, '')) LIKE '%地址%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%行政区%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%手机号%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%电话%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%配置%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%授权%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%网点%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%余额%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%参数%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%单号%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%快递公司%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%格式%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%缺少%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%不能为空%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%不匹配%'
+                    THEN 'data_or_configuration'
+                WHEN LOWER(COALESCE({error}, '')) LIKE '%明确拒绝%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%拒绝%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%停发%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%超出范围%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%超区%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%http error 4%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%http 4%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%供应商返回%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%api 返回%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%api拒绝%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%api 拒绝%'
+                    THEN 'provider_or_api_rejected'
+                WHEN LOWER(COALESCE({error}, '')) LIKE '%timeout%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%timed out%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%超时%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%网络%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%连接%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%http error 5%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%http 5%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%系统异常%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%内部错误%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%服务异常%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%暂时无法%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%unexpected%'
+                    OR LOWER(COALESCE({error}, '')) LIKE '%traceback%'
+                    THEN 'system_error_or_timeout'
+                ELSE 'insufficient_historical_evidence'
+            END
+        """
+        booking_category = error_category_sql.format(error="NEW.booking_error")
+        tracking_category = error_category_sql.format(error="NEW.tracking_error")
+        printing_category = error_category_sql.format(error="NEW.label_print_error")
+        conn.executescript(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS audit_shipments_insert
+            AFTER INSERT ON shipments
+            BEGIN
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'shipment_state', 'shipment', NEW.id, 'created',
+                    CASE WHEN NEW.tracking_signed_at <> '' OR NEW.status = '已签收' THEN 'signed'
+                        WHEN NEW.shipped_at <> '' OR NEW.status = '已发货' THEN 'shipped'
+                        WHEN NEW.status = '待处理' THEN 'pending'
+                        WHEN NEW.status = '异常' THEN 'exception'
+                        WHEN NEW.status = '已取消' THEN 'cancelled' ELSE 'unknown' END,
+                    '', NEW.created_at, NEW.created_at, 'observed'
+                );
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'label', 'shipment', NEW.id, 'created',
+                    CASE NEW.booking_status WHEN '排队中' THEN 'queued' WHEN '提交中' THEN 'submitting'
+                        WHEN '下单失败' THEN 'failed' WHEN '已出单' THEN 'completed'
+                        WHEN '已取消' THEN 'cancelled' ELSE 'idle' END,
+                    CASE WHEN NEW.booking_status = '下单失败' THEN {booking_category} ELSE '' END,
+                    NEW.created_at, COALESCE(NULLIF(NEW.booking_updated_at, ''), NEW.created_at), 'observed'
+                );
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'tracking', 'shipment', NEW.id, 'created',
+                    CASE WHEN NEW.tracking_status = '查询失败' THEN 'failed'
+                        WHEN NEW.tracking_status = '已签收' THEN 'signed'
+                        WHEN NEW.tracking_status = '运输中' THEN 'in_transit'
+                        WHEN NEW.tracking_status = '等待揽收' THEN 'waiting_pickup' ELSE 'idle' END,
+                    CASE WHEN NEW.tracking_status = '查询失败' THEN {tracking_category} ELSE '' END,
+                    NEW.created_at, COALESCE(NULLIF(NEW.tracking_last_checked_at, ''), NEW.created_at), 'observed'
+                );
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'printing', 'shipment', NEW.id, 'created',
+                    CASE NEW.label_print_status WHEN '待打印' THEN 'waiting'
+                        WHEN '打印中' THEN 'processing' WHEN '打印成功' THEN 'succeeded'
+                        WHEN '打印失败' THEN 'failed' ELSE 'idle' END,
+                    CASE WHEN NEW.label_print_status = '打印失败' THEN {printing_category} ELSE '' END,
+                    NEW.created_at, NEW.updated_at, 'observed'
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS audit_shipments_state_update
+            AFTER UPDATE OF status, shipped_at, tracking_signed_at ON shipments
+            WHEN OLD.status IS NOT NEW.status
+                OR OLD.shipped_at IS NOT NEW.shipped_at
+                OR OLD.tracking_signed_at IS NOT NEW.tracking_signed_at
+            BEGIN
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'shipment_state', 'shipment', NEW.id, 'changed',
+                    CASE WHEN NEW.tracking_signed_at <> '' OR NEW.status = '已签收' THEN 'signed'
+                        WHEN NEW.shipped_at <> '' OR NEW.status = '已发货' THEN 'shipped'
+                        WHEN NEW.status = '待处理' THEN 'pending'
+                        WHEN NEW.status = '异常' THEN 'exception'
+                        WHEN NEW.status = '已取消' THEN 'cancelled' ELSE 'unknown' END,
+                    '', NEW.created_at, NEW.updated_at, 'observed'
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS audit_shipments_label_update
+            AFTER UPDATE OF booking_status, booking_error ON shipments
+            WHEN OLD.booking_status IS NOT NEW.booking_status
+            BEGIN
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'label', 'shipment', NEW.id, 'changed',
+                    CASE NEW.booking_status WHEN '排队中' THEN 'queued' WHEN '提交中' THEN 'submitting'
+                        WHEN '下单失败' THEN 'failed' WHEN '已出单' THEN 'completed'
+                        WHEN '已取消' THEN 'cancelled' ELSE 'idle' END,
+                    CASE WHEN NEW.booking_status = '下单失败' THEN {booking_category} ELSE '' END,
+                    NEW.created_at, COALESCE(NULLIF(NEW.booking_updated_at, ''), NEW.updated_at), 'observed'
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS audit_shipments_tracking_update
+            AFTER UPDATE OF tracking_status, tracking_error ON shipments
+            WHEN OLD.tracking_status IS NOT NEW.tracking_status
+            BEGIN
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'tracking', 'shipment', NEW.id, 'changed',
+                    CASE WHEN NEW.tracking_status = '查询失败' THEN 'failed'
+                        WHEN NEW.tracking_status = '已签收' THEN 'signed'
+                        WHEN NEW.tracking_status = '运输中' THEN 'in_transit'
+                        WHEN NEW.tracking_status = '等待揽收' THEN 'waiting_pickup' ELSE 'idle' END,
+                    CASE WHEN NEW.tracking_status = '查询失败' THEN {tracking_category} ELSE '' END,
+                    NEW.created_at, COALESCE(NULLIF(NEW.tracking_last_checked_at, ''), NEW.updated_at), 'observed'
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS audit_shipments_printing_update
+            AFTER UPDATE OF label_print_status, label_print_error ON shipments
+            WHEN OLD.label_print_status IS NOT NEW.label_print_status
+            BEGIN
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'printing', 'shipment', NEW.id, 'changed',
+                    CASE NEW.label_print_status WHEN '待打印' THEN 'waiting'
+                        WHEN '打印中' THEN 'processing' WHEN '打印成功' THEN 'succeeded'
+                        WHEN '打印失败' THEN 'failed' ELSE 'idle' END,
+                    CASE WHEN NEW.label_print_status = '打印失败' THEN {printing_category} ELSE '' END,
+                    NEW.created_at, NEW.updated_at, 'observed'
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS audit_shipments_delete
+            BEFORE DELETE ON shipments
+            BEGIN
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'shipment_state', 'shipment', OLD.id, 'deleted', 'deleted', '',
+                    OLD.created_at, STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'), 'observed'
+                );
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'label', 'shipment', OLD.id, 'deleted', 'deleted', '',
+                    OLD.created_at, STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'), 'observed'
+                );
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'tracking', 'shipment', OLD.id, 'deleted', 'deleted', '',
+                    OLD.created_at, STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'), 'observed'
+                );
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'printing', 'shipment', OLD.id, 'deleted', 'deleted', '',
+                    OLD.created_at, STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'), 'observed'
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS audit_returns_insert
+            AFTER INSERT ON return_orders
+            BEGIN
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'tracking', 'return', NEW.id, 'created',
+                    CASE WHEN NEW.tracking_status = '查询失败' THEN 'failed'
+                        WHEN NEW.tracking_status = '已签收' THEN 'signed'
+                        WHEN NEW.tracking_status = '运输中' THEN 'in_transit'
+                        WHEN NEW.tracking_status = '等待揽收' THEN 'waiting_pickup' ELSE 'idle' END,
+                    CASE WHEN NEW.tracking_status = '查询失败' THEN {tracking_category} ELSE '' END,
+                    NEW.created_at, COALESCE(NULLIF(NEW.tracking_last_checked_at, ''), NEW.created_at), 'observed'
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS audit_returns_tracking_update
+            AFTER UPDATE OF tracking_status, tracking_error ON return_orders
+            WHEN OLD.tracking_status IS NOT NEW.tracking_status
+            BEGIN
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'tracking', 'return', NEW.id, 'changed',
+                    CASE WHEN NEW.tracking_status = '查询失败' THEN 'failed'
+                        WHEN NEW.tracking_status = '已签收' THEN 'signed'
+                        WHEN NEW.tracking_status = '运输中' THEN 'in_transit'
+                        WHEN NEW.tracking_status = '等待揽收' THEN 'waiting_pickup' ELSE 'idle' END,
+                    CASE WHEN NEW.tracking_status = '查询失败' THEN {tracking_category} ELSE '' END,
+                    NEW.created_at, COALESCE(NULLIF(NEW.tracking_last_checked_at, ''), NEW.updated_at), 'observed'
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS audit_returns_delete
+            BEFORE DELETE ON return_orders
+            BEGIN
+                INSERT INTO audit_state_events (
+                    domain, entity_kind, entity_id, event_type, state, reason_category,
+                    entity_created_at, occurred_at, evidence
+                ) VALUES (
+                    'tracking', 'return', OLD.id, 'deleted', 'deleted', '',
+                    OLD.created_at, STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'), 'observed'
+                );
+            END;
+            """
+        )
 
     def _migrate_shipments_schema(self) -> None:
         with sqlite3.connect(self.path) as check:
@@ -755,6 +1211,8 @@ class Database:
             "shipping_callback_events",
             "task_alert_acknowledgements",
             "operational_incidents",
+            "audit_event_meta",
+            "audit_state_events",
             "return_orders",
             "return_items",
         )
@@ -1235,6 +1693,314 @@ class Database:
             )
         return self.task_alerts()
 
+    @staticmethod
+    def _audit_metric(count: Optional[int], completeness: str, limitations: List[str]) -> Dict[str, Any]:
+        return {
+            "count": None if count is None else int(count),
+            "completeness": completeness,
+            "limitations": limitations,
+        }
+
+    def _daily_audit_history(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        date_text: str,
+        day_start: str,
+        day_end: str,
+        pending_24_cutoff: str,
+        waiting_30_cutoff: str,
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        coverage = conn.execute(
+            "SELECT started_at, full_day_coverage_from, schema_version FROM audit_event_meta WHERE id = 1"
+        ).fetchone()
+        if not coverage:
+            raise sqlite3.OperationalError("audit history metadata is unavailable")
+        coverage_available = date_text >= str(coverage["full_day_coverage_from"])
+        requested_day_finished = datetime.fromisoformat(day_end) <= datetime.now(APP_TZ)
+        history_complete = coverage_available and requested_day_finished
+        if history_complete:
+            row = dict(
+                conn.execute(
+                    """
+                    WITH latest_shipment_state AS (
+                        SELECT entity_id, state, entity_created_at
+                        FROM (
+                            SELECT entity_id, state, entity_created_at,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY entity_id
+                                    ORDER BY julianday(occurred_at) DESC, id DESC
+                                ) AS position
+                            FROM audit_state_events
+                            WHERE domain = 'shipment_state'
+                                AND entity_kind = 'shipment'
+                                AND julianday(occurred_at) < julianday(?)
+                        )
+                        WHERE position = 1
+                    ),
+                    latest_label_state AS (
+                        SELECT entity_id, state, occurred_at
+                        FROM (
+                            SELECT entity_id, state, occurred_at,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY entity_id
+                                    ORDER BY julianday(occurred_at) DESC, id DESC
+                                ) AS position
+                            FROM audit_state_events
+                            WHERE domain = 'label'
+                                AND entity_kind = 'shipment'
+                                AND julianday(occurred_at) < julianday(?)
+                        )
+                        WHERE position = 1
+                    ),
+                    latest_print_state AS (
+                        SELECT entity_id, state, occurred_at
+                        FROM (
+                            SELECT entity_id, state, occurred_at,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY entity_id
+                                    ORDER BY julianday(occurred_at) DESC, id DESC
+                                ) AS position
+                            FROM audit_state_events
+                            WHERE domain = 'printing'
+                                AND entity_kind = 'shipment'
+                                AND julianday(occurred_at) < julianday(?)
+                        )
+                        WHERE position = 1
+                    )
+                    SELECT
+                        (SELECT COUNT(*) FROM latest_shipment_state
+                            WHERE state NOT IN ('shipped', 'signed', 'cancelled', 'deleted')
+                                AND julianday(entity_created_at) >= julianday(?)
+                                AND julianday(entity_created_at) < julianday(?)) AS new_unshipped,
+                        (SELECT COUNT(*) FROM latest_shipment_state
+                            WHERE state = 'shipped') AS shipped_not_signed,
+                        (SELECT COUNT(*) FROM latest_shipment_state
+                            WHERE state = 'pending'
+                                AND julianday(entity_created_at) < julianday(?)) AS pending_over_24_hours,
+                        (SELECT COUNT(*) FROM latest_label_state
+                            WHERE state IN ('queued', 'submitting')
+                                AND julianday(occurred_at) < julianday(?)) AS label_over_30_minutes,
+                        (SELECT COUNT(*) FROM latest_print_state
+                            WHERE state = 'processing'
+                                AND julianday(occurred_at) < julianday(?)) AS printing_over_30_minutes
+                    """,
+                    (
+                        day_end,
+                        day_end,
+                        day_end,
+                        day_start,
+                        day_end,
+                        pending_24_cutoff,
+                        waiting_30_cutoff,
+                        waiting_30_cutoff,
+                    ),
+                ).fetchone()
+            )
+            completeness = "complete_append_only_events"
+            limitations: List[str] = []
+        else:
+            row = dict(
+                conn.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(CASE
+                            WHEN julianday(created_at) >= julianday(?)
+                                AND julianday(created_at) < julianday(?)
+                                AND status <> '已取消'
+                                AND (shipped_at = '' OR julianday(shipped_at) >= julianday(?))
+                            THEN 1 ELSE 0 END), 0) AS new_unshipped,
+                        COALESCE(SUM(CASE
+                            WHEN shipped_at <> ''
+                                AND julianday(shipped_at) < julianday(?)
+                                AND (tracking_signed_at = '' OR julianday(tracking_signed_at) >= julianday(?))
+                            THEN 1 ELSE 0 END), 0) AS shipped_not_signed,
+                        COALESCE(SUM(CASE
+                            WHEN status = '待处理'
+                                AND julianday(created_at) < julianday(?)
+                                AND (shipped_at = '' OR julianday(shipped_at) >= julianday(?))
+                            THEN 1 ELSE 0 END), 0) AS pending_over_24_hours,
+                        COALESCE(SUM(CASE
+                            WHEN booking_status IN ('排队中', '提交中')
+                                AND booking_updated_at <> ''
+                                AND julianday(booking_updated_at) < julianday(?)
+                            THEN 1 ELSE 0 END), 0) AS label_over_30_minutes,
+                        COALESCE(SUM(CASE
+                            WHEN label_print_status = '打印中'
+                                AND julianday(updated_at) < julianday(?)
+                            THEN 1 ELSE 0 END), 0) AS printing_over_30_minutes
+                    FROM shipments
+                    """,
+                    (
+                        day_start,
+                        day_end,
+                        day_end,
+                        day_end,
+                        day_end,
+                        pending_24_cutoff,
+                        day_end,
+                        waiting_30_cutoff,
+                        waiting_30_cutoff,
+                    ),
+                ).fetchone()
+            )
+            completeness = "partial_current_fields"
+            limitations = []
+            if not coverage_available:
+                limitations.append("state_changes_before_full_day_event_coverage_cannot_be_reconstructed")
+            if not requested_day_finished:
+                limitations.append("requested_day_has_not_ended")
+            limitations.extend(
+                [
+                    "later_cancellation_or_status_overwrite_can_change_observed_counts",
+                    "historical_print_start_time_was_not_stored_before_event_coverage",
+                ]
+            )
+
+        report = {
+            "new_shipments_unshipped_at_day_end": self._audit_metric(
+                row["new_unshipped"], completeness, limitations
+            ),
+            "shipped_not_signed_at_day_end": self._audit_metric(
+                row["shipped_not_signed"], completeness, limitations
+            ),
+            "pending_over_24_hours_at_day_end": self._audit_metric(
+                row["pending_over_24_hours"], completeness, limitations
+            ),
+            "label_queued_or_submitting_over_30_minutes_at_day_end": self._audit_metric(
+                row["label_over_30_minutes"], completeness, limitations
+            ),
+            "printing_processing_over_30_minutes_at_day_end": self._audit_metric(
+                row["printing_over_30_minutes"], completeness, limitations
+            ),
+        }
+        completeness_report = {
+            "schema_version": int(coverage["schema_version"]),
+            "full_day_coverage_from": str(coverage["full_day_coverage_from"]),
+            "requested_day": "complete" if history_complete else "partial",
+            "limitations": limitations,
+        }
+        return report, completeness_report
+
+    @staticmethod
+    def _failure_categories(categories: Iterable[str]) -> List[Dict[str, Any]]:
+        counts: Dict[str, int] = {}
+        for value in categories:
+            category = value if value in AUDIT_FAILURE_ACTION_HINTS else "insufficient_historical_evidence"
+            counts[category] = counts.get(category, 0) + 1
+        return [
+            {
+                "reason_category": category,
+                "count": counts[category],
+                "action_hint": AUDIT_FAILURE_ACTION_HINTS[category],
+            }
+            for category in AUDIT_FAILURE_ACTION_HINTS
+            if counts.get(category)
+        ]
+
+    def _daily_audit_failures(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        day_start: str,
+        day_end: str,
+        history_complete: bool,
+    ) -> Dict[str, Any]:
+        current_rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                WITH current_failures AS (
+                    SELECT 'label' AS domain, 'shipment' AS entity_kind, id AS entity_id,
+                        booking_updated_at AS failure_at, booking_error AS message
+                    FROM shipments WHERE booking_status = '下单失败'
+                    UNION ALL
+                    SELECT 'tracking', 'shipment', id, tracking_last_checked_at, tracking_error
+                    FROM shipments WHERE tracking_status = '查询失败'
+                    UNION ALL
+                    SELECT 'tracking', 'return', id, tracking_last_checked_at, tracking_error
+                    FROM return_orders WHERE tracking_status = '查询失败'
+                    UNION ALL
+                    SELECT 'printing', 'shipment', id, updated_at, label_print_error
+                    FROM shipments WHERE label_print_status = '打印失败'
+                )
+                SELECT *, CASE
+                    WHEN failure_at = '' OR julianday(failure_at) IS NULL THEN 'unknown'
+                    WHEN julianday(failure_at) < julianday(?) THEN 'historical'
+                    WHEN julianday(failure_at) < julianday(?) THEN 'on_date'
+                    ELSE 'after_date'
+                END AS time_bucket
+                FROM current_failures
+                """,
+                (day_start, day_end),
+            ).fetchall()
+        ]
+        for row in current_rows:
+            row["reason_category"] = classify_audit_failure(str(row["message"] or ""))
+
+        if history_complete:
+            new_rows = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT CASE domain WHEN 'label' THEN 'label'
+                            WHEN 'tracking' THEN 'tracking'
+                            WHEN 'printing' THEN 'printing' END AS domain,
+                        reason_category
+                    FROM audit_state_events
+                    WHERE domain IN ('label', 'tracking', 'printing')
+                        AND state = 'failed'
+                        AND evidence = 'observed'
+                        AND julianday(occurred_at) >= julianday(?)
+                        AND julianday(occurred_at) < julianday(?)
+                    """,
+                    (day_start, day_end),
+                ).fetchall()
+            ]
+            new_completeness = "complete_append_only_events"
+            limitations: List[str] = []
+        else:
+            new_rows = [row for row in current_rows if row["time_bucket"] == "on_date"]
+            new_completeness = "partial_current_failures_only"
+            limitations = ["failures_recovered_or_overwritten_before_event_coverage_are_not_recoverable"]
+
+        result: Dict[str, Any] = {}
+        for domain in ("label", "tracking", "printing"):
+            domain_current = [row for row in current_rows if row["domain"] == domain]
+            domain_new = [row for row in new_rows if row["domain"] == domain]
+            historical = [row for row in domain_current if row["time_bucket"] == "historical"]
+            unknown = [row for row in domain_current if row["time_bucket"] == "unknown"]
+            result[domain] = {
+                "new_on_date": {
+                    "count": len(domain_new),
+                    "completeness": new_completeness,
+                    "categories": self._failure_categories(
+                        str(row.get("reason_category") or "") for row in domain_new
+                    ),
+                    "limitations": limitations,
+                },
+                "unresolved_at_collection": {
+                    "count": len(domain_current),
+                    "categories": self._failure_categories(
+                        str(row.get("reason_category") or "") for row in domain_current
+                    ),
+                },
+                "historical_residual_before_date": {
+                    "count": len(historical),
+                    "categories": self._failure_categories(
+                        str(row.get("reason_category") or "") for row in historical
+                    ),
+                    "completeness": "current_failure_timestamp_evidence",
+                },
+                "unresolved_with_unknown_start": {
+                    "count": len(unknown),
+                    "categories": self._failure_categories(
+                        str(row.get("reason_category") or "") for row in unknown
+                    ),
+                },
+            }
+        return result
+
     def daily_audit(self, date_text: str) -> Dict[str, Any]:
         """Return aggregate-only audit metrics through an independent read-only connection."""
         if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", str(date_text or "")):
@@ -1244,10 +2010,15 @@ class Database:
         except ValueError as exc:
             raise AppError("日期格式不正确。") from exc
 
+        day_end_dt = day_start_dt + timedelta(days=1)
         day_start = day_start_dt.isoformat(timespec="seconds")
-        day_end = (day_start_dt + timedelta(days=1)).isoformat(timespec="seconds")
+        day_end = day_end_dt.isoformat(timespec="seconds")
         recent_start = (day_start_dt - timedelta(days=6)).isoformat(timespec="seconds")
-        stale_before = (datetime.now(APP_TZ) - timedelta(minutes=30)).isoformat(timespec="seconds")
+        current_time = datetime.now(APP_TZ)
+        stale_before = (current_time - timedelta(minutes=30)).isoformat(timespec="seconds")
+        current_pending_24_cutoff = (current_time - timedelta(hours=24)).isoformat(timespec="seconds")
+        pending_24_cutoff = (day_end_dt - timedelta(hours=24)).isoformat(timespec="seconds")
+        waiting_30_cutoff = (day_end_dt - timedelta(minutes=30)).isoformat(timespec="seconds")
 
         with self.connect_readonly() as conn:
             totals = dict(
@@ -1342,6 +2113,36 @@ class Database:
                     (day_start, day_end),
                 ).fetchone()
             )
+            current_waiting = dict(
+                conn.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(CASE WHEN status = '待处理'
+                            AND julianday(created_at) < julianday(?) THEN 1 ELSE 0 END), 0)
+                            AS pending_over_24_hours,
+                        COALESCE(SUM(CASE WHEN label_print_status = '打印中'
+                            AND julianday(updated_at) < julianday(?) THEN 1 ELSE 0 END), 0)
+                            AS printing_over_30_minutes
+                    FROM shipments
+                    """,
+                    (current_pending_24_cutoff, stale_before),
+                ).fetchone()
+            )
+
+            historical_end_of_day, completeness = self._daily_audit_history(
+                conn,
+                date_text=date_text,
+                day_start=day_start,
+                day_end=day_end,
+                pending_24_cutoff=pending_24_cutoff,
+                waiting_30_cutoff=waiting_30_cutoff,
+            )
+            failures = self._daily_audit_failures(
+                conn,
+                day_start=day_start,
+                day_end=day_end,
+                history_complete=completeness["requested_day"] == "complete",
+            )
 
             quality_counts = {
                 key: int(value or 0)
@@ -1400,8 +2201,17 @@ class Database:
                     "printing_failures": int(shipment_exceptions["printing_failures_on_date"] or 0),
                 },
             },
+            "historical_end_of_day": historical_end_of_day,
+            "failures": failures,
+            "completeness": completeness,
             "long_waiting": {
-                "label_tasks_over_30_minutes_current_snapshot": int(shipment_exceptions["long_waiting"] or 0)
+                "pending_shipments_over_24_hours_current_snapshot": int(
+                    current_waiting["pending_over_24_hours"] or 0
+                ),
+                "label_tasks_over_30_minutes_current_snapshot": int(shipment_exceptions["long_waiting"] or 0),
+                "printing_processing_over_30_minutes_current_snapshot": int(
+                    current_waiting["printing_over_30_minutes"] or 0
+                ),
             },
             "recent_7_day_average": {
                 "calendar_days": 7,
@@ -1417,6 +2227,8 @@ class Database:
                 "event_metrics": "timestamp_events_in_shanghai_calendar_day",
                 "backlog": "current_pending_snapshot_created_before_requested_day_end_not_historical",
                 "exceptions": "current_failure_snapshot_not_historical_event_log",
+                "historical_end_of_day": "append_only_state_events_when_complete_otherwise_labeled_observation",
+                "failures": "privacy_safe_failure_categories_no_raw_messages",
                 "recent_7_day_average": "seven_calendar_days_including_date_fixed_denominator_empty_is_zero",
                 "data_quality": "current_snapshot_all_shipments",
                 "data_quality_total": "sum_of_issue_counts_a_record_may_contribute_multiple_issues",

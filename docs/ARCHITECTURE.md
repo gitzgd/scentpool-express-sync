@@ -50,6 +50,7 @@ server.py
 - 门店归属、订单状态、重复单号等业务校验。
 - 电子面单任务状态、授权快照和打印状态持久化。
 - 任务异常分类、版本指纹和人工确认记录；人工确认不修改业务状态。
+- 只追加、无个人字段的审计状态事件；为日报提供前向完整的历史日末与失败恢复证据。
 - 在线备份、完整性检查和诊断统计。
 - 通过 SQLite URI `mode=ro` 与 `PRAGMA query_only=ON` 提供独立的日报聚合读取。
 
@@ -106,6 +107,8 @@ server.py
 - `shipping_callback_events`：打印等回调事件审计。
 - `label_auth_sessions`：电子面单授权会话。
 - `task_alert_acknowledgements`：异常当前版本的人工确认记录，不保存收件或快递个人数据。
+- `audit_event_meta`：审计事件启用时间、首个完整上海自然日和 Schema 版本。
+- `audit_state_events`：发货状态、面单、物流和打印的规范化状态事件；只保存内部整数记录号、固定状态/原因分类和时间，不保存业务编号、个人字段、密钥或原始报文，并由数据库触发器禁止更新和删除。
 
 数据库使用 WAL。列表接口避免返回完整物流和下单原始报文；详细物流按需加载。
 
@@ -153,9 +156,17 @@ server.py
 1. 请求必须精确命中日报路径，并通过独立的 `SCENTPOOL_AUDIT_TOKEN` Bearer 鉴权；普通总部会话不能替代，日报令牌也不参与其他路由鉴权。
 2. 服务端按 `Asia/Shanghai` 严格解析单个 `YYYY-MM-DD` 参数，拒绝重复、额外、超长或非法参数。
 3. `database.py` 只打开独立 URI `mode=ro` 连接并启用 `query_only`，不调用初始化、迁移或普通写连接。
-4. 响应只包含汇总数字、门店名和固定口径元数据。覆盖式状态无法还原历史积压或历史失败事件，因此这些字段明确标为当前快照。
+4. 数据库触发器从启用时保存一份脱敏旧库快照，随后只追加发货、面单、物流和打印状态变化；只有 `completeness.full_day_coverage_from` 起的完整自然日才按事件精确复原。
+5. 响应只包含汇总数字、门店名、固定失败分类与口径元数据。覆盖开始前或迁移当天的历史值仍明确标为部分观察，绝不把当前字段猜成完整历史。
 
-该能力已于 2026-08-05 部署到正确生产服务 `scentpool-express-sync-ec7c`；部署证据与只读生产验收结果记录在 `docs/STATUS.md`。
+### 本机固定只读采集器
+
+1. 仓库内 `tools/scentpool_daily_audit_probe.py` 固定生产 Service ID、服务名和 URL，并只允许健康检查、日报及 Render 服务详情、部署、事件、日志和指标的 GET 白名单。
+2. 可执行文件只从 Mac 登录钥匙串把 Render API Key 与日报令牌读入内存；仓库、命令参数、标准输出和临时结果都不保存凭据值。
+3. 日志只在内存中匹配 OOM、5xx、异常栈、数据库锁、超时和慢请求，输出固定聚合计数，不输出日志正文。
+4. 每个外部通道都必须返回 `ok`、`no_data`、`http_error`、`permission_denied`、`schema_changed`、`process_error`、`network_restricted` 或目标不匹配状态；失败时仍输出一份有效脱敏 JSON。
+
+独立令牌和当前快照日报基础版已于 2026-08-05 部署到正确生产服务 `scentpool-express-sync-ec7c`；只追加历史扩展仍待审查/部署。证据与只读生产验收结果记录在 `docs/STATUS.md`。
 
 ## 生产拓扑
 

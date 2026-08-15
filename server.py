@@ -933,7 +933,7 @@ class Handler(BaseHTTPRequestHandler):
             date_text = self.audit_date_parameter()
             try:
                 report = DB.daily_audit(date_text)
-            except (OSError, sqlite3.Error):
+            except (OSError, sqlite3.Error, KeyError, TypeError, ValueError):
                 raise AppError("业务日报暂时不可用。", 503) from None
             self.send_json(report)
             return

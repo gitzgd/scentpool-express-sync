@@ -88,6 +88,15 @@
 - 面单任务中断超过 10 分钟时，后台会每分钟检查并自动重新排队；单项累计尝试达到 3 次后停止自动恢复并明确标记失败。操作员应按页面提示检查配置、网点或余额，再使用“重新提交该批次失败订单”，不要重复创建新批次。
 - 部署后预期空闲 RSS 应明显低于 200 MB。如果新实例空闲 30 分钟后仍高于 250 MB，应回滚并保留事件日志。
 
+### 每日固定只读采集
+
+- 固定采集器的仓库版本为 `tools/scentpool_daily_audit_probe.py`，本机副本为 `~/.codex/scentpool_daily_audit_probe.py`；只用 `scripts/install_daily_audit_probe.py` 原子更新并校验，禁止直接粘贴含令牌的命令版本。
+- Render 目标固定为 `srv-d913padckfvc73eom3f0` / `scentpool-express-sync-ec7c`。采集器只允许健康检查、脱敏日报、服务详情、部署、事件、日志、内存、内存上限、磁盘使用/容量、HTTP 请求量和延迟的 GET 白名单；目标身份不一致时停止深度采集。
+- `scentpool-audit-token` 与 `scentpool-render-api` 只从 Mac 登录钥匙串读入内存。不得改为命令参数、环境变量、仓库配置、截图或普通日志。
+- 日志正文只在内存中匹配 OOM、5xx、异常栈、`database is locked`、timeout 和 `[slow-request]`；输出只保留聚合计数。Render 日志使用时间游标分页，部署/事件使用资源游标分页；游标缺失、没有前进或超过安全页数时必须明确标为结构变化/不完整。
+- 每个通道必须返回明确状态：`ok`、`no_data`、`http_error`、`permission_denied`、`schema_changed`、`process_error`、`network_restricted` 或 `target_mismatch`。即使凭据读取或进程失败，也必须先输出一份有效脱敏 JSON，再以非零状态结束。
+- Render 工作区套餐可能不提供 HTTP 请求日志或响应延迟指标；应保留对应 `no_data`/HTTP 错误状态，不能把缺少该通道写成“0 次 5xx”或“延迟正常”。5xx 优先使用按状态码聚合的 HTTP 请求指标，日志计数只标为 request-log 证据。
+
 ## 发布验收
 
 1. 确认事故前备份仍在本地且 SHA-256 一致。
@@ -95,3 +104,4 @@
 3. 依次测试 1、20、50 张面单合并，观察每次完成后主进程 RSS 是否回落。
 4. 核对 3 张历史订单的商品、快递单号、物流轨迹和打印状态。
 5. 连续观察 24 小时；无 OOM且空闲内存稳定后，再测试 100 至 200 张批量打印。
+6. 部署日报历史扩展前执行 SQLite 在线备份并对备份运行 `PRAGMA integrity_check`；部署后确认 `audit_event_meta`、`audit_state_events` 和只追加保护存在，且 `completeness.full_day_coverage_from` 不早于真实完整证据起点。

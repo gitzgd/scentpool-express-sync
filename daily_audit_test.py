@@ -11,12 +11,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import server
-from database import Database
+from database import APP_TZ, Database
 
 
 AUDIT_DATE = "2026-07-15"
@@ -82,7 +83,10 @@ def insert_synthetic_rows(db: Database) -> Dict[str, Any]:
             booking_updated_at: str = "",
             tracking_status: str = "",
             tracking_checked_at: str = "",
+            tracking_error: str = "",
             print_status: str = "",
+            booking_error: str = "",
+            print_error: str = "",
             updated_at: str = "",
         ) -> None:
             business_id = f"PRIVATE-BUSINESS-{code}"
@@ -101,10 +105,10 @@ def insert_synthetic_rows(db: Database) -> Dict[str, Any]:
                 INSERT INTO shipments (
                     order_date, business_id, store_id, store_name_snapshot, created_by,
                     recipient_name, phone, address, store_order_no, status, tracking_no,
-                    tracking_status, tracking_last_checked_at, tracking_signed_at, tracking_raw,
+                    tracking_status, tracking_last_checked_at, tracking_signed_at, tracking_error, tracking_raw,
                     shipped_at, booking_status, booking_error, booking_raw, booking_updated_at,
                     label_print_status, label_print_error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_date,
@@ -121,14 +125,15 @@ def insert_synthetic_rows(db: Database) -> Dict[str, Any]:
                     tracking_status,
                     tracking_checked_at,
                     signed_at,
+                    tracking_error,
                     raw_marker,
                     shipped_at,
                     booking_status,
-                    "PRIVATE-BOOKING-ERROR" if booking_status == "下单失败" else "",
+                    booking_error or ("PRIVATE-BOOKING-ERROR" if booking_status == "下单失败" else ""),
                     raw_marker,
                     booking_updated_at,
                     print_status,
-                    "PRIVATE-PRINT-ERROR" if print_status == "打印失败" else "",
+                    print_error or ("PRIVATE-PRINT-ERROR" if print_status == "打印失败" else ""),
                     created_at,
                     updated_at or created_at,
                 ),
@@ -179,9 +184,12 @@ def insert_synthetic_rows(db: Database) -> Dict[str, Any]:
             shipped_at="2026-07-15T12:30:00+08:00",
             booking_status="下单失败",
             booking_updated_at="2026-07-15T13:00:00+08:00",
+            booking_error="供应商明确拒绝：承运范围停发",
             tracking_status="查询失败",
             tracking_checked_at="2026-07-15T14:00:00+08:00",
+            tracking_error="系统异常：timeout",
             print_status="打印失败",
+            print_error="打印地址配置不完整",
             updated_at="2026-07-15T15:00:00+08:00",
         )
         add_shipment("PRIOR-BACKLOG", alpha_id, "审计门店甲", "2026-07-10T12:00:00+08:00")
@@ -192,6 +200,7 @@ def insert_synthetic_rows(db: Database) -> Dict[str, Any]:
             "2026-07-14T12:00:00+08:00",
             booking_status="下单失败",
             booking_updated_at="2026-07-14T13:00:00+08:00",
+            booking_error="网点余额不足",
         )
         add_shipment(
             "PRIOR-TRACKING-FAILURE",
@@ -202,6 +211,7 @@ def insert_synthetic_rows(db: Database) -> Dict[str, Any]:
             shipped_at="2026-07-14T10:30:00+08:00",
             tracking_status="查询失败",
             tracking_checked_at="2026-07-14T11:00:00+08:00",
+            tracking_error="历史证据不足",
         )
         add_shipment(
             "PRIOR-PRINT-FAILURE",
@@ -211,6 +221,7 @@ def insert_synthetic_rows(db: Database) -> Dict[str, Any]:
             status="已发货",
             shipped_at="2026-07-14T09:30:00+08:00",
             print_status="打印失败",
+            print_error="供应商明确拒绝打印请求",
             updated_at="2026-07-14T10:00:00+08:00",
         )
         add_shipment(
@@ -252,7 +263,7 @@ def insert_synthetic_rows(db: Database) -> Dict[str, Any]:
             signed_at="broken-signed-at",
         )
 
-        def add_return(code: str, checked_at: str) -> None:
+        def add_return(code: str, checked_at: str, error: str) -> None:
             tracking_no = f"PRIVATE-RETURN-TRACKING-{code}"
             identifiers.append(tracking_no)
             conn.execute(
@@ -262,19 +273,148 @@ def insert_synthetic_rows(db: Database) -> Dict[str, Any]:
                     sender_phone, remark, status, tracking_status, tracking_last_checked_at,
                     tracking_error, tracking_raw, created_at, updated_at
                 ) VALUES (?, '审计门店甲', ?, '圆通', ?, '13800000000', 'PRIVATE-RETURN-REMARK',
-                    '异常', '查询失败', ?, 'PRIVATE-RETURN-ERROR', 'PRIVATE-RETURN-RAW', ?, ?)
+                    '异常', '查询失败', ?, ?, 'PRIVATE-RETURN-RAW', ?, ?)
                 """,
-                (alpha_id, admin_id, tracking_no, checked_at, checked_at, checked_at),
+                (alpha_id, admin_id, tracking_no, checked_at, error, checked_at, checked_at),
             )
 
-        add_return("DAILY", "2026-07-15T16:00:00+08:00")
-        add_return("PRIOR", "2026-07-14T16:00:00+08:00")
+        add_return("DAILY", "2026-07-15T16:00:00+08:00", "物流服务网络 timeout")
+        add_return("PRIOR", "2026-07-14T16:00:00+08:00", "")
 
         return {
             "identifiers": [value for value in identifiers if value],
             "store_count": int(conn.execute("SELECT COUNT(*) FROM stores").fetchone()[0]),
             "shipment_count": int(conn.execute("SELECT COUNT(*) FROM shipments").fetchone()[0]),
         }
+
+
+def insert_full_history_rows(db: Database) -> list[str]:
+    identifiers: list[str] = []
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE audit_event_meta SET started_at = ?, full_day_coverage_from = ? WHERE id = 1",
+            ("2026-07-01T00:00:00+08:00", "2026-07-01"),
+        )
+        admin_id = int(conn.execute("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1").fetchone()[0])
+        store_id = int(conn.execute("SELECT id FROM stores ORDER BY id LIMIT 1").fetchone()[0])
+
+        def add(
+            code: str,
+            created_at: str,
+            *,
+            status: str = "待处理",
+            booking_status: str = "未下单",
+            booking_at: str = "",
+            booking_error: str = "",
+            tracking_status: str = "",
+            tracking_at: str = "",
+            tracking_error: str = "",
+            print_status: str = "",
+            print_error: str = "",
+            updated_at: str = "",
+        ) -> int:
+            business_id = f"FULL-PRIVATE-BUSINESS-{code}"
+            order_no = f"FULL-PRIVATE-ORDER-{code}"
+            recipient = f"FULL-PRIVATE-RECIPIENT-{code}"
+            phone = f"1370000{len(identifiers):04d}"
+            address = f"FULL-PRIVATE-ADDRESS-{code}"
+            raw = f"FULL-PRIVATE-RAW-{code}"
+            identifiers.extend((business_id, order_no, recipient, phone, address, raw))
+            return int(
+                conn.execute(
+                    """
+                    INSERT INTO shipments (
+                        order_date, business_id, store_id, store_name_snapshot, created_by,
+                        recipient_name, phone, address, store_order_no, status,
+                        booking_status, booking_updated_at, booking_error, booking_raw,
+                        tracking_status, tracking_last_checked_at, tracking_error, tracking_raw,
+                        label_print_status, label_print_error, created_at, updated_at
+                    ) VALUES (?, ?, ?, '完整证据门店', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        created_at[:10], business_id, store_id, admin_id, recipient, phone, address, order_no,
+                        status, booking_status, booking_at, booking_error, raw, tracking_status, tracking_at,
+                        tracking_error, raw, print_status, print_error, created_at, updated_at or created_at,
+                    ),
+                ).lastrowid
+            )
+
+        add("NEW-PENDING", "2026-07-15T00:00:00+08:00")
+        add("NEW-UNSHIPPED-EXCEPTION", "2026-07-15T01:00:00+08:00", status="异常")
+        shipped_backlog = add("SHIP-BACKLOG", "2026-07-14T08:00:00+08:00")
+        signed = add("SIGNED", "2026-07-14T09:00:00+08:00")
+        add("PENDING-OLD", "2026-07-13T08:00:00+08:00")
+        add(
+            "LABEL-WAIT",
+            "2026-07-13T09:00:00+08:00",
+            booking_status="排队中",
+            booking_at="2026-07-15T10:00:00+08:00",
+            updated_at="2026-07-15T10:00:00+08:00",
+        )
+        add(
+            "PRINT-WAIT",
+            "2026-07-13T10:00:00+08:00",
+            status="已发货",
+            print_status="打印中",
+            updated_at="2026-07-15T10:00:00+08:00",
+        )
+        recovered_label = add(
+            "RECOVERED-LABEL",
+            "2026-07-13T11:00:00+08:00",
+            status="已发货",
+        )
+        add(
+            "TRACKING-FAIL",
+            "2026-07-13T12:00:00+08:00",
+            status="已发货",
+            tracking_status="查询失败",
+            tracking_at="2026-07-15T11:30:00+08:00",
+            tracking_error="系统异常 timeout",
+            updated_at="2026-07-15T11:30:00+08:00",
+        )
+        add(
+            "PRINT-HISTORICAL",
+            "2026-07-13T13:00:00+08:00",
+            status="已发货",
+            print_status="打印失败",
+            print_error="供应商明确拒绝打印",
+            updated_at="2026-07-14T10:00:00+08:00",
+        )
+
+        conn.execute(
+            "UPDATE shipments SET status = '已发货', shipped_at = ?, updated_at = ? WHERE id = ?",
+            ("2026-07-15T10:00:00+08:00", "2026-07-15T10:00:00+08:00", shipped_backlog),
+        )
+        conn.execute(
+            "UPDATE shipments SET status = '已发货', shipped_at = ?, updated_at = ? WHERE id = ?",
+            ("2026-07-15T08:00:00+08:00", "2026-07-15T08:00:00+08:00", signed),
+        )
+        conn.execute(
+            """
+            UPDATE shipments SET status = '已签收', tracking_signed_at = ?, updated_at = ? WHERE id = ?
+            """,
+            ("2026-07-15T20:00:00+08:00", "2026-07-15T20:00:00+08:00", signed),
+        )
+        conn.execute(
+            """
+            UPDATE shipments SET booking_status = '下单失败', booking_error = ?,
+                booking_updated_at = ?, updated_at = ? WHERE id = ?
+            """,
+            (
+                "供应商明确拒绝：超出范围",
+                "2026-07-15T11:00:00+08:00",
+                "2026-07-15T11:00:00+08:00",
+                recovered_label,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE shipments SET booking_status = '未下单', booking_error = '',
+                booking_updated_at = ?, updated_at = ? WHERE id = ?
+            """,
+            ("2026-07-15T12:00:00+08:00", "2026-07-15T12:00:00+08:00", recovered_label),
+        )
+    return identifiers
 
 
 def assert_readonly_connection(db: Database, expected_shipments: int) -> None:
@@ -340,7 +480,62 @@ def assert_contract(report: Dict[str, Any]) -> None:
         "return_tracking_failures": 1,
         "printing_failures": 1,
     }
-    assert report["long_waiting"] == {"label_tasks_over_30_minutes_current_snapshot": 1}
+    assert report["historical_end_of_day"] == {
+        "new_shipments_unshipped_at_day_end": {
+            "count": 1,
+            "completeness": "partial_current_fields",
+            "limitations": report["completeness"]["limitations"],
+        },
+        "shipped_not_signed_at_day_end": {
+            "count": 4,
+            "completeness": "partial_current_fields",
+            "limitations": report["completeness"]["limitations"],
+        },
+        "pending_over_24_hours_at_day_end": {
+            "count": 2,
+            "completeness": "partial_current_fields",
+            "limitations": report["completeness"]["limitations"],
+        },
+        "label_queued_or_submitting_over_30_minutes_at_day_end": {
+            "count": 1,
+            "completeness": "partial_current_fields",
+            "limitations": report["completeness"]["limitations"],
+        },
+        "printing_processing_over_30_minutes_at_day_end": {
+            "count": 0,
+            "completeness": "partial_current_fields",
+            "limitations": report["completeness"]["limitations"],
+        },
+    }
+    assert report["completeness"]["requested_day"] == "partial"
+    assert report["completeness"]["limitations"]
+    assert report["failures"]["label"]["new_on_date"]["count"] == 1
+    assert report["failures"]["tracking"]["new_on_date"]["count"] == 2
+    assert report["failures"]["printing"]["new_on_date"]["count"] == 1
+    assert report["failures"]["label"]["unresolved_at_collection"]["count"] == 2
+    assert report["failures"]["tracking"]["unresolved_at_collection"]["count"] == 4
+    assert report["failures"]["printing"]["unresolved_at_collection"]["count"] == 2
+    assert report["failures"]["label"]["historical_residual_before_date"]["count"] == 1
+    assert report["failures"]["tracking"]["historical_residual_before_date"]["count"] == 2
+    assert report["failures"]["printing"]["historical_residual_before_date"]["count"] == 1
+    assert report["failures"]["label"]["new_on_date"]["categories"] == [
+        {
+            "reason_category": "provider_or_api_rejected",
+            "count": 1,
+            "action_hint": "请先核对承运范围或供应商规则；确认可继续后再重试，避免重复提交。",
+        }
+    ]
+    assert report["failures"]["tracking"]["new_on_date"]["categories"][0][
+        "reason_category"
+    ] == "system_error_or_timeout"
+    assert report["failures"]["printing"]["new_on_date"]["categories"][0][
+        "reason_category"
+    ] == "data_or_configuration"
+    assert report["long_waiting"] == {
+        "pending_shipments_over_24_hours_current_snapshot": 4,
+        "label_tasks_over_30_minutes_current_snapshot": 1,
+        "printing_processing_over_30_minutes_current_snapshot": 0,
+    }
     assert report["recent_7_day_average"] == {
         "calendar_days": 7,
         "new_shipments": 1.29,
@@ -360,6 +555,44 @@ def assert_contract(report: Dict[str, Any]) -> None:
     }
     assert report["basis"]["backlog"].endswith("_not_historical")
     assert "not_historical_event_log" in report["basis"]["exceptions"]
+    assert "append_only_state_events" in report["basis"]["historical_end_of_day"]
+
+
+def assert_full_history_contract(report: Dict[str, Any]) -> None:
+    assert report["completeness"] == {
+        "schema_version": 1,
+        "full_day_coverage_from": "2026-07-01",
+        "requested_day": "complete",
+        "limitations": [],
+    }
+    expected_counts = {
+        "new_shipments_unshipped_at_day_end": 2,
+        "shipped_not_signed_at_day_end": 5,
+        "pending_over_24_hours_at_day_end": 2,
+        "label_queued_or_submitting_over_30_minutes_at_day_end": 1,
+        "printing_processing_over_30_minutes_at_day_end": 1,
+    }
+    for key, count in expected_counts.items():
+        assert report["historical_end_of_day"][key] == {
+            "count": count,
+            "completeness": "complete_append_only_events",
+            "limitations": [],
+        }, (key, report["historical_end_of_day"][key])
+    assert report["failures"]["label"]["new_on_date"]["count"] == 1
+    assert report["failures"]["label"]["unresolved_at_collection"]["count"] == 0
+    assert report["failures"]["tracking"]["new_on_date"]["count"] == 1
+    assert report["failures"]["tracking"]["unresolved_at_collection"]["count"] == 1
+    assert report["failures"]["printing"]["new_on_date"]["count"] == 0
+    assert report["failures"]["printing"]["historical_residual_before_date"]["count"] == 1
+    assert report["failures"]["label"]["new_on_date"]["categories"][0][
+        "reason_category"
+    ] == "provider_or_api_rejected"
+    assert report["failures"]["tracking"]["new_on_date"]["categories"][0][
+        "reason_category"
+    ] == "system_error_or_timeout"
+    assert report["failures"]["printing"]["historical_residual_before_date"]["categories"][0][
+        "reason_category"
+    ] == "provider_or_api_rejected"
 
 
 def assert_no_sensitive_data(value: Any, identifiers: list[str]) -> None:
@@ -417,6 +650,77 @@ def main() -> None:
             assert_contract(direct_report)
             assert_no_sensitive_data(direct_report, fixture["identifiers"] + [db_path])
 
+            full_db_path = str(Path(tmp) / "synthetic-full-history.db")
+            full_db = Database(full_db_path)
+            full_db.initialize(str(Path(tmp) / "missing-full-products.xlsx"))
+            full_identifiers = insert_full_history_rows(full_db)
+            full_report = full_db.daily_audit(AUDIT_DATE)
+            assert_full_history_contract(full_report)
+            assert_no_sensitive_data(full_report, full_identifiers + [full_db_path])
+
+            with full_db.connect() as conn:
+                event_columns = {
+                    str(row["name"]) for row in conn.execute("PRAGMA table_info(audit_state_events)").fetchall()
+                }
+                assert not {
+                    "business_id", "store_order_no", "recipient_name", "phone", "address",
+                    "tracking_no", "message", "raw",
+                }.intersection(event_columns)
+                audit_index_sql = " ".join(
+                    str(row["sql"] or "")
+                    for row in conn.execute(
+                        "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'audit_state_events'"
+                    ).fetchall()
+                ).lower()
+                assert "julianday(occurred_at)" in audit_index_sql
+                event_count_before = int(conn.execute("SELECT COUNT(*) FROM audit_state_events").fetchone()[0])
+                for statement in (
+                    "UPDATE audit_state_events SET state = 'tampered' WHERE id = 1",
+                    "DELETE FROM audit_state_events WHERE id = 1",
+                ):
+                    try:
+                        conn.execute(statement)
+                        raise AssertionError("append-only audit event accepted mutation")
+                    except sqlite3.IntegrityError:
+                        pass
+
+                deletable_id = int(
+                    conn.execute(
+                        """
+                        INSERT INTO shipments (
+                            order_date, business_id, store_id, store_name_snapshot, created_by,
+                            recipient_name, phone, address, store_order_no, status,
+                            booking_status, booking_updated_at, label_print_status,
+                            created_at, updated_at
+                        ) SELECT '2026-08-15', 'DELETE-PRIVATE-BUSINESS', stores.id,
+                            'DELETE-PRIVATE-STORE', users.id, 'DELETE-PRIVATE-NAME',
+                            '13600000000', 'DELETE-PRIVATE-ADDRESS', 'DELETE-PRIVATE-ORDER',
+                            '待处理', '排队中', '2026-08-15T00:00:00+08:00', '打印中',
+                            '2026-08-15T00:00:00+08:00', '2026-08-15T00:00:00+08:00'
+                        FROM stores, users
+                        WHERE users.role = 'admin'
+                        ORDER BY stores.id, users.id
+                        LIMIT 1
+                        """
+                    ).lastrowid
+                )
+                conn.execute("DELETE FROM shipments WHERE id = ?", (deletable_id,))
+                deleted_domains = {
+                    str(row["domain"])
+                    for row in conn.execute(
+                        """
+                        SELECT domain FROM audit_state_events
+                        WHERE entity_kind = 'shipment' AND entity_id = ? AND event_type = 'deleted'
+                        """,
+                        (deletable_id,),
+                    ).fetchall()
+                }
+                assert deleted_domains == {"shipment_state", "label", "tracking", "printing"}
+                event_count_before = int(conn.execute("SELECT COUNT(*) FROM audit_state_events").fetchone()[0])
+            full_db.initialize(str(Path(tmp) / "missing-full-products.xlsx"))
+            with full_db.connect() as conn:
+                assert int(conn.execute("SELECT COUNT(*) FROM audit_state_events").fetchone()[0]) == event_count_before
+
             empty_db = Database(str(Path(tmp) / "empty.db"))
             empty_db.initialize(str(Path(tmp) / "missing-empty-products.xlsx"))
             empty_report = empty_db.daily_audit(AUDIT_DATE)
@@ -427,6 +731,9 @@ def main() -> None:
                 "signed_shipments": 0.0,
             }
             assert empty_report["by_store"] == []
+            unfinished_report = empty_db.daily_audit(datetime.now(APP_TZ).date().isoformat())
+            assert unfinished_report["completeness"]["requested_day"] == "partial"
+            assert "requested_day_has_not_ended" in unfinished_report["completeness"]["limitations"]
 
             os.environ["SCENTPOOL_AUDIT_TOKEN"] = AUDIT_TOKEN
             server.DB = db

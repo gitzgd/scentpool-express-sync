@@ -24,6 +24,8 @@ import server
 import label_pdf
 import shipping
 import tracking
+import daily_audit_probe_test
+import daily_audit_test
 from database import AppError, DEFAULT_PRODUCT_FILE, Database
 
 
@@ -593,6 +595,20 @@ def main() -> None:
             assert legacy_conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'operational_incidents'"
             ).fetchone()
+            assert legacy_conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'audit_event_meta'"
+            ).fetchone()
+            assert legacy_conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'audit_state_events'"
+            ).fetchone()
+            assert legacy_conn.execute("SELECT COUNT(*) FROM audit_state_events").fetchone()[0] == 5
+            audit_columns = {
+                str(row["name"]) for row in legacy_conn.execute("PRAGMA table_info(audit_state_events)").fetchall()
+            }
+            assert not {
+                "business_id", "store_order_no", "recipient_name", "phone", "address",
+                "tracking_no", "message", "raw",
+            }.intersection(audit_columns)
         assert list((Path(tmp) / "backups").glob("legacy-before-order-date-*.db"))
         legacy_product = legacy_db.list_products()[0]
         created_next_day = legacy_db.create_shipment(
@@ -1622,6 +1638,8 @@ def main() -> None:
         except AppError:
             pass
 
+        daily_audit_test.main()
+        daily_audit_probe_test.main()
         print("smoke test passed")
 
 

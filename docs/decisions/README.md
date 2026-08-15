@@ -16,3 +16,4 @@
 - [`ADR-0002-provider-confirmed-label-cancellation.md`](ADR-0002-provider-confirmed-label-cancellation.md)：只有供应商确认后才释放电子面单。
 - [`ADR-0003-default-delivery-and-local-acceptance.md`](ADR-0003-default-delivery-and-local-acceptance.md)：普通改动默认提交、发布，并提供合成数据本地验收界面。
 - [`ADR-0004-daily-audit-readonly-boundary.md`](ADR-0004-daily-audit-readonly-boundary.md)：日报使用独立令牌、独立只读连接和汇总白名单。
+- [`ADR-0005-forward-only-audit-state-events.md`](ADR-0005-forward-only-audit-state-events.md)：用脱敏只追加状态事件提供前向完整的历史日报，迁移前数据保持部分口径。

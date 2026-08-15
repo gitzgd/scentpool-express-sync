@@ -64,9 +64,22 @@ python3 server.py --host 0.0.0.0 --port 8765
 
 `GET /api/admin/system/daily-audit?date=YYYY-MM-DD` 供每日盘点任务读取汇总数据。它不接受总部登录会话替代鉴权，只接受 `Authorization: Bearer <SCENTPOOL_AUDIT_TOKEN>`；该 Bearer 令牌也不能访问其他管理员接口。
 
-接口使用独立的 SQLite URI `mode=ro` 连接并启用 `PRAGMA query_only=ON`，只返回日期、时区、门店名和汇总数量，不返回个人信息、订单或物流标识、原始第三方报文、会话、密钥、环境变量值或数据库路径。完整字段、7 日窗口、当前快照限制、测试和部署步骤见 `docs/features/daily-audit.md`。
+接口使用独立的 SQLite URI `mode=ro` 连接并启用 `PRAGMA query_only=ON`，只返回日期、时区、门店名、汇总数量、固定失败分类和完整性说明，不返回个人信息、订单或物流标识、原始第三方报文、会话、密钥、环境变量值或数据库路径。新版本通过脱敏只追加事件复原完整覆盖日的日末待处理、未签收积压、长等待和失败恢复；覆盖开始前的日期会返回 `completeness` 与 `limitations`，不会猜测。完整字段、7 日窗口、测试和部署步骤见 `docs/features/daily-audit.md`。
 
 该能力已在正确生产服务 `scentpool-express-sync-ec7c` 启用。`SCENTPOOL_AUDIT_TOKEN` 只保存在 Render 环境变量和受控本地钥匙串中，不得写入命令示例、日志、截图或仓库。
+
+### 本机固定采集器
+
+仓库内版本位于 `tools/scentpool_daily_audit_probe.py`，固定只读目标为 `srv-d913padckfvc73eom3f0` / `scentpool-express-sync-ec7c`。安全更新本机副本：
+
+```bash
+python3 scripts/install_daily_audit_probe.py
+python3 scripts/install_daily_audit_probe.py --check
+```
+
+安装器原子更新 `~/.codex/scentpool_daily_audit_probe.py` 并设为 `0700`，不读取密钥。采集器运行时只从 Mac 登录钥匙串读取 `scentpool-audit-token` 与 `scentpool-render-api`，只执行固定 GET 白名单；它聚合部署、重启、OOM、5xx、异常栈、SQLite 锁、超时、慢请求、内存、磁盘和 HTTP 请求/延迟。接口无数据、权限不足、HTTP 错误、响应结构变化、网络受限或进程异常都会输出有效脱敏 JSON，不会以“成功退出但没有结果”表示失败。
+
+当前生产仍需部署本分支后才会返回新增的历史日末和失败事件字段；部署前的生产日报保持既有快照口径。
 
 ## 发布到 Render
 
