@@ -768,6 +768,34 @@ def main() -> None:
         server.DB.save_label_authorization(
             {"partnerId": "CAINIAO-ID", "partnerKey": "CAINIAO-KEY", "net": "cainiao"}
         )
+
+        assert server.MAX_BATCH_PRINT_ORDERS == 50
+        assert label_pdf.DEFAULT_MEMORY_LIMIT_MB == 192
+        assert label_pdf.MAX_MEMORY_LIMIT_MB == 224
+        original_connect = server.DB.connect
+        original_idle_delays = server.SHIPPING_IDLE_DELAYS_SECONDS
+        connection_calls = {"count": 0}
+
+        def counted_worker_connect():
+            connection_calls["count"] += 1
+            return original_connect()
+
+        server.DB.connect = counted_worker_connect
+        server.SHIPPING_IDLE_DELAYS_SECONDS = (0.01, 0.01, 0.01, 0.01)
+        server.SHIPPING_QUEUE_EVENT.clear()
+        worker_stop = threading.Event()
+        worker_thread = threading.Thread(target=server.shipping_worker, args=(worker_stop,), daemon=True)
+        worker_thread.start()
+        time.sleep(0.08)
+        worker_stop.set()
+        server.notify_shipping_worker()
+        worker_thread.join(timeout=1)
+        server.DB.connect = original_connect
+        server.SHIPPING_IDLE_DELAYS_SECONDS = original_idle_delays
+        server.SHIPPING_QUEUE_EVENT.clear()
+        assert not worker_thread.is_alive()
+        assert connection_calls["count"] == 1, connection_calls
+
         httpd = server.FixedThreadPoolHTTPServer(("127.0.0.1", 0), server.Handler, 4)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
@@ -1186,6 +1214,7 @@ def main() -> None:
 
         original_download_label_pdf = label_pdf.download_label_pdf
         original_build_batch_label_pdf_file = server.build_batch_label_pdf_file
+        original_current_process_rss_mb = server.current_process_rss_mb
         try:
             def fake_download_label_pdf(_url, _business_id, target, *, max_bytes):
                 payload = blank_label_pdf()
@@ -1200,6 +1229,46 @@ def main() -> None:
 
             label_pdf.download_label_pdf = fake_download_label_pdf
             server.build_batch_label_pdf_file = fake_build_batch_label_pdf_file
+
+            status, body = request(
+                admin,
+                base,
+                "POST",
+                "/api/admin/labels/batch-print",
+                {"shipment_ids": [shipment_id] * 51},
+            )
+            assert status == 413, body
+            assert "最多合并 50" in body["error"]
+
+            assert server.LABEL_BATCH_PRINT_LOCK.acquire(blocking=False)
+            try:
+                status, body = request(
+                    admin,
+                    base,
+                    "POST",
+                    "/api/admin/labels/batch-print",
+                    {"shipment_ids": [shipment_id]},
+                )
+            finally:
+                server.LABEL_BATCH_PRINT_LOCK.release()
+            assert status == 409, body
+            assert "正在生成" in body["error"]
+
+            server.current_process_rss_mb = lambda: float(server.BATCH_PRINT_PARENT_RSS_LIMIT_MB + 1)
+            status, body = request(
+                admin,
+                base,
+                "POST",
+                "/api/admin/labels/batch-print",
+                {"shipment_ids": [shipment_id]},
+            )
+            assert status == 503, body
+            assert "订单" in body["error"]
+            status, print_guard_body = request(admin, base, "GET", "/api/shipments?q=YT-SMOKE-BOOKING-001")
+            assert status == 200, print_guard_body
+            assert print_guard_body["shipments"][0]["label_print_status"] == "待打印"
+            server.current_process_rss_mb = lambda: None
+
             with tempfile.TemporaryDirectory() as merge_dir:
                 merged_path = Path(merge_dir) / "merged.pdf"
                 label_pdf.merge_label_pdfs(
@@ -1222,6 +1291,7 @@ def main() -> None:
         finally:
             label_pdf.download_label_pdf = original_download_label_pdf
             server.build_batch_label_pdf_file = original_build_batch_label_pdf_file
+            server.current_process_rss_mb = original_current_process_rss_mb
         assert status == 200
         assert merged_pdf.startswith(b"%PDF")
         assert len(PdfReader(io.BytesIO(merged_pdf)).pages) == 1

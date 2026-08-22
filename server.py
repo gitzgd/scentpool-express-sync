@@ -58,19 +58,23 @@ def bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_JSON_BODY_BYTES = 1024 * 1024
 MAX_FORM_BODY_BYTES = 1024 * 1024
-MAX_BATCH_PRINT_ORDERS = bounded_env_int("SCENTPOOL_MAX_BATCH_PRINT_ORDERS", 200, 1, 300)
+MAX_BATCH_PRINT_ORDERS = bounded_env_int("SCENTPOOL_MAX_BATCH_PRINT_ORDERS", 50, 1, 50)
 MAX_LABEL_PDF_BYTES = 10 * 1024 * 1024
 MAX_BATCH_PDF_BYTES = 60 * 1024 * 1024
 MAX_REQUEST_THREADS = bounded_env_int("SCENTPOOL_MAX_REQUEST_THREADS", 8, 2, 16)
 LABEL_MERGE_TIMEOUT_SECONDS = bounded_env_int("SCENTPOOL_LABEL_MERGE_TIMEOUT_SECONDS", 600, 60, 1200)
 SLOW_REQUEST_MILLISECONDS = bounded_env_int("SCENTPOOL_SLOW_REQUEST_MILLISECONDS", 1000, 250, 10000)
 SHIPPING_TRANSIENT_RETRIES = bounded_env_int("SCENTPOOL_SHIPPING_TRANSIENT_RETRIES", 2, 0, 3)
+BATCH_PRINT_PARENT_RSS_LIMIT_MB = bounded_env_int("SCENTPOOL_BATCH_PRINT_PARENT_RSS_MB", 240, 128, 384)
 TASK_ALERT_REFRESH_SECONDS = 60
 DAILY_AUDIT_PATH = "/api/admin/system/daily-audit"
 MAX_AUDIT_QUERY_LENGTH = 64
 MAX_AUDIT_AUTHORIZATION_LENGTH = 512
 TRACKING_SYNC_LOCK = threading.Lock()
 RETURN_TRACKING_SYNC_LOCK = threading.Lock()
+LABEL_BATCH_PRINT_LOCK = threading.Lock()
+SHIPPING_QUEUE_EVENT = threading.Event()
+SHIPPING_IDLE_DELAYS_SECONDS = (2, 5, 15, 60)
 TRACKING_INCIDENT_KEY = "tracking:kuaidi100"
 
 
@@ -282,6 +286,30 @@ def attachment_header(filename: str, fallback: str) -> str:
 
 def inline_header(filename: str, fallback: str) -> str:
     return f"inline; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}"
+
+
+def current_process_rss_mb() -> Optional[float]:
+    """Return the current Linux RSS without allocating a diagnostic snapshot."""
+    status_path = Path("/proc/self/status")
+    if not status_path.is_file():
+        return None
+    try:
+        for line in status_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def ensure_batch_print_memory_available() -> None:
+    current_rss = current_process_rss_mb()
+    if current_rss is not None and current_rss >= BATCH_PRINT_PARENT_RSS_LIMIT_MB:
+        raise AppError(
+            "网站当前内存较高，为保护正在处理的订单，本次批量打印没有开始。"
+            "请等待几分钟后重试；如果仍然出现，请减少勾选数量并联系管理员。",
+            503,
+        )
 
 
 def build_batch_label_pdf_file(shipments: list[Dict[str, Any]], work_dir: Path) -> Path:
@@ -706,8 +734,8 @@ def start_tracking_worker() -> None:
     thread.start()
 
 
-def process_next_shipping_job() -> bool:
-    job = DB.claim_next_shipping_job()
+def process_next_shipping_job(connection: Optional[sqlite3.Connection] = None) -> bool:
+    job = DB.claim_next_shipping_job(connection)
     if not job:
         return False
     client = Kuaidi100LabelClient.from_env()
@@ -748,23 +776,44 @@ def process_next_shipping_job() -> bool:
     return True
 
 
-def shipping_worker() -> None:
-    recovered = DB.reset_stale_shipping_jobs()
-    next_stale_check = time.monotonic() + 60
-    if recovered.get("requeued") or recovered.get("failed"):
-        print(f"[shipping] recovered stale jobs: {recovered}", flush=True)
-    while True:
-        try:
-            if time.monotonic() >= next_stale_check:
-                recovered = DB.reset_stale_shipping_jobs()
-                next_stale_check = time.monotonic() + 60
-                if recovered.get("requeued") or recovered.get("failed"):
-                    print(f"[shipping] recovered stale jobs: {recovered}", flush=True)
-            if label_enabled() and process_next_shipping_job():
-                continue
-        except Exception as exc:
-            print(f"[shipping] 批量下单任务失败：{exc}")
-        time.sleep(2)
+def notify_shipping_worker() -> None:
+    SHIPPING_QUEUE_EVENT.set()
+
+
+def shipping_worker(stop_event: Optional[threading.Event] = None) -> None:
+    stop_event = stop_event or threading.Event()
+    worker_connection: Optional[sqlite3.Connection] = None
+    idle_index = 0
+    next_stale_check = 0.0
+    try:
+        while not stop_event.is_set():
+            try:
+                if worker_connection is None:
+                    worker_connection = DB.connect()
+                if time.monotonic() >= next_stale_check:
+                    recovered = DB.reset_stale_shipping_jobs(worker_connection)
+                    next_stale_check = time.monotonic() + 60
+                    if recovered.get("requeued") or recovered.get("failed"):
+                        print(f"[shipping] recovered stale jobs: {recovered}", flush=True)
+                if label_enabled() and process_next_shipping_job(worker_connection):
+                    idle_index = 0
+                    continue
+            except Exception as exc:
+                print(f"[shipping] 批量下单任务失败：{exc}", flush=True)
+                if worker_connection is not None:
+                    worker_connection.close()
+                    worker_connection = None
+
+            delay = SHIPPING_IDLE_DELAYS_SECONDS[idle_index]
+            woke_for_work = SHIPPING_QUEUE_EVENT.wait(delay)
+            SHIPPING_QUEUE_EVENT.clear()
+            if woke_for_work:
+                idle_index = 0
+            else:
+                idle_index = min(idle_index + 1, len(SHIPPING_IDLE_DELAYS_SECONDS) - 1)
+    finally:
+        if worker_connection is not None:
+            worker_connection.close()
 
 
 def start_shipping_worker() -> None:
@@ -1139,13 +1188,16 @@ class Handler(BaseHTTPRequestHandler):
                 choices,
                 body.get("filters") if isinstance(body.get("filters"), dict) else {},
             )
+            notify_shipping_worker()
             self.send_json(batch, status=202)
             return
 
         if path.startswith("/api/admin/shipping-batches/") and path.endswith("/retry") and self.command == "POST":
             self.require_admin(user)
             batch_id = int(path.split("/")[4])
-            self.send_json(DB.retry_shipping_batch(batch_id))
+            batch = DB.retry_shipping_batch(batch_id)
+            notify_shipping_worker()
+            self.send_json(batch)
             return
 
         if path.startswith("/api/admin/shipping-batches/") and self.command == "GET":
@@ -1237,16 +1289,25 @@ class Handler(BaseHTTPRequestHandler):
             shipment_ids = body.get("shipment_ids") if isinstance(body.get("shipment_ids"), list) else []
             if len(shipment_ids) > MAX_BATCH_PRINT_ORDERS:
                 raise AppError(f"单次最多合并 {MAX_BATCH_PRINT_ORDERS} 张面单，请分批打印。", 413)
-            shipments = DB.batch_print_shipments(shipment_ids)
-            with tempfile.TemporaryDirectory(prefix="scentpool-label-merge-") as directory:
-                payload_path = build_batch_label_pdf_file(shipments, Path(directory))
-                filename = f"面单_{local_now().strftime('%Y-%m-%d_%H%M')}_{len(shipments)}单.pdf"
-                self.send_file(
-                    payload_path,
-                    "application/pdf",
-                    inline_header(filename, "scentpool-labels.pdf"),
+            if not LABEL_BATCH_PRINT_LOCK.acquire(blocking=False):
+                raise AppError(
+                    "已有一批面单正在生成，请等待当前下载完成后再试。订单状态没有改变。",
+                    409,
                 )
-                DB.mark_labels_printed([int(row["id"]) for row in shipments])
+            try:
+                ensure_batch_print_memory_available()
+                shipments = DB.batch_print_shipments(shipment_ids)
+                with tempfile.TemporaryDirectory(prefix="scentpool-label-merge-") as directory:
+                    payload_path = build_batch_label_pdf_file(shipments, Path(directory))
+                    filename = f"面单_{local_now().strftime('%Y-%m-%d_%H%M')}_{len(shipments)}单.pdf"
+                    self.send_file(
+                        payload_path,
+                        "application/pdf",
+                        inline_header(filename, "scentpool-labels.pdf"),
+                    )
+                    DB.mark_labels_printed([int(row["id"]) for row in shipments])
+            finally:
+                LABEL_BATCH_PRINT_LOCK.release()
             return
 
         if path.startswith("/api/shipments/") and path.endswith("/items") and self.command == "PATCH":

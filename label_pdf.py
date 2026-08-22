@@ -17,7 +17,8 @@ from pypdf.errors import PdfReadError
 
 LABEL_PDF_HOST_SUFFIXES = ("kuaidi100.com", "cainiao.com", "aliyuncs.com")
 DOWNLOAD_CHUNK_BYTES = 64 * 1024
-DEFAULT_MEMORY_LIMIT_MB = 320
+DEFAULT_MEMORY_LIMIT_MB = 192
+MAX_MEMORY_LIMIT_MB = 224
 
 
 class LabelPdfError(Exception):
@@ -31,7 +32,7 @@ def apply_process_memory_limit() -> None:
         import resource
 
         configured = int(os.environ.get("SCENTPOOL_LABEL_PROCESS_MEMORY_MB", str(DEFAULT_MEMORY_LIMIT_MB)))
-        limit_bytes = max(128, min(configured, 384)) * 1024 * 1024
+        limit_bytes = max(128, min(configured, MAX_MEMORY_LIMIT_MB)) * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
     except (ImportError, OSError, ValueError):
         return

@@ -3180,9 +3180,20 @@ class Database:
                 )
         return self.get_shipping_batch(batch_id)
 
-    def claim_next_shipping_job(self) -> Optional[Dict[str, Any]]:
+    def claim_next_shipping_job(
+        self,
+        connection: Optional[sqlite3.Connection] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Claim one queued label job.
+
+        The shipping worker passes its own long-lived connection so an empty
+        queue does not repeatedly parse the full SQLite schema. Callers that do
+        not pass a connection retain the original one-shot behavior.
+        """
         now = now_text()
-        with self.connect() as conn:
+        conn = connection or self.connect()
+        owns_connection = connection is None
+        try:
             conn.execute("BEGIN IMMEDIATE")
             job = conn.execute(
                 """
@@ -3194,6 +3205,7 @@ class Database:
                 """
             ).fetchone()
             if not job:
+                conn.rollback()
                 return None
             conn.execute(
                 """
@@ -3213,6 +3225,13 @@ class Database:
             )
             shipment = conn.execute("SELECT * FROM shipments WHERE id = ?", (job["shipment_id"],)).fetchone()
             items = conn.execute("SELECT * FROM shipment_items WHERE shipment_id = ? ORDER BY id", (job["shipment_id"],)).fetchall()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            if owns_connection:
+                conn.close()
         payload = dict(shipment)
         payload["items"] = [dict(item) for item in items]
         payload["batch_item_id"] = job["id"]
@@ -3344,7 +3363,10 @@ class Database:
             )
         return self.get_shipping_batch(batch_id)
 
-    def reset_stale_shipping_jobs(self) -> Dict[str, int]:
+    def reset_stale_shipping_jobs(
+        self,
+        connection: Optional[sqlite3.Connection] = None,
+    ) -> Dict[str, int]:
         now = now_text()
         stale_before = (
             datetime.now(APP_TZ) - timedelta(minutes=SHIPPING_STALE_MINUTES)
@@ -3352,7 +3374,9 @@ class Database:
         requeued = 0
         failed = 0
         affected_batches: set[int] = set()
-        with self.connect() as conn:
+        conn = connection or self.connect()
+        owns_connection = connection is None
+        try:
             rows = conn.execute(
                 """
                 SELECT id, shipment_id, batch_id, attempt_count
@@ -3401,6 +3425,15 @@ class Database:
                     requeued += 1
             for batch_id in affected_batches:
                 self._refresh_shipping_batch_status(conn, batch_id, now)
+            if conn.in_transaction:
+                conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            if owns_connection:
+                conn.close()
         return {"requeued": requeued, "failed": failed}
 
     def apply_label_print_callback(self, task_id: str, param_raw: str, param: Dict[str, Any]) -> Dict[str, Any]:

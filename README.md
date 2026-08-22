@@ -53,8 +53,9 @@ python3 server.py --host 0.0.0.0 --port 8765
 - `SCENTPOOL_PUBLIC_BASE_URL`：网站公网根地址，用于生成菜鸟授权和打印状态回调地址。
 - `SCENTPOOL_MAX_REQUEST_THREADS=8`：Web 请求固定线程池大小，防止并发请求无限创建线程与内存分配区。
 - `SCENTPOOL_SHIPPING_TRANSIENT_RETRIES=2`：电子面单遇到限流、服务端错误、超时或临时网络错误时，在同一幂等请求内额外重试的次数；可设为 `0` 至 `3`。
-- `SCENTPOOL_MAX_BATCH_PRINT_ORDERS=200`：单次批量合并面单上限。
-- `SCENTPOOL_LABEL_PROCESS_MEMORY_MB=320`：Linux 上 PDF 合并子进程的硬内存上限。
+- `SCENTPOOL_MAX_BATCH_PRINT_ORDERS=50`：单次批量打印上限；代码会把更大的旧配置安全收紧到 50。
+- `SCENTPOOL_LABEL_PROCESS_MEMORY_MB=192`：Linux 上 PDF 合并子进程的目标内存上限；代码硬上限为 224 MB。
+- `SCENTPOOL_BATCH_PRINT_PARENT_RSS_MB=240`：Web 主进程达到该内存时暂缓新的批量打印，保留订单与待打印状态。
 - `MALLOC_ARENA_MAX=2`、`MALLOC_TRIM_THRESHOLD_=131072`：限制 glibc 分配区并更积极归还空闲内存。
 - 菜鸟授权面单使用每家快递公司自己的 `thirdTemplateURL`。圆通当前配置为一联单模板 `https://cloudprint.cainiao.com/template/standard/850338` 和货物自定义区模板 `https://cloudprint.cainiao.com/template/customArea/77205369`；京东和顺丰暂不配置模板。系统通过 `thirdCustomTemplateUrl` 和 `customParam.itemSummary` 传入按分类换行的商品名称与数量。
 - 电子面单的物品名称和备注会从发货单商品明细自动生成，格式为“【分类】商品名*数量”；同分类商品合并展示，不同分类自动换行，订单备注在全部货品信息后另起一行显示。物品栏超过 50 字时会清理重复品类前缀并逐级缩写每个商品的主关键词，但不会省略任何商品。自定义区内容最多 100 字。

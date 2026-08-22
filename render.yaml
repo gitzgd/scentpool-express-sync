@@ -25,9 +25,11 @@ services:
       - key: SCENTPOOL_SHIPPING_TRANSIENT_RETRIES
         value: "2"
       - key: SCENTPOOL_MAX_BATCH_PRINT_ORDERS
-        value: "200"
+        value: "50"
       - key: SCENTPOOL_LABEL_PROCESS_MEMORY_MB
-        value: "320"
+        value: "192"
+      - key: SCENTPOOL_BATCH_PRINT_PARENT_RSS_MB
+        value: "240"
       - key: SCENTPOOL_ADMIN_PASSWORD
         sync: false
       - key: SCENTPOOL_ALLOW_DB_RESTORE
