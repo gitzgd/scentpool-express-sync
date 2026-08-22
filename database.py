@@ -2774,40 +2774,50 @@ class Database:
         counts["total"] = sum(counts.values())
         return counts
 
-    def list_shipments(self, user: Dict[str, Any], filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _list_shipments_with_connection(
+        self,
+        conn: sqlite3.Connection,
+        user: Dict[str, Any],
+        filters: Dict[str, Any],
+        *,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
         where, params = self._shipment_filter_sql(user, filters)
         include_tracking_raw = (
             str(filters.get("include_tracking_raw") or "").strip() == "1"
             and bool(str(filters.get("id") or "").strip())
         )
-
-        with self.connect() as conn:
-            if self._shipment_columns is None:
-                self._shipment_columns = [
-                    str(row["name"])
-                    for row in conn.execute("PRAGMA table_info(shipments)").fetchall()
-                ]
-            excluded = {"booking_raw", "booking_salt", "booking_poll_token"}
-            if not include_tracking_raw:
-                excluded.add("tracking_raw")
-            selected_columns = ", ".join(
-                f"shipments.{column}"
-                for column in self._shipment_columns
-                if column not in excluded
-            )
-            sql = f"SELECT {selected_columns} FROM shipments"
-            if where:
-                sql += " WHERE " + " AND ".join(where)
-            sql += " ORDER BY shipments.created_at DESC, shipments.id DESC"
-            rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
-            if not rows:
-                return []
-            ids = [row["id"] for row in rows]
-            placeholders = ",".join("?" for _ in ids)
-            item_rows = conn.execute(
-                f"SELECT * FROM shipment_items WHERE shipment_id IN ({placeholders}) ORDER BY id",
-                ids,
-            ).fetchall()
+        if self._shipment_columns is None:
+            self._shipment_columns = [
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(shipments)").fetchall()
+            ]
+        excluded = {"booking_raw", "booking_salt", "booking_poll_token"}
+        if not include_tracking_raw:
+            excluded.add("tracking_raw")
+        selected_columns = ", ".join(
+            f"shipments.{column}"
+            for column in self._shipment_columns
+            if column not in excluded
+        )
+        sql = f"SELECT {selected_columns} FROM shipments"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY shipments.created_at DESC, shipments.id DESC"
+        query_params = list(params)
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            query_params.extend([limit, offset])
+        rows = [dict(row) for row in conn.execute(sql, query_params).fetchall()]
+        if not rows:
+            return []
+        ids = [row["id"] for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        item_rows = conn.execute(
+            f"SELECT * FROM shipment_items WHERE shipment_id IN ({placeholders}) ORDER BY id",
+            ids,
+        ).fetchall()
 
         items_by_shipment: Dict[int, List[Dict[str, Any]]] = {}
         for item in item_rows:
@@ -2825,6 +2835,44 @@ class Database:
             row.pop("booking_salt", None)
             row.pop("booking_poll_token", None)
         return rows
+
+    def list_shipments(self, user: Dict[str, Any], filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        with self.connect() as conn:
+            return self._list_shipments_with_connection(conn, user, filters)
+
+    def list_shipments_page(
+        self,
+        user: Dict[str, Any],
+        filters: Dict[str, Any],
+        *,
+        page: int,
+        page_size: int,
+    ) -> Dict[str, Any]:
+        where, params = self._shipment_filter_sql(user, filters)
+        count_sql = "SELECT COUNT(*) AS count FROM shipments"
+        if where:
+            count_sql += " WHERE " + " AND ".join(where)
+        with self.connect() as conn:
+            conn.execute("BEGIN")
+            total = int(conn.execute(count_sql, params).fetchone()["count"])
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            current_page = min(page, total_pages)
+            rows = self._list_shipments_with_connection(
+                conn,
+                user,
+                filters,
+                limit=page_size,
+                offset=(current_page - 1) * page_size,
+            )
+        return {
+            "shipments": rows,
+            "pagination": {
+                "page": current_page,
+                "page_size": page_size,
+                "total": total,
+                "total_pages": total_pages,
+            },
+        }
 
     def get_shipping_settings(self, *, public: bool = False) -> Dict[str, Any]:
         with self.connect() as conn:

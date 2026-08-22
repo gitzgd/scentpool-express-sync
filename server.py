@@ -1230,7 +1230,17 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/shipments" and self.command == "GET":
-            self.send_json({"shipments": DB.list_shipments(user, query), "statuses": STATUSES})
+            try:
+                page = int(query.pop("page", "1"))
+                page_size = int(query.pop("page_size", "50"))
+            except (TypeError, ValueError):
+                raise AppError("页码和每页数量必须是正整数。") from None
+            if page < 1 or page_size < 1:
+                raise AppError("页码和每页数量必须是正整数。")
+            if page_size > 50:
+                raise AppError("每页最多显示 50 单。")
+            result = DB.list_shipments_page(user, query, page=page, page_size=page_size)
+            self.send_json({**result, "statuses": STATUSES})
             return
 
         if path.startswith("/api/shipments/") and path.endswith("/tracking/refresh") and self.command == "POST":

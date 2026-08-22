@@ -20,6 +20,10 @@ const state = {
   storeFilters: { status: "", date_from: "", date_to: "", q: "" },
   adminShipmentPage: 1,
   storeShipmentPage: 1,
+  adminShipmentPagination: { page: 1, page_size: 50, total: 0, total_pages: 1 },
+  storeShipmentPagination: { page: 1, page_size: 50, total: 0, total_pages: 1 },
+  adminBoardLoaded: false,
+  storeBoardLoaded: false,
   adminReturnFilters: { store_id: "", status: "", date_from: "", date_to: "", q: "" },
   storeReturnFilters: { status: "", date_from: "", date_to: "", q: "" },
   productFilters: { category: "", q: "" },
@@ -205,14 +209,15 @@ function setShipmentPage(scope, page) {
 }
 
 function paginatedShipments(rows, scope) {
-  const total = rows.length;
-  const totalPages = Math.max(1, Math.ceil(total / SHIPMENT_PAGE_SIZE));
-  const page = Math.min(Math.max(1, shipmentPageState(scope)), totalPages);
+  const pagination = scope === "admin" ? state.adminShipmentPagination : state.storeShipmentPagination;
+  const total = Number(pagination?.total || 0);
+  const totalPages = Math.max(1, Number(pagination?.total_pages || 1));
+  const page = Math.min(Math.max(1, Number(pagination?.page || shipmentPageState(scope))), totalPages);
   setShipmentPage(scope, page);
   const start = (page - 1) * SHIPMENT_PAGE_SIZE;
-  const end = Math.min(start + SHIPMENT_PAGE_SIZE, total);
+  const end = Math.min(start + rows.length, total);
   return {
-    rows: rows.slice(start, end),
+    rows,
     total,
     totalPages,
     page,
@@ -371,18 +376,30 @@ function bindTrackingDetails() {
 }
 
 function bindShipmentPagination() {
+  const changePage = async (scope, page) => {
+    setShipmentPage(scope, page);
+    try {
+      if (scope === "admin") {
+        await loadShipments({ loadSummary: false });
+      } else {
+        await loadStoreShipments({ loadSummary: false });
+      }
+      await render({ refreshData: false });
+      document.querySelector(".date-shipment-group, .store-shipments-table")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (error) {
+      errorToast(error, "这一页暂时无法读取，请稍后重试。");
+    }
+  };
   document.querySelectorAll("[data-shipment-page]").forEach((node) => {
-    node.addEventListener("click", (event) => {
+    node.addEventListener("click", async (event) => {
       const scope = event.currentTarget.dataset.shipmentPage;
-      setShipmentPage(scope, event.currentTarget.dataset.page);
-      render({ refreshData: false });
+      await changePage(scope, event.currentTarget.dataset.page);
     });
   });
   document.querySelectorAll("[data-shipment-page-select]").forEach((node) => {
-    node.addEventListener("change", (event) => {
+    node.addEventListener("change", async (event) => {
       const scope = event.currentTarget.dataset.shipmentPageSelect;
-      setShipmentPage(scope, event.currentTarget.value);
-      render({ refreshData: false });
+      await changePage(scope, event.currentTarget.value);
     });
   });
 }
@@ -505,20 +522,26 @@ async function loadStores(all = false) {
   state.stores = data.stores || [];
 }
 
-async function loadShipments() {
+async function loadShipments({ loadSummary = true } = {}) {
   const params = new URLSearchParams();
   Object.entries(state.adminFilters).forEach(([key, value]) => {
     if (value) params.set(key, value);
   });
+  params.set("page", String(state.adminShipmentPage));
+  params.set("page_size", String(SHIPMENT_PAGE_SIZE));
   const summaryParams = new URLSearchParams(params);
   summaryParams.delete("status");
+  summaryParams.delete("page");
+  summaryParams.delete("page_size");
   const [data, summaryData] = await Promise.all([
     api(`/api/shipments?${params.toString()}`),
-    api(`/api/shipments/summary?${summaryParams.toString()}`),
+    loadSummary ? api(`/api/shipments/summary?${summaryParams.toString()}`) : Promise.resolve(null),
   ]);
   state.shipments = data.shipments || [];
+  state.adminShipmentPagination = data.pagination || { page: 1, page_size: SHIPMENT_PAGE_SIZE, total: state.shipments.length, total_pages: 1 };
+  state.adminShipmentPage = state.adminShipmentPagination.page || 1;
   state.statuses = data.statuses || state.statuses;
-  state.adminShipmentSummary = summaryData.counts || { total: 0 };
+  if (summaryData) state.adminShipmentSummary = summaryData.counts || { total: 0 };
 }
 
 async function loadShippingSettings() {
@@ -612,20 +635,26 @@ function scheduleShippingBatchPoll() {
   }, 2500);
 }
 
-async function loadStoreShipments() {
+async function loadStoreShipments({ loadSummary = true } = {}) {
   const params = new URLSearchParams();
   Object.entries(state.storeFilters).forEach(([key, value]) => {
     if (value) params.set(key, value);
   });
+  params.set("page", String(state.storeShipmentPage));
+  params.set("page_size", String(SHIPMENT_PAGE_SIZE));
   const summaryParams = new URLSearchParams(params);
   summaryParams.delete("status");
+  summaryParams.delete("page");
+  summaryParams.delete("page_size");
   const [data, summaryData] = await Promise.all([
     api(`/api/shipments?${params.toString()}`),
-    api(`/api/shipments/summary?${summaryParams.toString()}`),
+    loadSummary ? api(`/api/shipments/summary?${summaryParams.toString()}`) : Promise.resolve(null),
   ]);
   state.storeShipments = data.shipments || [];
+  state.storeShipmentPagination = data.pagination || { page: 1, page_size: SHIPMENT_PAGE_SIZE, total: state.storeShipments.length, total_pages: 1 };
+  state.storeShipmentPage = state.storeShipmentPagination.page || 1;
   state.statuses = data.statuses || state.statuses;
-  state.storeShipmentSummary = summaryData.counts || { total: 0 };
+  if (summaryData) state.storeShipmentSummary = summaryData.counts || { total: 0 };
 }
 
 async function loadStoreTodaySummary() {
@@ -1046,11 +1075,10 @@ function bindSubmit() {
 
 async function renderStoreBoard({ refreshData = true } = {}) {
   if (refreshData) {
-    await Promise.all([
-      ensureProductsGrouped(),
-      loadStoreShipments(),
-      loadStoreTodaySummary(),
-    ]);
+    const loads = [loadStoreShipments(), loadStoreTodaySummary()];
+    if (!state.storeBoardLoaded) loads.push(ensureProductsGrouped());
+    await Promise.all(loads);
+    state.storeBoardLoaded = true;
   }
   const today = localDate();
   const yesterday = localDate(-1);
@@ -2105,11 +2133,11 @@ function renderBatchPrintPanel() {
   return `
     <section class="panel panel-pad shipping-batch-panel">
       <div class="section-title">
-        <div><h2>批量打印面单</h2><div class="muted mini">当前筛选中待打印 ${eligible.length} 单，已选择 <span id="batchPrintSelectedCount">${selectedIds.size}</span> 单</div></div>
+        <div><h2>批量打印面单</h2><div class="muted mini">当前页待打印 ${eligible.length} 单，已选择 <span id="batchPrintSelectedCount">${selectedIds.size}</span> 单；切换页面后可继续分批打印</div></div>
         <button class="btn ghost small" id="closeBatchPrint" type="button">关闭</button>
       </div>
       <div class="inline-actions batch-print-actions">
-        <button class="btn secondary small" id="selectAllBatchPrint" type="button">全选</button>
+        <button class="btn secondary small" id="selectAllBatchPrint" type="button">全选本页</button>
         <button class="btn ghost small" id="clearBatchPrint" type="button">取消全选</button>
         <button class="btn primary" id="mergeBatchPrint" type="button" ${selectedIds.size ? "" : "disabled"}>合并并打印 ${selectedIds.size} 单</button>
       </div>
@@ -2122,7 +2150,7 @@ function renderBatchPrintPanel() {
             <div><strong>${escapeHtml(row.business_id)}</strong><div class="muted mini">${escapeHtml(row.store_name_snapshot)} · ${escapeHtml(row.recipient_name)}</div></div>
             <span class="muted mini">${escapeHtml(row.tracking_no)}</span>
           </div>
-        `).join("") || `<div class="empty">当前筛选中没有待打印面单</div>`}
+        `).join("") || `<div class="empty">当前页没有待打印面单</div>`}
       </div>
     </section>
   `;
@@ -2160,14 +2188,12 @@ function renderShippingBatchProgress() {
 
 async function renderAdmin({ refreshData = true } = {}) {
   if (refreshData) {
-    await Promise.all([
-      ensureProductsGrouped(),
-      loadStores(),
-      loadShipments(),
-      loadShippingSettings(),
-      loadActiveShippingBatch(),
-      loadTaskAlerts(),
-    ]);
+    const loads = [loadShipments()];
+    if (!state.adminBoardLoaded) {
+      loads.push(ensureProductsGrouped(), loadStores(), loadShippingSettings(), loadActiveShippingBatch(), loadTaskAlerts());
+    }
+    await Promise.all(loads);
+    state.adminBoardLoaded = true;
   }
   const today = localDate();
   const yesterday = localDate(-1);
@@ -3348,8 +3374,10 @@ async function render({ refreshData = true } = {}) {
   if (path !== "/admin") {
     stopTaskAlertPoll();
     state.taskAlertsOpen = false;
+    state.adminBoardLoaded = false;
     document.body.classList.remove("task-alert-dialog-open");
   }
+  if (path !== "/shipments") state.storeBoardLoaded = false;
   const showsLoading = refreshData && path !== "/login";
   if (showsLoading) {
     activeDataLoads += 1;

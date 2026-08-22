@@ -1681,6 +1681,76 @@ def main() -> None:
             assert "ORDER-SMOKE-001" in sheet_xml
             assert "wrapText" in styles_xml
 
+        pagination_payload = {
+            "recipient_name": "分页测试收件人",
+            "phone": "13800138000",
+            "address": "上海市分页测试路 1 号",
+            "remark": "PAGINATION-SMOKE",
+            "items": [{"barcode": product["barcode"], "quantity": 1}],
+        }
+        server.DB.create_store("分页隔离门店", "pagination-store", "pagination-pass")
+        other_store_user = server.DB.authenticate("pagination-store", "pagination-pass")
+        assert other_store_user is not None
+        server.DB.create_shipment(
+            other_store_user,
+            {**pagination_payload, "store_order_no": "PAGINATION-SMOKE-OTHER-STORE"},
+        )
+        for index in range(53):
+            server.DB.create_shipment(
+                test_staff_user,
+                {**pagination_payload, "store_order_no": f"PAGINATION-SMOKE-{index + 1:03d}"},
+            )
+
+        status, page_one = request(admin, base, "GET", "/api/shipments?q=PAGINATION-SMOKE&page=1&page_size=50")
+        assert status == 200, page_one
+        assert len(page_one["shipments"]) == 50
+        assert page_one["pagination"] == {
+            "page": 1,
+            "page_size": 50,
+            "total": 54,
+            "total_pages": 2,
+        }
+        assert page_one["shipments"][0]["store_order_no"] == "PAGINATION-SMOKE-053"
+
+        status, page_two = request(staff, base, "GET", "/api/shipments?q=PAGINATION-SMOKE&page=2&page_size=50")
+        assert status == 200, page_two
+        assert len(page_two["shipments"]) == 3
+        assert page_two["pagination"]["total"] == 53
+        assert page_two["shipments"][-1]["store_order_no"] == "PAGINATION-SMOKE-001"
+
+        status, clamped_page = request(admin, base, "GET", "/api/shipments?q=PAGINATION-SMOKE&page=999&page_size=50")
+        assert status == 200, clamped_page
+        assert clamped_page["pagination"]["page"] == 2
+        assert len(clamped_page["shipments"]) == 4
+
+        status, invalid_page = request(admin, base, "GET", "/api/shipments?page=abc")
+        assert status == 400, invalid_page
+        status, oversized_page = request(admin, base, "GET", "/api/shipments?page_size=51")
+        assert status == 400, oversized_page
+
+        status, full_preview = request(
+            admin,
+            base,
+            "POST",
+            "/api/admin/shipping-batches/preview",
+            {"filters": {"q": "PAGINATION-SMOKE", "status": "待处理"}},
+        )
+        assert status == 200, full_preview
+        assert full_preview["preview"]["matched"] == 54
+        assert len(full_preview["preview"]["eligible"]) == 54
+        staff_preview = server.DB.preview_shipping_batch(test_staff_user, {"q": "PAGINATION-SMOKE", "status": "待处理"})
+        assert staff_preview["matched"] == 53
+
+        status, pagination_csv, _headers = request_full(
+            admin,
+            base,
+            "GET",
+            "/api/export/shipments.csv?q=PAGINATION-SMOKE",
+        )
+        assert status == 200
+        pagination_rows = list(csv.DictReader(io.StringIO(pagination_csv.decode("utf-8-sig"))))
+        assert len(pagination_rows) == 54
+
         status, body = request(staff, base, "DELETE", f"/api/shipments/{shipment_id}")
         assert status == 409, body
 
