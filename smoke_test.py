@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from http.cookiejar import CookieJar
 from pathlib import Path
 from urllib.parse import quote
@@ -765,6 +766,33 @@ def main() -> None:
         server.SESSION_SECURE = False
         server.ALLOW_DB_RESTORE = False
         server.DB.initialize(DEFAULT_PRODUCT_FILE)
+        connection_before = server.DB.connection_diagnostics()
+        with server.DB.connect() as lifecycle_connection:
+            assert lifecycle_connection.execute("SELECT 1").fetchone()[0] == 1
+        connection_after = server.DB.connection_diagnostics()
+        assert connection_after["opened_total"] == connection_before["opened_total"] + 1
+        assert connection_after["closed_total"] == connection_before["closed_total"] + 1
+        assert connection_after["active"] == 0
+        try:
+            lifecycle_connection.execute("SELECT 1")
+            raise AssertionError("transaction context must close the SQLite connection")
+        except sqlite3.ProgrammingError:
+            pass
+        with server.DB.connect_readonly() as readonly_connection:
+            assert readonly_connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        try:
+            readonly_connection.execute("SELECT 1")
+            raise AssertionError("read-only transaction context must close the SQLite connection")
+        except sqlite3.ProgrammingError:
+            pass
+        parallel_before = server.DB.connection_diagnostics()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            assert all(pool.map(lambda _index: server.DB.health_check(), range(1000)))
+        parallel_after = server.DB.connection_diagnostics()
+        assert parallel_after["opened_total"] == parallel_before["opened_total"] + 1000
+        assert parallel_after["closed_total"] == parallel_before["closed_total"] + 1000
+        assert parallel_after["active"] == 0
+        assert parallel_after["peak_active"] <= 8
         server.DB.save_label_authorization(
             {"partnerId": "CAINIAO-ID", "partnerKey": "CAINIAO-KEY", "net": "cainiao"}
         )
@@ -824,6 +852,9 @@ def main() -> None:
         assert status == 200, body
         assert body["storage"]["journal_mode"] == "wal"
         assert body["storage"]["table_counts"]["products"] == 52
+        assert body["storage"]["connections"]["opened_total"] == body["storage"]["connections"]["closed_total"]
+        assert body["storage"]["connections"]["active"] == 0
+        assert body["storage"]["connections"]["peak_active"] <= server.MAX_REQUEST_THREADS
         assert body["process"]["request_thread_limit"] == server.MAX_REQUEST_THREADS
 
         status, body = request(admin, base, "GET", "/api/admin/task-alerts")

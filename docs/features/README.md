@@ -15,7 +15,7 @@
 | [脱敏业务日报](daily-audit.md) | 独立 Bearer 鉴权、只读 SQLite 汇总、前向完整历史日末、脱敏失败分类与固定只读 Render 采集器（扩展待审查/部署） | `database.py`, `server.py`, `tools/scentpool_daily_audit_probe.py`, `daily_audit_test.py` |
 | 导出 | CSV/XLSX、门店和日期命名、商品分类换行 | `server.py` |
 | 数据安全 | SQLite 在线备份、恢复保护、完整性检查 | `database.py`, `manage.py`, `server.py` |
-| 运维 | 健康检查、诊断、慢请求、资源限制 | `server.py`, `render.yaml`, `OPERATIONS.md` |
+| 运维 | 健康检查、进程与 SQLite 连接诊断、慢请求、资源限制 | `server.py`, `database.py`, `render.yaml`, `OPERATIONS.md` |
 
 ## 新增功能文档要求
 

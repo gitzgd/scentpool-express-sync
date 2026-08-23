@@ -6,6 +6,8 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -49,6 +51,32 @@ class AppError(Exception):
         self.message = message
         self.status = status
         self.details = details or {}
+
+
+class _ManagedConnection(sqlite3.Connection):
+    """SQLite connection whose transaction context also releases native resources."""
+
+    def _configure_close_callback(self, callback: Any) -> None:
+        self._close_callback = callback
+        self._managed_closed = False
+
+    def close(self) -> None:
+        if getattr(self, "_managed_closed", False):
+            return
+        self._managed_closed = True
+        try:
+            super().close()
+        finally:
+            callback = getattr(self, "_close_callback", None)
+            self._close_callback = None
+            if callback is not None:
+                callback()
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
 
 
 def now_text() -> str:
@@ -130,22 +158,58 @@ class Database:
     def __init__(self, path: str):
         self.path = path
         self._shipment_columns: Optional[List[str]] = None
+        self._connection_stats_lock = threading.Lock()
+        self._connection_opened_total = 0
+        self._connection_closed_total = 0
+        self._connection_active = 0
+        self._connection_peak_active = 0
+
+    def _record_connection_opened(self) -> None:
+        with self._connection_stats_lock:
+            self._connection_opened_total += 1
+            self._connection_active += 1
+            self._connection_peak_active = max(self._connection_peak_active, self._connection_active)
+
+    def _record_connection_closed(self) -> None:
+        with self._connection_stats_lock:
+            self._connection_closed_total += 1
+            self._connection_active = max(0, self._connection_active - 1)
+
+    def connection_diagnostics(self) -> Dict[str, int]:
+        with self._connection_stats_lock:
+            return {
+                "opened_total": self._connection_opened_total,
+                "closed_total": self._connection_closed_total,
+                "active": self._connection_active,
+                "peak_active": self._connection_peak_active,
+            }
+
+    def _new_connection(self, database: str, **kwargs: Any) -> sqlite3.Connection:
+        conn = sqlite3.connect(database, factory=_ManagedConnection, **kwargs)
+        assert isinstance(conn, _ManagedConnection)
+        conn._configure_close_callback(self._record_connection_closed)
+        self._record_connection_opened()
+        return conn
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=15)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 15000")
-        conn.execute("PRAGMA cache_size = -2048")
-        conn.execute("PRAGMA temp_store = FILE")
-        conn.execute("PRAGMA synchronous = NORMAL")
-        conn.execute("PRAGMA wal_autocheckpoint = 1000")
-        return conn
+        conn = self._new_connection(self.path, timeout=15)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 15000")
+            conn.execute("PRAGMA cache_size = -2048")
+            conn.execute("PRAGMA temp_store = FILE")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute("PRAGMA wal_autocheckpoint = 1000")
+            return conn
+        except Exception:
+            conn.close()
+            raise
 
     def connect_readonly(self) -> sqlite3.Connection:
         """Open a reporting connection that cannot initialize, migrate, or write the database."""
         database_uri = Path(self.path).expanduser().resolve().as_uri()
-        conn = sqlite3.connect(f"{database_uri}?mode=ro", uri=True, timeout=15)
+        conn = self._new_connection(f"{database_uri}?mode=ro", uri=True, timeout=15)
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout = 15000")
@@ -873,7 +937,7 @@ class Database:
         )
 
     def _migrate_shipments_schema(self) -> None:
-        with sqlite3.connect(self.path) as check:
+        with closing(sqlite3.connect(self.path)) as check:
             check.row_factory = sqlite3.Row
             row = check.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'shipments'").fetchone()
             if not row:
@@ -1246,6 +1310,7 @@ class Database:
             "journal_mode": journal_mode,
             "table_counts": table_counts,
             "raw_sizes": {key: int(value or 0) for key, value in raw_sizes.items()},
+            "connections": self.connection_diagnostics(),
         }
 
     def record_operational_incident(
@@ -2259,7 +2324,7 @@ class Database:
     def backup_to(self, target: str | Path) -> Path:
         target_path = Path(target)
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as source, sqlite3.connect(str(target_path)) as destination:
+        with self.connect() as source, closing(sqlite3.connect(str(target_path))) as destination:
             source.backup(destination)
             integrity = str(destination.execute("PRAGMA integrity_check").fetchone()[0])
         if integrity.lower() != "ok":
