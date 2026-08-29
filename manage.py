@@ -66,6 +66,58 @@ def command_diagnostics(args: argparse.Namespace) -> None:
     print(json.dumps(db.storage_diagnostics(), ensure_ascii=False, indent=2))
 
 
+def command_repair_shipment_times(args: argparse.Namespace) -> None:
+    db_path = Path(args.db).expanduser().resolve()
+    db = Database(str(db_path))
+    if not args.apply:
+        try:
+            preview = db.preview_shipment_time_repairs()
+        except AppError:
+            raise
+        except Exception as exc:
+            raise AppError("数据库不可读或尚未具备时间修复 Schema。", 500) from exc
+        print(json.dumps(preview, ensure_ascii=False, indent=2))
+        return
+
+    if not Path(args.db).is_absolute():
+        raise AppError("apply 模式必须使用绝对数据库路径。")
+    if str(args.confirm_db_path or "") != str(db_path):
+        raise AppError("数据库路径二次确认不匹配，未执行修复。")
+    if args.confirm != "APPLY_SHIPMENT_TIME_REPAIR":
+        raise AppError("缺少固定二次确认短语，未执行修复。")
+    if not args.preview_fingerprint:
+        raise AppError("apply 模式必须输入 dry-run 预览指纹。")
+    if args.max_rows is None or args.max_rows <= 0:
+        raise AppError("apply 模式必须设置大于 0 的 --max-rows。")
+    if args.backup_output is None:
+        raise AppError("apply 模式必须指定 --backup-output。")
+    backup_path = args.backup_output.expanduser().resolve()
+    if backup_path == db_path:
+        raise AppError("备份路径不能与当前数据库相同。")
+    if backup_path.exists():
+        raise AppError("备份文件已存在；为避免覆盖，请使用新的路径。")
+    try:
+        current_preview = db.preview_shipment_time_repairs()
+    except AppError:
+        raise
+    except Exception as exc:
+        raise AppError("数据库不可读或尚未具备时间修复 Schema。", 500) from exc
+    if args.preview_fingerprint != current_preview["preview_fingerprint"]:
+        raise AppError("数据库或修复目标与预览不一致，请重新执行 dry-run。", 409)
+    try:
+        db.backup_to(backup_path)
+    except Exception as exc:
+        raise AppError("在线备份或完整性检查失败，未执行修复。", 500) from exc
+    result = db.apply_shipment_time_repairs(
+        preview_fingerprint=args.preview_fingerprint,
+        max_rows=args.max_rows,
+        include_estimated=args.include_estimated,
+    )
+    result["backup_created"] = True
+    result["rollback"] = "restore_verified_pre_apply_backup"
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="万物香铺快递同步管理工具")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="SQLite 数据库路径")
@@ -91,6 +143,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     diagnostics = subparsers.add_parser("diagnostics", help="查看数据库文件、WAL、表记录和原始报文占用")
     diagnostics.set_defaults(func=command_diagnostics)
+
+    repair_times = subparsers.add_parser(
+        "repair-shipment-times",
+        help="预览或受控修复发货/签收时间；默认 dry-run 且只输出聚合",
+    )
+    repair_times.add_argument("--apply", action="store_true", help="显式启用写入模式")
+    repair_times.add_argument("--preview-fingerprint", default="", help="最近一次 dry-run 指纹")
+    repair_times.add_argument("--max-rows", type=int, help="允许修改的最大记录数")
+    repair_times.add_argument("--backup-output", type=Path, help="写入前在线备份的新文件路径")
+    repair_times.add_argument("--confirm-db-path", default="", help="再次输入数据库绝对路径")
+    repair_times.add_argument("--confirm", default="", help="固定确认短语")
+    repair_times.add_argument(
+        "--include-estimated",
+        action="store_true",
+        help="额外授权写入估算时间；未设置时只应用强证据精确修复",
+    )
+    repair_times.set_defaults(func=command_repair_shipment_times)
     return parser
 
 
