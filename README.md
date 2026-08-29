@@ -78,9 +78,9 @@ python3 scripts/install_daily_audit_probe.py
 python3 scripts/install_daily_audit_probe.py --check
 ```
 
-安装器原子更新 `~/.codex/scentpool_daily_audit_probe.py` 并设为 `0700`，不读取密钥。采集器运行时只从 Mac 登录钥匙串读取 `scentpool-audit-token` 与 `scentpool-render-api`，只执行固定 GET 白名单；它聚合部署、重启、OOM、5xx、异常栈、SQLite 锁、超时、慢请求、内存、磁盘和 HTTP 请求/延迟。接口无数据、权限不足、HTTP 错误、响应结构变化、网络受限或进程异常都会输出有效脱敏 JSON，不会以“成功退出但没有结果”表示失败。
+安装器原子更新 `~/.codex/scentpool_daily_audit_probe.py` 并设为 `0700`，不读取密钥。采集器运行时只从 Mac 登录钥匙串读取 `scentpool-audit-token` 与 `scentpool-render-api`，在 macOS 上显式使用系统 CA 文件校验 HTTPS，并只执行固定 GET 白名单；它聚合部署、重启、OOM、5xx、异常栈、SQLite 锁、超时、慢请求、内存、磁盘和 HTTP 请求/延迟。接口无数据、权限不足、HTTP 错误、响应结构变化、网络受限或进程异常都会输出有效脱敏 JSON，不会以“成功退出但没有结果”表示失败。
 
-历史日末和失败事件字段已于 2026-08-17 上线；本分支新增的时间证据等级尚未部署。
+历史日末和失败事件字段已于 2026-08-17 上线；时间证据等级及连接/打印/延迟兼容扩展已于 2026-08-29 上线。
 
 ## 发布到 Render
 
@@ -179,7 +179,7 @@ curl -b cookie.txt -c cookie.txt \
 python3 manage.py --db /绝对路径/scentpool.db repair-shipment-times
 ```
 
-生产 apply 需要独立授权、绝对路径复核、预览指纹、影响上限、固定确认短语、全新在线备份路径；估算时间还需额外 `--include-estimated`。完整执行与回滚清单见 `docs/features/shipment-time-integrity.md`。当前代码尚未部署，也未修复生产历史数据。
+生产 apply 需要独立授权、绝对路径复核、预览指纹、影响上限、固定确认短语、全新在线备份路径；估算时间还需额外 `--include-estimated`。完整执行与回滚清单见 `docs/features/shipment-time-integrity.md`。时间完整性约束代码已于 2026-08-29 部署，但生产历史数据仍未修复。
 
 ## 本地验证
 

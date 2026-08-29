@@ -5,6 +5,7 @@ import io
 import json
 import urllib.parse
 from typing import Any, Dict, Optional
+from unittest import mock
 
 from tools import scentpool_daily_audit_probe as probe
 
@@ -327,6 +328,22 @@ def assert_private_markers_absent(report: Dict[str, Any]) -> None:
 
 
 def main() -> None:
+    fake_context = object()
+    with (
+        mock.patch.object(probe.sys, "platform", "darwin"),
+        mock.patch.object(probe.os.path, "isfile", return_value=True),
+        mock.patch.object(probe.ssl, "create_default_context", return_value=fake_context) as create_context,
+    ):
+        assert probe.https_context() is fake_context
+        create_context.assert_called_once_with(cafile=probe.MACOS_SYSTEM_CA_FILE)
+
+    with (
+        mock.patch.object(probe.sys, "platform", "linux"),
+        mock.patch.object(probe.ssl, "create_default_context", return_value=fake_context) as create_context,
+    ):
+        assert probe.https_context() is fake_context
+        create_context.assert_called_once_with()
+
     assert probe.requested_date(["2026-02-28"]) == "2026-02-28"
     for invalid in ("2026-02-30", "2026-8-1", "2026-08-14&extra=1"):
         try:

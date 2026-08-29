@@ -173,7 +173,7 @@ server.py
 3. 日志只在内存中匹配 OOM、5xx、异常栈、数据库锁、超时和慢请求，输出固定聚合计数，不输出日志正文。
 4. 每个外部通道都必须返回 `ok`、`no_data`、`http_error`、`permission_denied`、`schema_changed`、`process_error`、`network_restricted` 或目标不匹配状态；失败时仍输出一份有效脱敏 JSON。
 
-独立令牌和当前快照日报基础版已于 2026-08-05 部署到正确生产服务 `scentpool-express-sync-ec7c`，只追加历史扩展已于 2026-08-17 上线；本分支新增的时间证据等级仍未部署。证据与只读生产验收结果记录在 `docs/STATUS.md`。
+独立令牌和当前快照日报基础版已于 2026-08-05 部署到正确生产服务 `scentpool-express-sync-ec7c`，只追加历史扩展已于 2026-08-17 上线；时间证据等级及连接/打印/延迟兼容扩展已于 2026-08-29 上线。证据与只读生产验收结果记录在 `docs/STATUS.md`。
 
 ## 生产拓扑
 

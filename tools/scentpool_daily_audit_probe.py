@@ -9,6 +9,7 @@ printed or persisted.
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 import ssl
@@ -38,6 +39,7 @@ EXPECTED_CONNECTION_PEAK_UPPER_BOUND = 9
 CORRELATION_WINDOW_MINUTES = 10
 LATENCY_QUANTILES = (0.5, 0.9, 0.99)
 AUDIT_DIAGNOSTICS_PATH = "/api/admin/system/audit-diagnostics"
+MACOS_SYSTEM_CA_FILE = "/etc/ssl/cert.pem"
 
 RENDER_QUERY_WHITELIST = {
     f"/services/{RENDER_SERVICE_ID}": set(),
@@ -149,6 +151,12 @@ def keychain_secret(service: str) -> tuple[Optional[str], Dict[str, Any]]:
         )
 
 
+def https_context() -> ssl.SSLContext:
+    if sys.platform == "darwin" and os.path.isfile(MACOS_SYSTEM_CA_FILE):
+        return ssl.create_default_context(cafile=MACOS_SYSTEM_CA_FILE)
+    return ssl.create_default_context()
+
+
 def render_url(path: str, params: Optional[Dict[str, Any]] = None) -> str:
     allowed = RENDER_QUERY_WHITELIST.get(path)
     if allowed is None:
@@ -209,7 +217,7 @@ class JsonClient:
                 with urllib.request.urlopen(
                     request,
                     timeout=self.timeout_seconds,
-                    context=ssl.create_default_context(),
+                    context=https_context(),
                 ) as response:
                     raw = response.read()
                     try:

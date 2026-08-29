@@ -1,6 +1,6 @@
 # 发货与签收时间完整性
 
-- 状态：代码与合成测试已完成，未部署，生产历史数据未修复
+- 状态：时间完整性约束已于 2026-08-29 部署，生产历史数据未修复
 - 关联决策：[`ADR-0006`](../decisions/ADR-0006-shipment-time-evidence-and-controlled-repair.md)
 
 ## 不变量
