@@ -140,6 +140,35 @@ def test_write_paths(tmp: Path) -> None:
     assert rows[manual_exact_id]["shipped_at_quality"] == "exact"
     assert rows[manual_exact_id]["shipped_at_source"] == "manual_input"
 
+    with db.connect() as conn:
+        for sql, params in (
+            ("UPDATE shipments SET shipped_at_source = '' WHERE id = ?", (manual_exact_id,)),
+            ("UPDATE shipments SET tracking_signed_at_source = '' WHERE id = ?", (direct_signed_id,)),
+            (
+                "UPDATE shipments SET created_at = '2026-07-01T10:00:00+08:00' WHERE id = ?",
+                (manual_exact_id,),
+            ),
+        ):
+            try:
+                conn.execute(sql, params)
+                raise AssertionError("single-column integrity bypass must be rejected")
+            except sqlite3.IntegrityError:
+                pass
+        conn.execute(
+            "UPDATE shipments SET shipped_at_source = 'manual_verified' WHERE id = ?",
+            (manual_exact_id,),
+        )
+        conn.execute(
+            "UPDATE shipments SET tracking_signed_at_source = 'provider_verified' WHERE id = ?",
+            (direct_signed_id,),
+        )
+        assert conn.execute(
+            "SELECT shipped_at_source FROM shipments WHERE id = ?", (manual_exact_id,)
+        ).fetchone()[0] == "manual_verified"
+        assert conn.execute(
+            "SELECT tracking_signed_at_source FROM shipments WHERE id = ?", (direct_signed_id,)
+        ).fetchone()[0] == "provider_verified"
+
     assert_raises(
         lambda: db.update_shipment(
             manual_id,

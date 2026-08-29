@@ -1290,8 +1290,9 @@ class Database:
             END;
 
             CREATE TRIGGER IF NOT EXISTS shipments_time_integrity_update
-            BEFORE UPDATE OF status, shipped_at, shipped_at_quality,
-                tracking_signed_at, tracking_signed_at_quality ON shipments
+            BEFORE UPDATE OF status, created_at, shipped_at, shipped_at_quality,
+                shipped_at_source, tracking_signed_at, tracking_signed_at_quality,
+                tracking_signed_at_source ON shipments
             WHEN (
                 NEW.status IN ('已发货', '已签收') AND (
                     julianday(NEW.created_at) IS NULL
