@@ -68,6 +68,7 @@ SHIPPING_TRANSIENT_RETRIES = bounded_env_int("SCENTPOOL_SHIPPING_TRANSIENT_RETRI
 BATCH_PRINT_PARENT_RSS_LIMIT_MB = bounded_env_int("SCENTPOOL_BATCH_PRINT_PARENT_RSS_MB", 240, 128, 384)
 TASK_ALERT_REFRESH_SECONDS = 60
 DAILY_AUDIT_PATH = "/api/admin/system/daily-audit"
+AUDIT_DIAGNOSTICS_PATH = "/api/admin/system/audit-diagnostics"
 MAX_AUDIT_QUERY_LENGTH = 64
 MAX_AUDIT_AUTHORIZATION_LENGTH = 512
 TRACKING_SYNC_LOCK = threading.Lock()
@@ -76,6 +77,22 @@ LABEL_BATCH_PRINT_LOCK = threading.Lock()
 SHIPPING_QUEUE_EVENT = threading.Event()
 SHIPPING_IDLE_DELAYS_SECONDS = (2, 5, 15, 60)
 TRACKING_INCIDENT_KEY = "tracking:kuaidi100"
+
+
+def log_audit_print_event(kind: str, outcome: str, started_at: float) -> None:
+    """Emit fixed, aggregate-only timing evidence for the read-only audit probe."""
+    if kind not in {"batch_print", "merge"} or outcome not in {"success", "failure"}:
+        return
+    duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
+    slow = 1 if duration_ms >= SLOW_REQUEST_MILLISECONDS else 0
+    try:
+        print(
+            f"[audit-print] kind={kind} outcome={outcome} "
+            f"duration_ms={duration_ms} slow={slow}",
+            flush=True,
+        )
+    except (OSError, ValueError):
+        pass
 
 
 def json_bytes(data: Any) -> bytes:
@@ -987,6 +1004,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(report)
             return
 
+        if path == AUDIT_DIAGNOSTICS_PATH:
+            self.require_audit_token()
+            if self.command != "GET":
+                self.send_json({"error": "该接口仅支持 GET 请求。"}, status=405, headers={"Allow": "GET"})
+                return
+            if urlparse(self.path).query:
+                raise AppError("该接口不接受查询参数。")
+            self.send_json(
+                {
+                    "sampled_at": now_text(),
+                    "storage": {"connections": DB.connection_diagnostics()},
+                }
+            )
+            return
+
         user = self.require_user()
 
         if path == "/api/me" and self.command == "GET":
@@ -1295,29 +1327,41 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/admin/labels/batch-print" and self.command == "POST":
             self.require_admin(user)
-            body = self.read_json()
-            shipment_ids = body.get("shipment_ids") if isinstance(body.get("shipment_ids"), list) else []
-            if len(shipment_ids) > MAX_BATCH_PRINT_ORDERS:
-                raise AppError(f"单次最多合并 {MAX_BATCH_PRINT_ORDERS} 张面单，请分批打印。", 413)
-            if not LABEL_BATCH_PRINT_LOCK.acquire(blocking=False):
-                raise AppError(
-                    "已有一批面单正在生成，请等待当前下载完成后再试。订单状态没有改变。",
-                    409,
-                )
+            request_started = time.perf_counter()
             try:
-                ensure_batch_print_memory_available()
-                shipments = DB.batch_print_shipments(shipment_ids)
-                with tempfile.TemporaryDirectory(prefix="scentpool-label-merge-") as directory:
-                    payload_path = build_batch_label_pdf_file(shipments, Path(directory))
-                    filename = f"面单_{local_now().strftime('%Y-%m-%d_%H%M')}_{len(shipments)}单.pdf"
-                    self.send_file(
-                        payload_path,
-                        "application/pdf",
-                        inline_header(filename, "scentpool-labels.pdf"),
+                body = self.read_json()
+                shipment_ids = body.get("shipment_ids") if isinstance(body.get("shipment_ids"), list) else []
+                if len(shipment_ids) > MAX_BATCH_PRINT_ORDERS:
+                    raise AppError(f"单次最多合并 {MAX_BATCH_PRINT_ORDERS} 张面单，请分批打印。", 413)
+                if not LABEL_BATCH_PRINT_LOCK.acquire(blocking=False):
+                    raise AppError(
+                        "已有一批面单正在生成，请等待当前下载完成后再试。订单状态没有改变。",
+                        409,
                     )
-                    DB.mark_labels_printed([int(row["id"]) for row in shipments])
-            finally:
-                LABEL_BATCH_PRINT_LOCK.release()
+                try:
+                    ensure_batch_print_memory_available()
+                    shipments = DB.batch_print_shipments(shipment_ids)
+                    with tempfile.TemporaryDirectory(prefix="scentpool-label-merge-") as directory:
+                        merge_started = time.perf_counter()
+                        try:
+                            payload_path = build_batch_label_pdf_file(shipments, Path(directory))
+                        except Exception:
+                            log_audit_print_event("merge", "failure", merge_started)
+                            raise
+                        log_audit_print_event("merge", "success", merge_started)
+                        filename = f"面单_{local_now().strftime('%Y-%m-%d_%H%M')}_{len(shipments)}单.pdf"
+                        self.send_file(
+                            payload_path,
+                            "application/pdf",
+                            inline_header(filename, "scentpool-labels.pdf"),
+                        )
+                        DB.mark_labels_printed([int(row["id"]) for row in shipments])
+                finally:
+                    LABEL_BATCH_PRINT_LOCK.release()
+            except Exception:
+                log_audit_print_event("batch_print", "failure", request_started)
+                raise
+            log_audit_print_event("batch_print", "success", request_started)
             return
 
         if path.startswith("/api/shipments/") and path.endswith("/items") and self.command == "PATCH":

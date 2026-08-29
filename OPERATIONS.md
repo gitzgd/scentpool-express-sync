@@ -117,6 +117,10 @@
 - 日志正文只在内存中匹配 OOM、5xx、异常栈、`database is locked`、timeout 和 `[slow-request]`；输出只保留聚合计数。Render 日志使用时间游标分页，部署/事件使用资源游标分页；游标缺失、没有前进或超过安全页数时必须明确标为结构变化/不完整。
 - 每个通道必须返回明确状态：`ok`、`no_data`、`http_error`、`permission_denied`、`schema_changed`、`process_error`、`network_restricted` 或 `target_mismatch`。即使凭据读取或进程失败，也必须先输出一份有效脱敏 JSON，再以非零状态结束。
 - Render 工作区套餐可能不提供 HTTP 请求日志或响应延迟指标；应保留对应 `no_data`/HTTP 错误状态，不能把缺少该通道写成“0 次 5xx”或“延迟正常”。5xx 优先使用按状态码聚合的 HTTP 请求指标，日志计数只标为 request-log 证据。
+- 连接证据使用独立 `GET /api/admin/system/audit-diagnostics`，仍由日报 Bearer 令牌鉴权，但不授予普通管理员接口权限。固定采集器必须间隔至少 30 秒采样两次；逐次检查 `opened_total - closed_total == active`，再判断 `active` 是否回落、`peak_active` 是否单调及是否超过固定生产基线 9。任一次失败、超时或计数重置都必须标为不完整，不得沿用前一天结论。
+- 批量打印和合并仅从全串匹配的 `[audit-print]` 固定事件或兼容的 Render request 标签提取时间、固定类别、结果、耗时和慢请求标志。任何附加自由文本都会使固定事件匹配失败；输出不得含日志正文、订单/单号、人员信息、地址或 URL。
+- 打印风险相关性窗口固定为内存突升或异常重启前后各 10 分钟，并为上海自然日日界线额外读取前后 10 分钟。相关只代表时间接近，不证明因果；无打印、无风险信号、未知内存单位或时间缺失必须保留 `no_data`/`schema_changed` 与完整性字段。
+- HTTP latency 依 Render 官方接口使用可重复浮点 `quantile`，固定采集 p50/p90/p99。优先一次提交多个 `quantile`；仅当该请求返回 HTTP 400 时逐个分位降级。允许官方时间序列数组及受控的 `data`/`series` 包装；其他结构返回 `schema_changed`。某些单分位失败时保留已成功分位并标记部分覆盖，不把缺失值填成 0，也不把 400 猜成特定分位非法。
 
 ## 发布验收
 

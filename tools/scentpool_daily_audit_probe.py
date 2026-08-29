@@ -19,7 +19,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
 
@@ -33,6 +33,11 @@ AUDIT_KEYCHAIN_SERVICE = "scentpool-audit-token"
 RENDER_KEYCHAIN_SERVICE = "scentpool-render-api"
 MAX_CURSOR_PAGES = 50
 MAX_LOG_PAGES = 200
+CONNECTION_SAMPLE_INTERVAL_SECONDS = 30
+EXPECTED_CONNECTION_PEAK_UPPER_BOUND = 9
+CORRELATION_WINDOW_MINUTES = 10
+LATENCY_QUANTILES = (0.5, 0.9, 0.99)
+AUDIT_DIAGNOSTICS_PATH = "/api/admin/system/audit-diagnostics"
 
 RENDER_QUERY_WHITELIST = {
     f"/services/{RENDER_SERVICE_ID}": set(),
@@ -58,6 +63,13 @@ LOG_PATTERNS = {
     "timeout": re.compile(r"(?:timed out|timeout)", re.I),
     "slow_request": re.compile(r"\[slow-request\]", re.I),
 }
+AUDIT_PRINT_PATTERN = re.compile(
+    r"^\[audit-print\] kind=(batch_print|merge) outcome=(success|failure) "
+    r"duration_ms=([0-9]+) slow=([01])$"
+)
+LEGACY_MERGE_PATTERN = re.compile(
+    r"^\[labels\] merged orders=[0-9]+ pages=[0-9]+ source_bytes=[0-9]+ output_bytes=[0-9]+$"
+)
 SAFE_EVENT_TYPES = {
     "build_started", "build_ended", "deploy_started", "deploy_ended", "server_available",
     "server_failed", "server_hardware_failure", "server_restarted", "service_resumed",
@@ -98,6 +110,18 @@ def day_window(date_text: str) -> tuple[str, str]:
     return (
         start.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         end.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    )
+
+
+def expanded_window(start_time: str, end_time: str, minutes: int) -> tuple[str, str]:
+    start = parsed_timestamp(start_time)
+    end = parsed_timestamp(end_time)
+    if start is None or end is None:
+        raise ValueError("window timestamps must be timezone-aware")
+    delta = timedelta(minutes=minutes)
+    return (
+        (start - delta).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        (end + delta).isoformat(timespec="seconds").replace("+00:00", "Z"),
     )
 
 
@@ -142,6 +166,8 @@ def validate_get_url(url: str) -> None:
         raise ValueError("collector only permits HTTPS GET requests")
     if parsed.netloc == urllib.parse.urlparse(BASE_URL).netloc:
         if parsed.path == "/api/health" and not parsed.query:
+            return
+        if parsed.path == AUDIT_DIAGNOSTICS_PATH and not parsed.query:
             return
         if parsed.path == "/api/admin/system/daily-audit":
             params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
@@ -267,6 +293,10 @@ def audit_payload_is_private(value: Any) -> bool:
 
 
 def label_map(labels: Any) -> Optional[Dict[str, str]]:
+    if isinstance(labels, dict):
+        if not all(isinstance(key, str) and isinstance(value, str) for key, value in labels.items()):
+            return None
+        return dict(labels)
     if not isinstance(labels, list):
         return None
     result: Dict[str, str] = {}
@@ -281,12 +311,29 @@ def label_map(labels: Any) -> Optional[Dict[str, str]]:
     return result
 
 
+def metric_series_payload(payload: Any) -> Optional[list[Any]]:
+    """Accept the documented array plus bounded wrapper variants seen across metric APIs."""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return None
+    direct = payload.get("data")
+    if isinstance(direct, list):
+        return direct
+    direct = payload.get("series")
+    if isinstance(direct, list):
+        return direct
+    if isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("series"), list):
+        return payload["data"]["series"]
+    return None
+
+
 def metric_summary(result: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
     if result.get("status") != "ok":
         return without_data(result)
-    series = result.get("data")
-    if not isinstance(series, list):
-        return schema_error(result, "指标响应不再是时间序列数组。")
+    series = metric_series_payload(result.get("data"))
+    if series is None:
+        return schema_error(result, "指标响应不再是支持的时间序列结构。")
     normalized: list[Dict[str, Any]] = []
     for item in series:
         if not isinstance(item, dict) or label_map(item.get("labels")) is None:
@@ -354,6 +401,82 @@ def metric_summary(result: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
     }
 
 
+def collect_http_latency(
+    client: JsonClient,
+    *,
+    metric_params: Dict[str, Any],
+    headers: Dict[str, str],
+) -> Dict[str, Any]:
+    """Prefer the documented multi-quantile query and degrade to isolated quantiles on 400."""
+    multi_params = {**metric_params, "quantile": list(LATENCY_QUANTILES)}
+    multi_raw = client.fetch(render_url("/metrics/http-latency", multi_params), headers)
+    multi = metric_summary(multi_raw, mode="series")
+    if multi.get("status") != "http_error" or multi.get("http_status") != 400:
+        return {**multi, "query_mode": "multi_quantile"}
+
+    successful: list[Dict[str, Any]] = []
+    failures: list[Dict[str, Any]] = []
+    no_data_quantiles: list[float] = []
+    for quantile in LATENCY_QUANTILES:
+        raw = client.fetch(
+            render_url("/metrics/http-latency", {**metric_params, "quantile": quantile}),
+            headers,
+        )
+        summary = metric_summary(raw, mode="series")
+        status = str(summary.get("status") or "process_error")
+        if status == "ok":
+            for series in summary.get("series", []):
+                normalized = dict(series)
+                labels = dict(normalized.get("labels") or {})
+                labels.setdefault("quantile", str(quantile))
+                normalized["labels"] = labels
+                successful.append(normalized)
+        elif status == "no_data":
+            no_data_quantiles.append(quantile)
+        else:
+            failures.append(
+                {
+                    "quantile": quantile,
+                    "status": status,
+                    **({"http_status": summary["http_status"]} if "http_status" in summary else {}),
+                }
+            )
+
+    if successful:
+        return status_result(
+            "ok",
+            message="延迟指标已使用单分位受控降级采集。",
+            query_mode="single_quantile_fallback",
+            coverage="complete" if not failures and not no_data_quantiles else "partial",
+            series=successful,
+            no_data_quantiles=no_data_quantiles,
+            failed_quantiles=failures,
+        )
+    if no_data_quantiles and not failures:
+        return status_result(
+            "no_data",
+            message="延迟指标接口可用，但所选时间段或当前套餐没有数据。",
+            query_mode="single_quantile_fallback",
+            no_data_quantiles=no_data_quantiles,
+        )
+    if failures and all(item["status"] == "schema_changed" for item in failures):
+        return status_result(
+            "schema_changed",
+            message="延迟指标的多分位与单分位响应结构均无法识别。",
+            query_mode="single_quantile_fallback",
+            failed_quantiles=failures,
+        )
+    representative = failures[0] if failures else {"status": "http_error", "http_status": 400}
+    return status_result(
+        str(representative["status"]),
+        message="延迟指标的多分位与单分位请求均不可用。",
+        query_mode="single_quantile_fallback",
+        **({"http_status": representative["http_status"]} if "http_status" in representative else {}),
+        failed_quantiles=failures,
+        no_data_quantiles=no_data_quantiles,
+    )
+
+
 def collect_cursor_pages(
     client: JsonClient,
     path: str,
@@ -390,6 +513,297 @@ def collect_cursor_pages(
     ), rows, False
 
 
+def parsed_timestamp(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def safe_timestamp(value: Any) -> Optional[str]:
+    parsed = parsed_timestamp(value)
+    return parsed.isoformat(timespec="seconds").replace("+00:00", "Z") if parsed else None
+
+
+def fixed_print_request_path(labels: Dict[str, str]) -> bool:
+    for key in ("path", "requestPath", "route"):
+        value = labels.get(key)
+        if isinstance(value, str) and len(value) <= 512:
+            parsed = urllib.parse.urlparse(value)
+            if parsed.path == "/api/admin/labels/batch-print":
+                return True
+    return False
+
+
+def print_event_from_log(message: str, labels: Dict[str, str], timestamp: Any) -> tuple[Optional[Dict[str, Any]], bool]:
+    match = AUDIT_PRINT_PATTERN.fullmatch(message)
+    candidate: Optional[Dict[str, Any]] = None
+    if match:
+        duration_ms = int(match.group(3))
+        if duration_ms <= 24 * 60 * 60 * 1000:
+            candidate = {
+                "kind": match.group(1),
+                "outcome": match.group(2),
+                "duration_ms": duration_ms,
+                "slow": match.group(4) == "1",
+                "source": "structured_app_log",
+            }
+    elif LEGACY_MERGE_PATTERN.fullmatch(message):
+        candidate = {
+            "kind": "merge",
+            "outcome": "success",
+            "duration_ms": None,
+            "slow": None,
+            "source": "legacy_merge_log",
+        }
+    elif labels.get("type") == "request" and fixed_print_request_path(labels):
+        status_code = str(labels.get("statusCode") or "")
+        outcome = "unknown"
+        if re.fullmatch(r"[1-5][0-9]{2}", status_code):
+            outcome = "success" if int(status_code) < 400 else "failure"
+        duration_ms: Optional[int] = None
+        for key in ("durationMs", "responseTimeMs", "responseTime"):
+            raw = str(labels.get(key) or "")
+            if re.fullmatch(r"[0-9]{1,8}(?:\.[0-9]{1,3})?", raw):
+                duration_ms = round(float(raw))
+                break
+        candidate = {
+            "kind": "batch_print",
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "slow": duration_ms >= 1000 if duration_ms is not None else None,
+            "source": "render_request_log",
+        }
+    if candidate is None:
+        return None, False
+    normalized_timestamp = safe_timestamp(timestamp)
+    if normalized_timestamp is None:
+        return None, True
+    candidate["timestamp"] = normalized_timestamp
+    return candidate, False
+
+
+def summarize_print_events(events: list[Dict[str, Any]], missing_timestamps: int) -> Dict[str, Any]:
+    structured_requests = [
+        event for event in events
+        if event["kind"] == "batch_print" and event["source"] == "structured_app_log"
+    ]
+    request_events = structured_requests or [
+        event for event in events
+        if event["kind"] == "batch_print" and event["source"] == "render_request_log"
+    ]
+    structured_merges = [
+        event for event in events
+        if event["kind"] == "merge" and event["source"] == "structured_app_log"
+    ]
+    merge_events = structured_merges or [event for event in events if event["kind"] == "merge"]
+    selected = sorted(request_events + merge_events, key=lambda item: item["timestamp"])
+    counts = {
+        "requests": len(request_events),
+        "merges": len(merge_events),
+        "success": sum(event["outcome"] == "success" for event in selected),
+        "failure": sum(event["outcome"] == "failure" for event in selected),
+        "unknown_outcome": sum(event["outcome"] == "unknown" for event in selected),
+        "slow": sum(event["slow"] is True for event in selected),
+    }
+    if not selected and not missing_timestamps:
+        return status_result(
+            "no_data",
+            message="目标时间段没有批量打印或合并时间证据。",
+            evidence_complete=True,
+            missing_timestamps=0,
+            counts=counts,
+            events=[],
+        )
+    return status_result(
+        "ok" if selected else "schema_changed",
+        message=(
+            "已生成脱敏的批量打印与合并时间证据。"
+            if selected
+            else "发现打印证据但时间字段无法识别。"
+        ),
+        evidence_complete=missing_timestamps == 0,
+        missing_timestamps=missing_timestamps,
+        counts=counts,
+        events=selected,
+    )
+
+
+def merge_print_activities(activities: list[Dict[str, Any]]) -> Dict[str, Any]:
+    events: list[Dict[str, Any]] = []
+    missing_timestamps = 0
+    source_statuses: list[str] = []
+    evidence_complete = True
+    for activity in activities:
+        source_statuses.append(str(activity.get("status") or "schema_changed"))
+        if isinstance(activity.get("events"), list):
+            events.extend(event for event in activity["events"] if isinstance(event, dict))
+        missing_timestamps += int(activity.get("missing_timestamps") or 0)
+        evidence_complete = evidence_complete and bool(activity.get("evidence_complete", False))
+    deduplicated: list[Dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for event in events:
+        identity = (
+            event.get("timestamp"), event.get("kind"), event.get("outcome"),
+            event.get("duration_ms"), event.get("source"),
+        )
+        if identity not in seen:
+            seen.add(identity)
+            deduplicated.append(event)
+    merged = summarize_print_events(deduplicated, missing_timestamps)
+    merged["evidence_complete"] = evidence_complete and missing_timestamps == 0
+    merged["source_window_statuses"] = source_statuses
+    return merged
+
+
+def unit_multiplier(unit: str) -> Optional[float]:
+    normalized = unit.strip().lower()
+    return {
+        "b": 1.0,
+        "byte": 1.0,
+        "bytes": 1.0,
+        "kb": 1000.0,
+        "kib": 1024.0,
+        "mb": 1000.0 * 1000.0,
+        "mib": 1024.0 * 1024.0,
+        "gb": 1000.0 * 1000.0 * 1000.0,
+        "gib": 1024.0 * 1024.0 * 1024.0,
+    }.get(normalized)
+
+
+def memory_spike_evidence(result: Dict[str, Any]) -> Dict[str, Any]:
+    if result.get("status") != "ok":
+        return without_data(result)
+    series = metric_series_payload(result.get("data"))
+    if series is None:
+        return schema_error(result, "内存相关性指标结构无法识别。")
+    spike_times: list[str] = []
+    usable_series = 0
+    for item in series:
+        if not isinstance(item, dict) or not isinstance(item.get("values"), list):
+            return schema_error(result, "内存相关性数据点结构发生变化。")
+        multiplier = unit_multiplier(str(item.get("unit") or ""))
+        if multiplier is None:
+            continue
+        points: list[tuple[datetime, float]] = []
+        for point in item["values"]:
+            if not isinstance(point, dict) or not isinstance(point.get("value"), (int, float)):
+                return schema_error(result, "内存相关性数据点不是数值。")
+            timestamp = parsed_timestamp(point.get("timestamp"))
+            if timestamp is None:
+                return schema_error(result, "内存相关性数据点时间无法识别。")
+            points.append((timestamp, float(point["value"]) * multiplier))
+        points.sort(key=lambda item: item[0])
+        if points:
+            usable_series += 1
+        for previous, current in zip(points, points[1:]):
+            delta = current[1] - previous[1]
+            threshold = max(64 * 1024 * 1024, max(previous[1], 1.0) * 0.25)
+            if delta >= threshold:
+                spike_times.append(current[0].isoformat(timespec="seconds").replace("+00:00", "Z"))
+    if not usable_series:
+        return status_result(
+            "no_data",
+            message="内存指标没有可用于突升判定的数据或可识别单位。",
+            timestamps=[],
+        )
+    return status_result(
+        "ok" if spike_times else "no_data",
+        message=("已识别内存突升时间。" if spike_times else "目标时间段未识别到内存突升。"),
+        timestamps=sorted(set(spike_times)),
+    )
+
+
+def abnormal_restart_timestamps(event_rows: list[Dict[str, Any]]) -> tuple[list[str], int]:
+    timestamps: list[str] = []
+    missing = 0
+    for row in event_rows:
+        if str(row.get("type") or "") not in {
+            "server_failed", "server_hardware_failure", "server_restarted"
+        }:
+            continue
+        timestamp = safe_timestamp(row.get("timestamp", row.get("createdAt")))
+        if timestamp is None:
+            missing += 1
+        else:
+            timestamps.append(timestamp)
+    return sorted(set(timestamps)), missing
+
+
+def correlate_print_activity(
+    print_activity: Dict[str, Any],
+    memory_result: Dict[str, Any],
+    event_rows: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    memory_spikes = memory_spike_evidence(memory_result)
+    restart_times, missing_restart_times = abnormal_restart_timestamps(event_rows)
+    print_events = print_activity.get("events") if isinstance(print_activity, dict) else None
+    if not isinstance(print_events, list):
+        print_events = []
+    signals = [
+        *(('memory_spike', timestamp) for timestamp in memory_spikes.get("timestamps", [])),
+        *(('abnormal_restart', timestamp) for timestamp in restart_times),
+    ]
+    windows: list[Dict[str, Any]] = []
+    for signal, timestamp in sorted(signals, key=lambda item: item[1]):
+        signal_time = parsed_timestamp(timestamp)
+        if signal_time is None:
+            continue
+        nearby = []
+        for event in print_events:
+            event_time = parsed_timestamp(event.get("timestamp")) if isinstance(event, dict) else None
+            if event_time is not None and abs((event_time - signal_time).total_seconds()) <= CORRELATION_WINDOW_MINUTES * 60:
+                nearby.append(
+                    {
+                        "timestamp": event["timestamp"],
+                        "kind": event["kind"],
+                        "outcome": event["outcome"],
+                        "slow": event["slow"],
+                    }
+                )
+        windows.append(
+            {
+                "signal": signal,
+                "timestamp": timestamp,
+                "print_event_count": len(nearby),
+                "print_events": nearby,
+            }
+        )
+    memory_evidence_complete = memory_spikes.get("status") in {"ok", "no_data"}
+    evidence_complete = (
+        bool(print_activity.get("evidence_complete", False))
+        and not missing_restart_times
+        and memory_evidence_complete
+    )
+    if print_activity.get("status") == "schema_changed" or memory_spikes.get("status") == "schema_changed":
+        status = "schema_changed"
+        message = "打印、内存或重启的时间证据结构不完整，不能完成相关性判定。"
+    elif not print_events or not signals:
+        status = "no_data"
+        message = "打印事件或风险信号不足，未形成可判定的时间窗口相关性。"
+    else:
+        status = "ok"
+        message = "已完成打印事件与内存突升/异常重启的时间窗口相关性判定。"
+    return status_result(
+        status,
+        message=message,
+        window_minutes=CORRELATION_WINDOW_MINUTES,
+        evidence_complete=evidence_complete,
+        memory_spike_status=memory_spikes.get("status"),
+        memory_evidence_complete=memory_evidence_complete,
+        memory_spike_count=len(memory_spikes.get("timestamps", [])),
+        abnormal_restart_count=len(restart_times),
+        missing_restart_timestamps=missing_restart_times,
+        correlated_window_count=sum(window["print_event_count"] > 0 for window in windows),
+        windows=windows,
+    )
+
+
 def collect_logs(
     client: JsonClient,
     *,
@@ -410,6 +824,8 @@ def collect_logs(
     request_logs = 0
     http_5xx = 0
     total_logs = 0
+    print_events: list[Dict[str, Any]] = []
+    missing_print_timestamps = 0
     last_result: Dict[str, Any] = {}
     for page_number in range(MAX_LOG_PAGES):
         last_result = client.fetch(render_url("/logs", params), headers)
@@ -433,6 +849,13 @@ def collect_logs(
                 request_logs += 1
                 if str(labels.get("statusCode") or "").startswith("5"):
                     http_5xx += 1
+            print_event, missing_timestamp = print_event_from_log(
+                message, labels, entry.get("timestamp")
+            )
+            if print_event is not None:
+                print_events.append(print_event)
+            if missing_timestamp:
+                missing_print_timestamps += 1
         if not payload.get("hasMore"):
             if total_logs == 0:
                 return no_data(
@@ -443,6 +866,7 @@ def collect_logs(
                     request_logs=0,
                     http_5xx_request_logs=0,
                     pagination_complete=True,
+                    print_activity=summarize_print_events([], 0),
                 )
             return {
                 **without_data(last_result),
@@ -451,6 +875,9 @@ def collect_logs(
                 "request_logs": request_logs,
                 "http_5xx_request_logs": http_5xx,
                 "pagination_complete": True,
+                "print_activity": summarize_print_events(
+                    print_events, missing_print_timestamps
+                ),
             }
         next_start = payload.get("nextStartTime")
         next_end = payload.get("nextEndTime")
@@ -468,6 +895,7 @@ def collect_logs(
         request_logs=request_logs,
         http_5xx_request_logs=http_5xx,
         pagination_complete=False,
+        print_activity=summarize_print_events(print_events, missing_print_timestamps),
         page_limit=MAX_LOG_PAGES,
     )
 
@@ -493,22 +921,139 @@ def app_summary(result: Dict[str, Any], *, daily: bool = False) -> Dict[str, Any
     return {**without_data(result), "result": {key: data.get(key) for key in allowed}}
 
 
+def connection_sample(result: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    if result.get("status") != "ok":
+        return None, without_data(result)
+    data = result.get("data")
+    if not isinstance(data, dict) or audit_payload_is_private(data):
+        return None, schema_error(result, "连接诊断响应包含不允许字段或结构发生变化。")
+    sampled_at = data.get("sampled_at")
+    storage = data.get("storage")
+    connections = storage.get("connections") if isinstance(storage, dict) else None
+    expected = {"opened_total", "closed_total", "active", "peak_active"}
+    if (
+        not isinstance(sampled_at, str)
+        or not isinstance(connections, dict)
+        or set(connections) != expected
+        or not all(isinstance(connections[key], int) and connections[key] >= 0 for key in expected)
+    ):
+        return None, schema_error(result, "连接诊断响应缺少固定计数或时间字段。")
+    try:
+        datetime.fromisoformat(sampled_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None, schema_error(result, "连接诊断采样时间无法识别。")
+    sample = {"sampled_at": sampled_at, **{key: int(connections[key]) for key in sorted(expected)}}
+    sample["conserved"] = sample["opened_total"] - sample["closed_total"] == sample["active"]
+    return sample, without_data(result)
+
+
+def collect_connection_samples(
+    client: JsonClient,
+    *,
+    headers: Dict[str, str],
+    interval_seconds: int = CONNECTION_SAMPLE_INTERVAL_SECONDS,
+    sleeper: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> Dict[str, Any]:
+    interval_seconds = max(CONNECTION_SAMPLE_INTERVAL_SECONDS, int(interval_seconds))
+    samples: list[Dict[str, Any]] = []
+    attempts: list[Dict[str, Any]] = []
+    first_started = monotonic()
+    first, first_status = connection_sample(
+        client.fetch(f"{BASE_URL}{AUDIT_DIAGNOSTICS_PATH}", headers)
+    )
+    attempts.append(first_status)
+    if first is not None:
+        samples.append(first)
+    sleeper(interval_seconds)
+    second_started = monotonic()
+    second, second_status = connection_sample(
+        client.fetch(f"{BASE_URL}{AUDIT_DIAGNOSTICS_PATH}", headers)
+    )
+    attempts.append(second_status)
+    if second is not None:
+        samples.append(second)
+    measured_interval = max(0.0, second_started - first_started)
+    interval_met = measured_interval >= CONNECTION_SAMPLE_INTERVAL_SECONDS
+
+    if len(samples) != 2 or not interval_met:
+        failure = next((attempt for attempt in attempts if attempt.get("status") != "ok"), None)
+        status = str((failure or {}).get("status") or "schema_changed")
+        return status_result(
+            status,
+            message="连接双采样证据不完整，未据此判定连接回落。",
+            completeness="partial" if samples else "unavailable",
+            sample_count=len(samples),
+            required_interval_seconds=CONNECTION_SAMPLE_INTERVAL_SECONDS,
+            measured_interval_seconds=round(measured_interval, 3),
+            interval_requirement_met=interval_met,
+            samples=samples,
+            attempts=attempts,
+        )
+
+    first_sample, second_sample = samples
+    counter_reset = any(
+        second_sample[key] < first_sample[key]
+        for key in ("opened_total", "closed_total", "peak_active")
+    )
+    peak_change = second_sample["peak_active"] - first_sample["peak_active"]
+    peak_abnormal = (
+        counter_reset
+        or max(first_sample["peak_active"], second_sample["peak_active"])
+        > EXPECTED_CONNECTION_PEAK_UPPER_BOUND
+    )
+    return status_result(
+        "ok",
+        message="连接诊断已完成至少 30 秒间隔的双采样。",
+        completeness="complete",
+        sample_count=2,
+        required_interval_seconds=CONNECTION_SAMPLE_INTERVAL_SECONDS,
+        measured_interval_seconds=round(measured_interval, 3),
+        interval_requirement_met=True,
+        samples=samples,
+        all_samples_conserved=all(bool(sample["conserved"]) for sample in samples),
+        active_recovered=(
+            None if counter_reset else second_sample["active"] <= first_sample["active"]
+        ),
+        active_change=(
+            None if counter_reset else second_sample["active"] - first_sample["active"]
+        ),
+        counter_reset_between_samples=counter_reset,
+        peak_active_change=peak_change,
+        peak_active_abnormal=peak_abnormal,
+        expected_peak_active_upper_bound=EXPECTED_CONNECTION_PEAK_UPPER_BOUND,
+    )
+
+
 def collect_report(
     date_text: str,
     *,
     audit_token: str,
     render_token: str,
     client: Optional[JsonClient] = None,
+    connection_interval_seconds: int = CONNECTION_SAMPLE_INTERVAL_SECONDS,
+    sleeper: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> Dict[str, Any]:
     requested_date([date_text])
     http = client or JsonClient()
     start_time, end_time = day_window(date_text)
+    correlation_start_time, correlation_end_time = expanded_window(
+        start_time, end_time, CORRELATION_WINDOW_MINUTES
+    )
     audit_headers = {"Authorization": f"Bearer {audit_token}"}
     render_headers = {"Authorization": f"Bearer {render_token}"}
 
     health = app_summary(http.fetch(f"{BASE_URL}/api/health"))
     daily_url = f"{BASE_URL}/api/admin/system/daily-audit?{urllib.parse.urlencode({'date': date_text})}"
     daily = app_summary(http.fetch(daily_url, audit_headers), daily=True)
+    connection_diagnostics = collect_connection_samples(
+        http,
+        headers=audit_headers,
+        interval_seconds=connection_interval_seconds,
+        sleeper=sleeper,
+        monotonic=monotonic,
+    )
     service_fetch = http.fetch(render_url(f"/services/{RENDER_SERVICE_ID}"), render_headers)
     service_data = service_fetch.get("data") if service_fetch.get("status") == "ok" else None
     if not isinstance(service_data, dict):
@@ -602,6 +1147,20 @@ def collect_report(
         else:
             events = event_status
 
+        correlation_event_status, correlation_event_rows, _correlation_event_complete = collect_cursor_pages(
+            http,
+            f"/services/{RENDER_SERVICE_ID}/events",
+            {
+                "limit": 100,
+                "startTime": correlation_start_time,
+                "endTime": correlation_end_time,
+            },
+            wrapper_key="event",
+            headers=render_headers,
+        )
+        if correlation_event_status.get("status") != "ok":
+            correlation_event_rows = event_rows
+
         logs = collect_logs(
             http,
             owner_id=owner_id,
@@ -609,14 +1168,47 @@ def collect_report(
             end_time=end_time,
             headers=render_headers,
         )
+        boundary_print_activities: list[Dict[str, Any]] = []
+        for boundary_start, boundary_end in (
+            (correlation_start_time, start_time),
+            (end_time, correlation_end_time),
+        ):
+            boundary_logs = collect_logs(
+                http,
+                owner_id=owner_id,
+                start_time=boundary_start,
+                end_time=boundary_end,
+                headers=render_headers,
+            )
+            boundary_print_activities.append(
+                boundary_logs.get("print_activity")
+                if isinstance(boundary_logs.get("print_activity"), dict)
+                else status_result(
+                    str(boundary_logs.get("status") or "schema_changed"),
+                    message="跨日边界日志不可用。",
+                    evidence_complete=False,
+                    missing_timestamps=0,
+                    events=[],
+                )
+            )
         metric_params: Dict[str, Any] = {
             "startTime": start_time,
             "endTime": end_time,
             "resolutionSeconds": 300,
             "resource": RENDER_SERVICE_ID,
         }
-        memory = metric_summary(
-            http.fetch(render_url("/metrics/memory", metric_params), render_headers), mode="resource"
+        memory_raw = http.fetch(render_url("/metrics/memory", metric_params), render_headers)
+        memory = metric_summary(memory_raw, mode="resource")
+        correlation_memory_raw = http.fetch(
+            render_url(
+                "/metrics/memory",
+                {
+                    **metric_params,
+                    "startTime": correlation_start_time,
+                    "endTime": correlation_end_time,
+                },
+            ),
+            render_headers,
         )
         memory_limit = metric_summary(
             http.fetch(render_url("/metrics/memory-limit", metric_params), render_headers), mode="resource"
@@ -631,9 +1223,31 @@ def collect_report(
         http_requests = metric_summary(
             http.fetch(render_url("/metrics/http-requests", request_params), render_headers), mode="requests"
         )
-        latency_params = {**metric_params, "quantile": [0.5, 0.9, 0.99]}
-        http_latency = metric_summary(
-            http.fetch(render_url("/metrics/http-latency", latency_params), render_headers), mode="series"
+        http_latency = collect_http_latency(
+            http,
+            metric_params=metric_params,
+            headers=render_headers,
+        )
+        primary_print_activity = logs.get("print_activity") if isinstance(logs.get("print_activity"), dict) else status_result(
+            str(logs.get("status") or "schema_changed"),
+            message="日志通道不可用，无法提取打印时间证据。",
+            evidence_complete=False,
+            missing_timestamps=0,
+            events=[],
+        )
+        print_activity = merge_print_activities(
+            [primary_print_activity, *boundary_print_activities]
+        )
+        logs["print_activity"] = print_activity
+        print_correlation = correlate_print_activity(
+            print_activity, correlation_memory_raw, correlation_event_rows
+        )
+        print_correlation["expanded_window_start"] = correlation_start_time
+        print_correlation["expanded_window_end"] = correlation_end_time
+        print_correlation["event_window_status"] = correlation_event_status.get("status")
+        print_correlation["evidence_complete"] = bool(
+            print_correlation.get("evidence_complete")
+            and correlation_event_status.get("status") == "ok"
         )
     else:
         blocked = status_result(
@@ -648,10 +1262,11 @@ def collect_report(
         disk_capacity = dict(blocked)
         http_requests = dict(blocked)
         http_latency = dict(blocked)
+        print_correlation = dict(blocked)
 
     sections = [
-        health, daily, render_service, deploys, events, logs, memory, memory_limit,
-        disk_usage, disk_capacity, http_requests, http_latency,
+        health, daily, connection_diagnostics, render_service, deploys, events, logs, memory, memory_limit,
+        disk_usage, disk_capacity, http_requests, http_latency, print_correlation,
     ]
     hard_failures = {"http_error", "permission_denied", "schema_changed", "process_error", "network_restricted", "target_mismatch"}
     if any(section.get("status") in hard_failures for section in sections):
@@ -667,10 +1282,12 @@ def collect_report(
         "overall_status": overall_status,
         "health": health,
         "daily_audit": daily,
+        "connection_diagnostics": connection_diagnostics,
         "render_service": render_service,
         "render_deploys": deploys,
         "render_events": events,
         "render_logs": logs,
+        "print_risk_correlation": print_correlation,
         "render_metrics": {
             "memory_usage": memory,
             "memory_limit": memory_limit,
