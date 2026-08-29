@@ -797,6 +797,36 @@ def main() -> None:
                 response_bodies.append(admin_without_bearer)
                 assert status == 401
 
+                status, connection_report = request(
+                    anonymous, base, "GET", server.AUDIT_DIAGNOSTICS_PATH, headers=bearer
+                )
+                response_bodies.append(connection_report)
+                assert status == 200, connection_report
+                assert set(connection_report) == {"sampled_at", "storage"}
+                assert set(connection_report["storage"]) == {"connections"}
+                connection_counts = connection_report["storage"]["connections"]
+                assert set(connection_counts) == {
+                    "opened_total", "closed_total", "active", "peak_active"
+                }
+                assert connection_counts["opened_total"] - connection_counts["closed_total"] == connection_counts["active"]
+                assert_no_sensitive_data(connection_report, fixture["identifiers"] + [db_path])
+
+                status, body = request(
+                    admin, base, "GET", server.AUDIT_DIAGNOSTICS_PATH
+                )
+                response_bodies.append(body)
+                assert status == 401
+                status, body = request(
+                    anonymous, base, "POST", server.AUDIT_DIAGNOSTICS_PATH, {}, bearer
+                )
+                response_bodies.append(body)
+                assert status == 405
+                status, body = request(
+                    anonymous, base, "GET", f"{server.AUDIT_DIAGNOSTICS_PATH}?extra=1", headers=bearer
+                )
+                response_bodies.append(body)
+                assert status == 400
+
                 status, body = request(
                     anonymous, base, "GET", "/api/admin/system/diagnostics", headers=bearer
                 )
