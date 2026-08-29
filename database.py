@@ -37,6 +37,8 @@ BOOKING_ACTIVE_STATUSES = ("排队中", "提交中")
 SHIPPING_STALE_MINUTES = 10
 SHIPPING_STALE_MAX_ATTEMPTS = 3
 AUDIT_HISTORY_SCHEMA_VERSION = 1
+SHIPMENT_TIME_QUALITIES = ("exact", "estimated", "legacy_unclassified")
+SHIPMENT_TIME_REPAIR_VERSION = 1
 AUDIT_FAILURE_ACTION_HINTS = {
     "provider_or_api_rejected": "请先核对承运范围或供应商规则；确认可继续后再重试，避免重复提交。",
     "system_error_or_timeout": "请先等待系统自动恢复；持续失败时联系管理员检查服务状态，不要连续重复提交。",
@@ -81,6 +83,31 @@ class _ManagedConnection(sqlite3.Connection):
 
 def now_text() -> str:
     return datetime.now(APP_TZ).isoformat(timespec="seconds")
+
+
+def normalize_timestamp(value: Any, *, assume_local: bool = False) -> str:
+    """Return a timezone-aware Shanghai ISO timestamp or raise a safe validation error."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise AppError("时间格式无效，请使用带时区的 ISO 时间。") from exc
+    if parsed.tzinfo is None:
+        if not assume_local:
+            raise AppError("时间必须包含时区。")
+        parsed = parsed.replace(tzinfo=APP_TZ)
+    return parsed.astimezone(APP_TZ).isoformat(timespec="seconds")
+
+
+def timestamp_value(value: Any, *, assume_local: bool = False) -> Optional[datetime]:
+    try:
+        normalized = normalize_timestamp(value, assume_local=assume_local)
+    except AppError:
+        return None
+    return datetime.fromisoformat(normalized) if normalized else None
 
 
 def classify_audit_failure(message: str, *, evidence: str = "observed") -> str:
@@ -300,6 +327,10 @@ class Database:
                     tracking_raw TEXT NOT NULL DEFAULT '',
                     shipping_note TEXT NOT NULL DEFAULT '',
                     shipped_at TEXT NOT NULL DEFAULT '',
+                    shipped_at_quality TEXT NOT NULL DEFAULT '',
+                    shipped_at_source TEXT NOT NULL DEFAULT '',
+                    tracking_signed_at_quality TEXT NOT NULL DEFAULT '',
+                    tracking_signed_at_source TEXT NOT NULL DEFAULT '',
                     booking_status TEXT NOT NULL DEFAULT '未下单',
                     booking_task_id TEXT NOT NULL DEFAULT '',
                     booking_order_id TEXT NOT NULL DEFAULT '',
@@ -498,11 +529,13 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_return_orders_store ON return_orders(store_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_return_orders_created ON return_orders(created_at)")
             self._ensure_shipment_tracking_columns(conn)
+            self._ensure_shipment_time_columns(conn)
             self._ensure_return_tracking_columns(conn)
             self._ensure_shipping_batch_columns(conn)
             self._ensure_label_columns(conn)
             self._normalize_shipments_with_tracking(conn)
             self._ensure_audit_history(conn)
+            self._ensure_shipment_time_integrity(conn)
             conn.execute(
                 """
                 INSERT INTO shipping_settings (id, default_company, cargo_name, updated_at)
@@ -992,6 +1025,10 @@ class Database:
                     tracking_raw TEXT NOT NULL DEFAULT '',
                     shipping_note TEXT NOT NULL DEFAULT '',
                     shipped_at TEXT NOT NULL DEFAULT '',
+                    shipped_at_quality TEXT NOT NULL DEFAULT '',
+                    shipped_at_source TEXT NOT NULL DEFAULT '',
+                    tracking_signed_at_quality TEXT NOT NULL DEFAULT '',
+                    tracking_signed_at_source TEXT NOT NULL DEFAULT '',
                     booking_status TEXT NOT NULL DEFAULT '未下单',
                     booking_task_id TEXT NOT NULL DEFAULT '',
                     booking_order_id TEXT NOT NULL DEFAULT '',
@@ -1028,7 +1065,9 @@ class Database:
                 "recipient_name", "phone", "address", "store_order_no", "remark", "status",
                 "express_company", "tracking_no", "tracking_provider", "tracking_status",
                 "tracking_state_code", "tracking_last_event", "tracking_last_checked_at", "tracking_signed_at",
-                "tracking_error", "tracking_raw", "shipping_note", "shipped_at", "booking_status",
+                "tracking_error", "tracking_raw", "shipping_note", "shipped_at",
+                "shipped_at_quality", "shipped_at_source", "tracking_signed_at_quality",
+                "tracking_signed_at_source", "booking_status",
                 "booking_task_id", "booking_order_id", "booking_request_id", "booking_poll_token",
                 "booking_salt", "booking_error", "booking_carrier_status", "booking_raw",
                 "booking_requested_at", "booking_updated_at", "booking_courier_name",
@@ -1040,7 +1079,9 @@ class Database:
                 "business_id": business_expr,
                 "tracking_provider": "''", "tracking_status": "''", "tracking_state_code": "''",
                 "tracking_last_event": "''", "tracking_last_checked_at": "''", "tracking_signed_at": "''",
-                "tracking_error": "''", "tracking_raw": "''", "booking_status": "'未下单'",
+                "tracking_error": "''", "tracking_raw": "''", "shipped_at_quality": "''",
+                "shipped_at_source": "''", "tracking_signed_at_quality": "''",
+                "tracking_signed_at_source": "''", "booking_status": "'未下单'",
                 "booking_task_id": "''", "booking_order_id": "''", "booking_request_id": "''",
                 "booking_poll_token": "''", "booking_salt": "''", "booking_error": "''",
                 "booking_carrier_status": "''", "booking_raw": "''", "booking_requested_at": "''",
@@ -1166,6 +1207,113 @@ class Database:
             """
         )
 
+    def _ensure_shipment_time_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(shipments)").fetchall()}
+        columns = {
+            "shipped_at_quality": "TEXT NOT NULL DEFAULT ''",
+            "shipped_at_source": "TEXT NOT NULL DEFAULT ''",
+            "tracking_signed_at_quality": "TEXT NOT NULL DEFAULT ''",
+            "tracking_signed_at_source": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE shipments ADD COLUMN {name} {definition}")
+        conn.execute(
+            """
+            UPDATE shipments
+            SET shipped_at_quality = 'legacy_unclassified', shipped_at_source = 'legacy_existing'
+            WHERE shipped_at <> '' AND julianday(shipped_at) IS NOT NULL AND shipped_at_quality = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE shipments
+            SET tracking_signed_at_quality = 'legacy_unclassified',
+                tracking_signed_at_source = 'legacy_existing'
+            WHERE tracking_signed_at <> '' AND julianday(tracking_signed_at) IS NOT NULL
+              AND tracking_signed_at_quality = ''
+            """
+        )
+
+    def _ensure_shipment_time_integrity(self, conn: sqlite3.Connection) -> None:
+        """Protect new state/time writes without rewriting historical damaged rows."""
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS shipment_time_repair_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repair_batch_id TEXT NOT NULL,
+                shipment_id INTEGER NOT NULL,
+                field_name TEXT NOT NULL CHECK (field_name IN ('shipped_at', 'tracking_signed_at')),
+                previous_value_sha256 TEXT NOT NULL,
+                replacement_value TEXT NOT NULL,
+                evidence_quality TEXT NOT NULL CHECK (evidence_quality IN ('exact', 'estimated')),
+                evidence_source TEXT NOT NULL,
+                preview_fingerprint TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_shipment_time_repair_events_batch
+                ON shipment_time_repair_events(repair_batch_id, shipment_id);
+
+            CREATE TRIGGER IF NOT EXISTS shipment_time_repair_events_no_update
+            BEFORE UPDATE ON shipment_time_repair_events
+            BEGIN
+                SELECT RAISE(ABORT, 'shipment time repair events are append-only');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS shipment_time_repair_events_no_delete
+            BEFORE DELETE ON shipment_time_repair_events
+            BEGIN
+                SELECT RAISE(ABORT, 'shipment time repair events are append-only');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS shipments_time_integrity_insert
+            BEFORE INSERT ON shipments
+            WHEN (
+                NEW.status IN ('已发货', '已签收') AND (
+                    julianday(NEW.created_at) IS NULL
+                    OR NEW.shipped_at = '' OR julianday(NEW.shipped_at) IS NULL
+                    OR NEW.shipped_at_quality NOT IN ('exact', 'estimated', 'legacy_unclassified')
+                    OR TRIM(NEW.shipped_at_source) = ''
+                    OR julianday(NEW.shipped_at) < julianday(NEW.created_at)
+                )
+            ) OR (
+                NEW.status = '已签收' AND (
+                    NEW.tracking_signed_at = '' OR julianday(NEW.tracking_signed_at) IS NULL
+                    OR NEW.tracking_signed_at_quality NOT IN ('exact', 'estimated', 'legacy_unclassified')
+                    OR TRIM(NEW.tracking_signed_at_source) = ''
+                    OR julianday(NEW.tracking_signed_at) < julianday(NEW.shipped_at)
+                )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'shipment time integrity violation');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS shipments_time_integrity_update
+            BEFORE UPDATE OF status, shipped_at, shipped_at_quality,
+                tracking_signed_at, tracking_signed_at_quality ON shipments
+            WHEN (
+                NEW.status IN ('已发货', '已签收') AND (
+                    julianday(NEW.created_at) IS NULL
+                    OR NEW.shipped_at = '' OR julianday(NEW.shipped_at) IS NULL
+                    OR NEW.shipped_at_quality NOT IN ('exact', 'estimated', 'legacy_unclassified')
+                    OR TRIM(NEW.shipped_at_source) = ''
+                    OR julianday(NEW.shipped_at) < julianday(NEW.created_at)
+                )
+            ) OR (
+                NEW.status = '已签收' AND (
+                    NEW.tracking_signed_at = '' OR julianday(NEW.tracking_signed_at) IS NULL
+                    OR NEW.tracking_signed_at_quality NOT IN ('exact', 'estimated', 'legacy_unclassified')
+                    OR TRIM(NEW.tracking_signed_at_source) = ''
+                    OR julianday(NEW.tracking_signed_at) < julianday(NEW.shipped_at)
+                )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'shipment time integrity violation');
+            END;
+            """
+        )
+
     def _normalize_shipments_with_tracking(self, conn: sqlite3.Connection) -> None:
         now = now_text()
         conn.execute(
@@ -1173,12 +1321,15 @@ class Database:
             UPDATE shipments
             SET status = '已发货',
                 express_company = CASE WHEN express_company = '' THEN ? ELSE express_company END,
-                shipped_at = CASE WHEN shipped_at = '' THEN updated_at ELSE shipped_at END,
+                shipped_at = CASE WHEN shipped_at = '' AND julianday(updated_at) IS NOT NULL
+                    THEN updated_at WHEN shipped_at = '' THEN ? ELSE shipped_at END,
+                shipped_at_quality = CASE WHEN shipped_at = '' THEN 'estimated' ELSE shipped_at_quality END,
+                shipped_at_source = CASE WHEN shipped_at = '' THEN 'legacy_status_updated_at' ELSE shipped_at_source END,
                 tracking_status = CASE WHEN tracking_status = '' THEN '待查询' ELSE tracking_status END,
                 updated_at = ?
             WHERE status = '待处理' AND tracking_no <> ''
             """,
-            (DEFAULT_EXPRESS_COMPANY, now),
+            (DEFAULT_EXPRESS_COMPANY, now, now),
         )
         conn.execute(
             """
@@ -2229,6 +2380,53 @@ class Database:
                     ).fetchone()
                 ).items()
             }
+            time_evidence = {
+                key: int(value or 0)
+                for key, value in dict(
+                    conn.execute(
+                        """
+                        SELECT
+                            COALESCE(SUM(CASE WHEN status IN ('已发货', '已签收')
+                                AND julianday(shipped_at) IS NOT NULL
+                                AND shipped_at_quality = 'exact'
+                                AND TRIM(shipped_at_source) <> ''
+                                AND (status <> '已签收' OR (
+                                    julianday(tracking_signed_at) IS NOT NULL
+                                    AND tracking_signed_at_quality = 'exact'
+                                    AND TRIM(tracking_signed_at_source) <> ''
+                                    AND julianday(tracking_signed_at) >= julianday(shipped_at)
+                                ))
+                                THEN 1 ELSE 0 END), 0) AS exact_records,
+                            COALESCE(SUM(CASE WHEN status IN ('已发货', '已签收')
+                                AND julianday(shipped_at) IS NOT NULL
+                                AND shipped_at_quality IN ('exact', 'estimated')
+                                AND TRIM(shipped_at_source) <> ''
+                                AND (status <> '已签收' OR (
+                                    julianday(tracking_signed_at) IS NOT NULL
+                                    AND tracking_signed_at_quality IN ('exact', 'estimated')
+                                    AND TRIM(tracking_signed_at_source) <> ''
+                                    AND julianday(tracking_signed_at) >= julianday(shipped_at)
+                                ))
+                                AND (shipped_at_quality = 'estimated'
+                                    OR tracking_signed_at_quality = 'estimated')
+                                THEN 1 ELSE 0 END), 0) AS estimated_records,
+                            COALESCE(SUM(CASE WHEN status IN ('已发货', '已签收')
+                                AND NOT (
+                                    julianday(shipped_at) IS NOT NULL
+                                    AND shipped_at_quality IN ('exact', 'estimated')
+                                    AND TRIM(shipped_at_source) <> ''
+                                    AND (status <> '已签收' OR (
+                                        julianday(tracking_signed_at) IS NOT NULL
+                                        AND tracking_signed_at_quality IN ('exact', 'estimated')
+                                        AND TRIM(tracking_signed_at_source) <> ''
+                                        AND julianday(tracking_signed_at) >= julianday(shipped_at)
+                                    ))
+                                ) THEN 1 ELSE 0 END), 0) AS still_missing_evidence_records
+                        FROM shipments
+                        """
+                    ).fetchone()
+                ).items()
+            }
 
         current_tracking_failures = int(shipment_exceptions["shipment_tracking_failures"] or 0) + int(
             return_exceptions["return_tracking_failures"] or 0
@@ -2287,6 +2485,7 @@ class Database:
             "data_quality": {
                 "total_issues": sum(quality_counts.values()),
                 **quality_counts,
+                "time_evidence": time_evidence,
             },
             "basis": {
                 "event_metrics": "timestamp_events_in_shanghai_calendar_day",
@@ -2297,7 +2496,275 @@ class Database:
                 "recent_7_day_average": "seven_calendar_days_including_date_fixed_denominator_empty_is_zero",
                 "data_quality": "current_snapshot_all_shipments",
                 "data_quality_total": "sum_of_issue_counts_a_record_may_contribute_multiple_issues",
+                "time_evidence": "exact_estimated_or_still_missing_evidence_current_shipment_state",
             },
+        }
+
+    @staticmethod
+    def _provider_signed_time_from_raw(raw: Any) -> str:
+        try:
+            payload = json.loads(str(raw or ""))
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        if str(payload.get("state") or "") != "3" and str(payload.get("ischeck") or "") != "1":
+            return ""
+        traces = payload.get("data")
+        if not isinstance(traces, list):
+            return ""
+        candidates: List[str] = []
+        for trace in traces:
+            if not isinstance(trace, dict):
+                continue
+            value = trace.get("ftime") or trace.get("time")
+            parsed = timestamp_value(value, assume_local=True)
+            if parsed:
+                candidates.append(parsed.isoformat(timespec="seconds"))
+        return max(candidates, key=lambda value: datetime.fromisoformat(value)) if candidates else ""
+
+    def _build_shipment_time_repair_plan(self, conn: sqlite3.Connection) -> Dict[str, Any]:
+        rows = conn.execute(
+            """
+            SELECT id, status, created_at, updated_at, shipped_at, shipped_at_quality,
+                shipped_at_source, tracking_signed_at, tracking_signed_at_quality,
+                tracking_signed_at_source, tracking_last_checked_at, tracking_raw,
+                booking_requested_at, booking_updated_at
+            FROM shipments
+            WHERE status IN ('已发货', '已签收')
+            ORDER BY id
+            """
+        ).fetchall()
+        issue_counts = {
+            "invalid_created_at": 0,
+            "invalid_shipped_at": 0,
+            "invalid_tracking_signed_at": 0,
+            "shipped_state_missing_shipped_at": 0,
+            "signed_state_missing_tracking_signed_at": 0,
+            "shipped_before_created": 0,
+            "signed_before_shipped": 0,
+            "evidence_conflicts": 0,
+        }
+        repairs: List[Dict[str, Any]] = []
+        unsafe_records = 0
+        fingerprint_rows: List[Dict[str, Any]] = []
+
+        for source_row in rows:
+            row = dict(source_row)
+            created = timestamp_value(row["created_at"], assume_local=True)
+            shipped = timestamp_value(row["shipped_at"], assume_local=True)
+            signed = timestamp_value(row["tracking_signed_at"], assume_local=True)
+            if created is None:
+                issue_counts["invalid_created_at"] += 1
+            if row["shipped_at"] and shipped is None:
+                issue_counts["invalid_shipped_at"] += 1
+            if row["tracking_signed_at"] and signed is None:
+                issue_counts["invalid_tracking_signed_at"] += 1
+            if not row["shipped_at"]:
+                issue_counts["shipped_state_missing_shipped_at"] += 1
+            if row["status"] == "已签收" and not row["tracking_signed_at"]:
+                issue_counts["signed_state_missing_tracking_signed_at"] += 1
+            if created and shipped and shipped < created:
+                issue_counts["shipped_before_created"] += 1
+            if shipped and signed and signed < shipped:
+                issue_counts["signed_before_shipped"] += 1
+
+            needs_shipped = shipped is None or (created is not None and shipped < created)
+            needs_signed = row["status"] == "已签收" and (
+                signed is None or (shipped is not None and signed < shipped)
+            )
+            if not needs_shipped and not needs_signed:
+                continue
+
+            proposed: Dict[str, Dict[str, str]] = {}
+            provider_signed = self._provider_signed_time_from_raw(row["tracking_raw"])
+            provider_signed_dt = timestamp_value(provider_signed, assume_local=True)
+            if needs_signed and provider_signed_dt and (created is None or provider_signed_dt >= created):
+                proposed["tracking_signed_at"] = {
+                    "value": provider_signed,
+                    "quality": "exact",
+                    "source": "provider_signed_trace",
+                }
+                signed = provider_signed_dt
+
+            if needs_shipped:
+                upper_bound = signed
+                candidates = [
+                    ("label_success_or_update", row["booking_updated_at"]),
+                    ("label_request", row["booking_requested_at"]),
+                    ("tracking_check", row["tracking_last_checked_at"]),
+                    ("status_update", row["updated_at"]),
+                ]
+                chosen: Optional[tuple[str, datetime]] = None
+                for source, value in candidates:
+                    parsed = timestamp_value(value, assume_local=True)
+                    if parsed and (created is None or parsed >= created) and (upper_bound is None or parsed <= upper_bound):
+                        chosen = (source, parsed)
+                        break
+                if chosen is None and upper_bound and (created is None or upper_bound >= created):
+                    chosen = ("signed_time_upper_bound", upper_bound)
+                if chosen:
+                    proposed["shipped_at"] = {
+                        "value": chosen[1].isoformat(timespec="seconds"),
+                        "quality": "estimated",
+                        "source": chosen[0],
+                    }
+                    shipped = chosen[1]
+
+            if needs_signed and "tracking_signed_at" not in proposed:
+                candidates = [
+                    ("tracking_check", row["tracking_last_checked_at"]),
+                    ("status_update", row["updated_at"]),
+                ]
+                for source, value in candidates:
+                    parsed = timestamp_value(value, assume_local=True)
+                    if parsed and (created is None or parsed >= created) and (shipped is None or parsed >= shipped):
+                        proposed["tracking_signed_at"] = {
+                            "value": parsed.isoformat(timespec="seconds"),
+                            "quality": "estimated",
+                            "source": source,
+                        }
+                        signed = parsed
+                        break
+
+            resulting_shipped = timestamp_value(
+                proposed.get("shipped_at", {}).get("value") or row["shipped_at"], assume_local=True
+            )
+            resulting_signed = timestamp_value(
+                proposed.get("tracking_signed_at", {}).get("value") or row["tracking_signed_at"],
+                assume_local=True,
+            )
+            safe = created is not None and bool(resulting_shipped) and (
+                row["status"] != "已签收" or bool(resulting_signed)
+            )
+            safe = safe and not (created and resulting_shipped and resulting_shipped < created)
+            safe = safe and not (
+                resulting_shipped and resulting_signed and resulting_signed < resulting_shipped
+            )
+            if not safe:
+                unsafe_records += 1
+                issue_counts["evidence_conflicts"] += 1
+                proposed = {}
+            if proposed:
+                quality = "estimated" if any(v["quality"] == "estimated" for v in proposed.values()) else "exact"
+                repairs.append({"shipment_id": int(row["id"]), "quality": quality, "changes": proposed})
+            fingerprint_rows.append(
+                {
+                    "id": int(row["id"]),
+                    "status": row["status"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                    "shipped_at": row["shipped_at"],
+                    "tracking_signed_at": row["tracking_signed_at"],
+                    "tracking_last_checked_at": row["tracking_last_checked_at"],
+                    "booking_requested_at": row["booking_requested_at"],
+                    "booking_updated_at": row["booking_updated_at"],
+                    "tracking_raw_sha256": hashlib.sha256(str(row["tracking_raw"] or "").encode()).hexdigest(),
+                    "proposed": proposed,
+                }
+            )
+
+        fingerprint_payload = {
+            "version": SHIPMENT_TIME_REPAIR_VERSION,
+            "database_path": str(Path(self.path).expanduser().resolve()),
+            "rows": fingerprint_rows,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        exact_records = sum(1 for repair in repairs if repair["quality"] == "exact")
+        estimated_records = sum(1 for repair in repairs if repair["quality"] == "estimated")
+        return {
+            "schema_version": SHIPMENT_TIME_REPAIR_VERSION,
+            "mode": "dry_run",
+            "issue_counts": issue_counts,
+            "repairability": {
+                "exact_records": exact_records,
+                "estimated_records": estimated_records,
+                "unsafe_records": unsafe_records,
+            },
+            "planned_change_records": len(repairs),
+            "planned_field_changes": sum(len(repair["changes"]) for repair in repairs),
+            "preview_fingerprint": fingerprint,
+            "privacy": "aggregate_only_no_business_or_personal_identifiers",
+            "repairs": repairs,
+        }
+
+    def preview_shipment_time_repairs(self) -> Dict[str, Any]:
+        with self.connect_readonly() as conn:
+            plan = self._build_shipment_time_repair_plan(conn)
+        return {key: value for key, value in plan.items() if key != "repairs"}
+
+    def apply_shipment_time_repairs(
+        self,
+        *,
+        preview_fingerprint: str,
+        max_rows: int,
+        include_estimated: bool = False,
+    ) -> Dict[str, Any]:
+        if max_rows <= 0:
+            raise AppError("受影响数量上限必须大于 0。")
+        now = now_text()
+        batch_id = hashlib.sha256(f"{preview_fingerprint}:{now}".encode()).hexdigest()[:20]
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            plan = self._build_shipment_time_repair_plan(conn)
+            if not secrets.compare_digest(str(preview_fingerprint), str(plan["preview_fingerprint"])):
+                raise AppError("数据库自预览后已变化，请重新执行 dry-run。", 409)
+            selected = [
+                repair for repair in plan["repairs"]
+                if include_estimated or repair["quality"] == "exact"
+            ]
+            if len(selected) > max_rows:
+                raise AppError("待修复记录数超过显式上限，未写入任何数据。", 409)
+            for repair in selected:
+                shipment = conn.execute(
+                    "SELECT * FROM shipments WHERE id = ?", (repair["shipment_id"],)
+                ).fetchone()
+                if not shipment:
+                    raise AppError("修复目标在事务内发生变化，已回滚。", 409)
+                values = dict(shipment)
+                for field_name, change in repair["changes"].items():
+                    values[field_name] = change["value"]
+                    values[f"{field_name}_quality"] = change["quality"]
+                    values[f"{field_name}_source"] = change["source"]
+                conn.execute(
+                    """
+                    UPDATE shipments
+                    SET shipped_at = ?, shipped_at_quality = ?, shipped_at_source = ?,
+                        tracking_signed_at = ?, tracking_signed_at_quality = ?,
+                        tracking_signed_at_source = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        values["shipped_at"], values["shipped_at_quality"], values["shipped_at_source"],
+                        values["tracking_signed_at"], values["tracking_signed_at_quality"],
+                        values["tracking_signed_at_source"], now, repair["shipment_id"],
+                    ),
+                )
+                for field_name, change in repair["changes"].items():
+                    conn.execute(
+                        """
+                        INSERT INTO shipment_time_repair_events (
+                            repair_batch_id, shipment_id, field_name, previous_value_sha256,
+                            replacement_value, evidence_quality, evidence_source,
+                            preview_fingerprint, applied_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            batch_id, repair["shipment_id"], field_name,
+                            hashlib.sha256(str(shipment[field_name] or "").encode()).hexdigest(),
+                            change["value"], change["quality"], change["source"],
+                            preview_fingerprint, now,
+                        ),
+                    )
+        return {
+            "mode": "apply",
+            "repair_batch_id": batch_id,
+            "applied_records": len(selected),
+            "applied_field_changes": sum(len(repair["changes"]) for repair in selected),
+            "included_estimated": bool(include_estimated),
+            "privacy": "aggregate_only_no_business_or_personal_identifiers",
         }
 
     def default_credentials_active(self) -> bool:
@@ -3351,6 +3818,87 @@ class Database:
         payload["batch_id"] = job["batch_id"]
         return payload
 
+    def _resolved_shipment_times(
+        self,
+        shipment: sqlite3.Row | Dict[str, Any],
+        *,
+        status: str,
+        shipped_at: str = "",
+        shipped_quality: str = "",
+        shipped_source: str = "",
+        signed_at: str = "",
+        signed_quality: str = "",
+        signed_source: str = "",
+        fallback_at: str = "",
+        fallback_source: str = "status_observed_at",
+    ) -> Dict[str, str]:
+        existing = dict(shipment)
+        fallback = normalize_timestamp(fallback_at or now_text(), assume_local=True)
+        created = timestamp_value(existing.get("created_at"), assume_local=True)
+        if status in {"已发货", "已签收"} and created is None:
+            raise AppError("订单创建时间无效，不能安全写入发货或签收状态。", 409)
+
+        shipped_raw = shipped_at or str(existing.get("shipped_at") or "")
+        shipped_dt = timestamp_value(shipped_raw, assume_local=True)
+        if status in {"已发货", "已签收"}:
+            if shipped_at and shipped_dt is None:
+                raise AppError("发货时间格式无效。")
+            if shipped_dt is None:
+                shipped_raw = signed_at or fallback
+                shipped_dt = timestamp_value(shipped_raw, assume_local=True)
+                shipped_quality = "estimated"
+                shipped_source = fallback_source if not signed_at else "signed_time_upper_bound"
+            else:
+                shipped_raw = normalize_timestamp(shipped_raw, assume_local=True)
+                shipped_quality = shipped_quality or str(existing.get("shipped_at_quality") or "legacy_unclassified")
+                shipped_source = shipped_source or str(existing.get("shipped_at_source") or "legacy_existing")
+        else:
+            shipped_raw = ""
+            shipped_quality = ""
+            shipped_source = ""
+            shipped_dt = None
+
+        signed_raw = signed_at or str(existing.get("tracking_signed_at") or "")
+        signed_dt = timestamp_value(signed_raw, assume_local=True)
+        if status == "已签收":
+            if signed_at and signed_dt is None:
+                raise AppError("签收时间格式无效。")
+            if signed_dt is None:
+                signed_raw = fallback
+                signed_dt = timestamp_value(signed_raw, assume_local=True)
+                signed_quality = "estimated"
+                signed_source = fallback_source
+            else:
+                signed_raw = normalize_timestamp(signed_raw, assume_local=True)
+                signed_quality = signed_quality or str(
+                    existing.get("tracking_signed_at_quality") or "legacy_unclassified"
+                )
+                signed_source = signed_source or str(
+                    existing.get("tracking_signed_at_source") or "legacy_existing"
+                )
+        elif status != "已签收" and signed_at == "":
+            signed_raw = ""
+            signed_quality = ""
+            signed_source = ""
+            signed_dt = None
+
+        if created and shipped_dt and shipped_dt < created:
+            raise AppError("发货时间不能早于订单创建时间。", 409)
+        if shipped_dt and signed_dt and signed_dt < shipped_dt:
+            raise AppError("签收时间不能早于发货时间。", 409)
+        if shipped_quality and shipped_quality not in SHIPMENT_TIME_QUALITIES:
+            raise AppError("发货时间证据等级无效。")
+        if signed_quality and signed_quality not in SHIPMENT_TIME_QUALITIES:
+            raise AppError("签收时间证据等级无效。")
+        return {
+            "shipped_at": shipped_raw,
+            "shipped_at_quality": shipped_quality,
+            "shipped_at_source": shipped_source,
+            "tracking_signed_at": signed_raw,
+            "tracking_signed_at_quality": signed_quality,
+            "tracking_signed_at_source": signed_source,
+        }
+
     def complete_shipping_job(self, item_id: int, result: Dict[str, Any]) -> Dict[str, Any]:
         now = now_text()
         success = bool(result.get("success"))
@@ -3365,7 +3913,12 @@ class Database:
             if not shipment:
                 raise AppError("发货单不存在。", 404)
             status = "已发货" if tracking_no else shipment["status"]
-            shipped_at = shipment["shipped_at"] or (now if tracking_no else "")
+            times = self._resolved_shipment_times(
+                shipment,
+                status=status,
+                fallback_at=now,
+                fallback_source="label_success_observed_at",
+            )
             conn.execute(
                 """
                 UPDATE shipping_batch_items
@@ -3385,14 +3938,19 @@ class Database:
                 SET status = ?, tracking_no = CASE WHEN ? <> '' THEN ? ELSE tracking_no END,
                     tracking_status = CASE WHEN ? <> '' THEN '等待揽收' ELSE tracking_status END,
                     tracking_provider = CASE WHEN ? <> '' THEN 'kuaidi100' ELSE tracking_provider END,
-                    shipped_at = ?, booking_status = ?, booking_task_id = ?, booking_order_id = ?,
+                    shipped_at = ?, shipped_at_quality = ?, shipped_at_source = ?,
+                    tracking_signed_at = ?, tracking_signed_at_quality = ?, tracking_signed_at_source = ?,
+                    booking_status = ?, booking_task_id = ?, booking_order_id = ?,
                     booking_poll_token = '', booking_error = ?, booking_raw = ?, booking_updated_at = ?,
                     label_url = ?, label_print_status = ?, label_print_error = '', label_print_type = ?,
                     label_carrier_order_no = ?, label_child_no = ?, label_return_no = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
-                    status, tracking_no, tracking_no, tracking_no, tracking_no, shipped_at, booking_status,
+                    status, tracking_no, tracking_no, tracking_no, tracking_no,
+                    times["shipped_at"], times["shipped_at_quality"], times["shipped_at_source"],
+                    times["tracking_signed_at"], times["tracking_signed_at_quality"],
+                    times["tracking_signed_at_source"], booking_status,
                     str(result.get("task_id") or ""), str(result.get("carrier_order_no") or ""),
                     str(result.get("error") or ""), str(result.get("raw") or ""), now,
                     str(result.get("label_url") or ""), str(result.get("print_status") or ""),
@@ -3711,7 +4269,9 @@ class Database:
                 SET status = '待处理', tracking_no = '', tracking_provider = '',
                     tracking_status = '', tracking_state_code = '', tracking_last_event = '',
                     tracking_last_checked_at = '', tracking_signed_at = '', tracking_error = '', tracking_raw = '',
-                    shipped_at = '', booking_status = '已取消', booking_task_id = '', booking_order_id = '',
+                    shipped_at = '', shipped_at_quality = '', shipped_at_source = '',
+                    tracking_signed_at_quality = '', tracking_signed_at_source = '',
+                    booking_status = '已取消', booking_task_id = '', booking_order_id = '',
                     booking_request_id = '', booking_poll_token = '', booking_salt = '',
                     booking_error = '', booking_raw = ?,
                     label_url = '', label_print_status = '', label_print_error = '', label_print_type = '',
@@ -3777,25 +4337,39 @@ class Database:
         return int(row["count"] or 0)
 
     def apply_tracking_result(self, shipment_id: int, result: Dict[str, Any]) -> Dict[str, Any]:
-        checked_at = str(result.get("checked_at") or now_text())
-        signed_at = str(result.get("signed_at") or "")
+        checked_at = normalize_timestamp(result.get("checked_at") or now_text(), assume_local=True)
+        signed_at = str(result.get("signed_at") or "").strip()
         tracking_status = str(result.get("tracking_status") or "")
         is_signed = bool(result.get("is_signed"))
         if is_signed and not signed_at:
             signed_at = checked_at
+        if signed_at:
+            signed_at = normalize_timestamp(signed_at, assume_local=True)
         status_update = "已签收" if is_signed else None
         now = now_text()
         with self.connect() as conn:
-            existing = conn.execute("SELECT status FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
+            existing = conn.execute("SELECT * FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
             if not existing:
                 raise AppError("发货单不存在。", 404)
             status = status_update or ("已发货" if existing["status"] == "待处理" and tracking_status and tracking_status != "查询失败" else existing["status"])
+            signed_source = str(result.get("signed_at_source") or "")
+            times = self._resolved_shipment_times(
+                existing,
+                status=status,
+                signed_at=signed_at if is_signed else "",
+                signed_quality=("exact" if signed_source == "provider_event" else "estimated") if is_signed else "",
+                signed_source=signed_source or ("tracking_check_observed_at" if is_signed else ""),
+                fallback_at=checked_at,
+                fallback_source="tracking_check_observed_at",
+            )
             cursor = conn.execute(
                 """
                 UPDATE shipments
                 SET tracking_provider = ?, tracking_status = ?, tracking_state_code = ?,
                     tracking_last_event = ?, tracking_last_checked_at = ?,
-                    tracking_signed_at = ?, tracking_error = ?, tracking_raw = ?,
+                    tracking_signed_at = ?, tracking_signed_at_quality = ?, tracking_signed_at_source = ?,
+                    shipped_at = ?, shipped_at_quality = ?, shipped_at_source = ?,
+                    tracking_error = ?, tracking_raw = ?,
                     status = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -3805,7 +4379,12 @@ class Database:
                     str(result.get("state_code") or ""),
                     str(result.get("last_event") or ""),
                     checked_at,
-                    signed_at,
+                    times["tracking_signed_at"],
+                    times["tracking_signed_at_quality"],
+                    times["tracking_signed_at_source"],
+                    times["shipped_at"],
+                    times["shipped_at_quality"],
+                    times["shipped_at_source"],
                     str(result.get("error") or ""),
                     str(result.get("raw") or ""),
                     status,
@@ -3838,10 +4417,9 @@ class Database:
         auto_shipped = status == "待处理" and tracking_no
         if auto_shipped:
             status = "已发货"
-        if status in {"已发货", "已签收"} and not shipped_at:
-            shipped_at = existing["shipped_at"] or now
-        if status not in {"已发货", "已签收"}:
-            shipped_at = ""
+        explicit_shipped_at = bool(shipped_at)
+        if explicit_shipped_at:
+            shipped_at = normalize_timestamp(shipped_at)
 
         tracking_changed = tracking_no != existing["tracking_no"] or express_company != existing["express_company"]
         tracking_provider = existing["tracking_provider"]
@@ -3867,14 +4445,37 @@ class Database:
             tracking_signed_at = tracking_signed_at or now
             tracking_error = ""
 
+        times = self._resolved_shipment_times(
+            existing,
+            status=status,
+            shipped_at=shipped_at,
+            shipped_quality="exact" if explicit_shipped_at else "",
+            shipped_source="manual_input" if explicit_shipped_at else "",
+            signed_at=tracking_signed_at,
+            signed_quality=(
+                str(existing["tracking_signed_at_quality"] or "legacy_unclassified")
+                if existing["tracking_signed_at"] and tracking_signed_at == existing["tracking_signed_at"]
+                else ("estimated" if status == "已签收" else "")
+            ),
+            signed_source=(
+                str(existing["tracking_signed_at_source"] or "legacy_existing")
+                if existing["tracking_signed_at"] and tracking_signed_at == existing["tracking_signed_at"]
+                else ("manual_status_observed_at" if status == "已签收" else "")
+            ),
+            fallback_at=now,
+            fallback_source="manual_status_observed_at",
+        )
+
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 UPDATE shipments
                 SET status = ?, express_company = ?, tracking_no = ?, shipping_note = ?,
-                    shipped_at = ?, tracking_provider = ?, tracking_status = ?,
+                    shipped_at = ?, shipped_at_quality = ?, shipped_at_source = ?,
+                    tracking_provider = ?, tracking_status = ?,
                     tracking_state_code = ?, tracking_last_event = ?,
                     tracking_last_checked_at = ?, tracking_signed_at = ?,
+                    tracking_signed_at_quality = ?, tracking_signed_at_source = ?,
                     tracking_error = ?, tracking_raw = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -3883,13 +4484,17 @@ class Database:
                     express_company,
                     tracking_no,
                     shipping_note,
-                    shipped_at,
+                    times["shipped_at"],
+                    times["shipped_at_quality"],
+                    times["shipped_at_source"],
                     tracking_provider,
                     tracking_status,
                     tracking_state_code,
                     tracking_last_event,
                     tracking_last_checked_at,
-                    tracking_signed_at,
+                    times["tracking_signed_at"],
+                    times["tracking_signed_at_quality"],
+                    times["tracking_signed_at_source"],
                     tracking_error,
                     tracking_raw,
                     now,

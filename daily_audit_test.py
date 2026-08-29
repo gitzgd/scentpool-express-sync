@@ -47,6 +47,9 @@ def request(
 
 def insert_synthetic_rows(db: Database) -> Dict[str, Any]:
     with db.connect() as conn:
+        # This fixture intentionally creates historical corruption that new writes reject.
+        conn.execute("DROP TRIGGER IF EXISTS shipments_time_integrity_insert")
+        conn.execute("DROP TRIGGER IF EXISTS shipments_time_integrity_update")
         admin_id = int(conn.execute("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1").fetchone()[0])
         now = "2026-07-01T00:00:00+08:00"
         alpha_id = int(
@@ -291,6 +294,9 @@ def insert_synthetic_rows(db: Database) -> Dict[str, Any]:
 def insert_full_history_rows(db: Database) -> list[str]:
     identifiers: list[str] = []
     with db.connect() as conn:
+        # Historical event reconstruction fixtures intentionally bypass current write guards.
+        conn.execute("DROP TRIGGER IF EXISTS shipments_time_integrity_insert")
+        conn.execute("DROP TRIGGER IF EXISTS shipments_time_integrity_update")
         conn.execute(
             "UPDATE audit_event_meta SET started_at = ?, full_day_coverage_from = ? WHERE id = 1",
             ("2026-07-01T00:00:00+08:00", "2026-07-01"),
@@ -552,6 +558,11 @@ def assert_contract(report: Dict[str, Any]) -> None:
         "shipped_before_created": 1,
         "signed_before_shipped": 1,
         "missing_store_name": 1,
+        "time_evidence": {
+            "exact_records": 0,
+            "estimated_records": 0,
+            "still_missing_evidence_records": 11,
+        },
     }
     assert report["basis"]["backlog"].endswith("_not_historical")
     assert "not_historical_event_log" in report["basis"]["exceptions"]

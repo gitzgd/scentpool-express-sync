@@ -80,7 +80,7 @@ python3 scripts/install_daily_audit_probe.py --check
 
 安装器原子更新 `~/.codex/scentpool_daily_audit_probe.py` 并设为 `0700`，不读取密钥。采集器运行时只从 Mac 登录钥匙串读取 `scentpool-audit-token` 与 `scentpool-render-api`，只执行固定 GET 白名单；它聚合部署、重启、OOM、5xx、异常栈、SQLite 锁、超时、慢请求、内存、磁盘和 HTTP 请求/延迟。接口无数据、权限不足、HTTP 错误、响应结构变化、网络受限或进程异常都会输出有效脱敏 JSON，不会以“成功退出但没有结果”表示失败。
 
-当前生产仍需部署本分支后才会返回新增的历史日末和失败事件字段；部署前的生产日报保持既有快照口径。
+历史日末和失败事件字段已于 2026-08-17 上线；本分支新增的时间证据等级尚未部署。
 
 ## 发布到 Render
 
@@ -173,10 +173,19 @@ curl -b cookie.txt -c cookie.txt \
 - Render 数据库存放在持久磁盘 `/var/data/scentpool.db`，服务重启后数据应保留。
 - 生产事故、容量预估、备份恢复和数据库迁移门槛见 `OPERATIONS.md`。
 
+历史发货/签收时间修复命令默认只做聚合预览，不写数据库：
+
+```bash
+python3 manage.py --db /绝对路径/scentpool.db repair-shipment-times
+```
+
+生产 apply 需要独立授权、绝对路径复核、预览指纹、影响上限、固定确认短语、全新在线备份路径；估算时间还需额外 `--include-estimated`。完整执行与回滚清单见 `docs/features/shipment-time-integrity.md`。当前代码尚未部署，也未修复生产历史数据。
+
 ## 本地验证
 
 ```bash
 python3 -m py_compile server.py database.py manage.py smoke_test.py tracking.py shipping.py label_pdf.py
 node --check static/app.js
+python3 shipment_time_integrity_test.py
 python3 smoke_test.py
 ```

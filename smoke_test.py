@@ -27,6 +27,7 @@ import shipping
 import tracking
 import daily_audit_probe_test
 import daily_audit_test
+import shipment_time_integrity_test
 from database import AppError, DEFAULT_PRODUCT_FILE, Database
 
 
@@ -1161,6 +1162,8 @@ def main() -> None:
         assert status == 200, body
         assert body["shipments"][0]["tracking_status"] == "等待揽收"
         assert body["shipments"][0]["label_print_status"] == "待打印"
+        assert body["shipments"][0]["shipped_at_quality"] == "estimated"
+        assert body["shipments"][0]["shipped_at_source"] == "label_success_observed_at"
         assert "tracking_raw" not in body["shipments"][0]
         status, detail_body = request(
             admin,
@@ -1188,7 +1191,9 @@ def main() -> None:
                 """
                 UPDATE shipments
                 SET status = '已发货', express_company = '圆通', tracking_no = 'YT-BREAKER-002',
-                    tracking_status = '等待揽收', tracking_error = '', tracking_last_checked_at = ''
+                    tracking_status = '等待揽收', tracking_error = '', tracking_last_checked_at = '',
+                    shipped_at = updated_at, shipped_at_quality = 'estimated',
+                    shipped_at_source = 'synthetic_fixture'
                 WHERE id = ?
                 """,
                 (breaker_shipment["id"],),
@@ -1436,6 +1441,7 @@ def main() -> None:
         assert status == 200, body
         assert body["shipment"]["booking_status"] == "已取消"
         assert body["shipment"]["tracking_no"] == ""
+        synthetic_created_at = body["shipment"]["created_at"]
 
         def fake_in_transit(_shipment):
             return {
@@ -1443,7 +1449,7 @@ def main() -> None:
                 "tracking_status": "运输中",
                 "state_code": "0",
                 "last_event": "2026-07-07 12:00:00 快件运输中",
-                "checked_at": "2026-07-07T12:05:00+08:00",
+                "checked_at": synthetic_created_at,
                 "signed_at": "",
                 "error": "",
                 "raw": "{}",
@@ -1484,6 +1490,7 @@ def main() -> None:
         assert body["shipments"][0]["status"] == "已发货"
         assert body["shipments"][0]["express_company"] == "顺丰"
         assert body["shipments"][0]["tracking_no"] == "SF123456"
+        assert body["shipments"][0]["shipped_at_quality"] == "estimated"
         created_date = body["shipments"][0]["created_at"][:10]
         store_code = f"S{int(body['shipments'][0]['store_id']):02d}"
 
@@ -1495,21 +1502,28 @@ def main() -> None:
                 "last_event": f"{created_date} 12:00:00 已签收",
                 "checked_at": f"{created_date}T12:05:00+08:00",
                 "signed_at": f"{created_date} 12:00:00",
+                "signed_at_source": "provider_event",
                 "error": "",
                 "raw": "{}",
                 "is_signed": True,
             }
 
         server.query_tracking = fake_query_tracking
+        with server.DB.connect() as conn:
+            conn.execute(
+                "UPDATE shipments SET tracking_last_checked_at = '' WHERE id = ?",
+                (shipment_id,),
+            )
         status, body = request(admin, base, "POST", "/api/admin/tracking/sync", {"force": True, "limit": 5})
         assert status == 200, body
-        assert body["result"]["signed"] == 1
+        assert body["result"]["signed"] == 1, body
         assert body["result"]["remaining"] == 0
         status, body = request(admin, base, "GET", "/api/shipments?q=ORDER-SMOKE-001")
         assert status == 200, body
         assert body["shipments"][0]["status"] == "已签收"
         assert body["shipments"][0]["tracking_status"] == "已签收"
         assert body["shipments"][0]["tracking_signed_at"]
+        assert body["shipments"][0]["tracking_signed_at_quality"] == "exact"
 
         status, body = request(staff, base, "GET", "/returns/new")
         assert status == 200
@@ -1810,6 +1824,7 @@ def main() -> None:
             pass
 
         daily_audit_test.main()
+        shipment_time_integrity_test.main()
         daily_audit_probe_test.main()
         print("smoke test passed")
 

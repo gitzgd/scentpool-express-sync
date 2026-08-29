@@ -8,11 +8,12 @@
 | 门店与商品 | 门店维护、商品维护、Excel 导入、条码标识 | `database.py`, `xlsx_importer.py`, `static/app.js` |
 | [发货单](shipment-pagination.md) | 门店创建、服务端分页看板、筛选、编辑限制、总部处理 | `database.py`, `server.py`, `static/app.js` |
 | [退货单](return-carrier-autodetect.md) | 门店创建、快递公司自动识别、总部看板、商品快照、退货物流 | `database.py`, `tracking.py`, `server.py`, `static/app.js` |
+| [发货与签收时间完整性](shipment-time-integrity.md) | 写入约束、证据等级、历史聚合预览与受控修复 | `database.py`, `tracking.py`, `manage.py` |
 | 物流 | 快递100查询、自动/手动同步、签收更新 | `tracking.py`, `server.py` |
 | 电子面单 | 菜鸟授权、网点余额、批量下单、取消、复打 | `shipping.py`, `database.py`, `server.py` |
 | 打印 | 待打印选择、PDF 合并、打印状态、单张复打 | `label_pdf.py`, `server.py`, `static/app.js` |
 | [任务可靠性与失败提示](task-reliability.md) | 面单短暂故障重试、中断恢复、分类异常角标、60 秒刷新、人工确认与操作指引 | `database.py`, `shipping.py`, `server.py`, `static/app.js` |
-| [脱敏业务日报](daily-audit.md) | 独立 Bearer 鉴权、只读 SQLite 汇总、前向完整历史日末、脱敏失败分类与固定只读 Render 采集器（扩展待审查/部署） | `database.py`, `server.py`, `tools/scentpool_daily_audit_probe.py`, `daily_audit_test.py` |
+| [脱敏业务日报](daily-audit.md) | 独立 Bearer 鉴权、只读 SQLite 汇总、前向完整历史日末、脱敏失败分类、时间证据等级与固定只读 Render 采集器 | `database.py`, `server.py`, `tools/scentpool_daily_audit_probe.py`, `daily_audit_test.py` |
 | 导出 | CSV/XLSX、门店和日期命名、商品分类换行 | `server.py` |
 | 数据安全 | SQLite 在线备份、恢复保护、完整性检查 | `database.py`, `manage.py`, `server.py` |
 | 运维 | 健康检查、进程与 SQLite 连接诊断、慢请求、资源限制 | `server.py`, `database.py`, `render.yaml`, `OPERATIONS.md` |

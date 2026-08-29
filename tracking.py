@@ -246,13 +246,15 @@ def normalize_kuaidi100_response(data: Dict[str, Any], raw: str) -> Dict[str, An
     if not traces and state in {"", "0"}:
         return tracking_pending_result(raw=raw, state=state)
 
+    provider_signed_at = str(trace_value(last_trace, "ftime") or trace_value(last_trace, "time") or "")
     return {
         "provider": "kuaidi100",
         "tracking_status": state_label(state, last_event),
         "state_code": state,
         "last_event": last_event,
         "checked_at": checked_at,
-        "signed_at": str(trace_value(last_trace, "ftime") or trace_value(last_trace, "time") or checked_at) if is_signed else "",
+        "signed_at": (provider_signed_at or checked_at) if is_signed else "",
+        "signed_at_source": ("provider_event" if provider_signed_at else "tracking_check_observed_at") if is_signed else "",
         "error": "",
         "raw": raw[:5000],
         "is_signed": is_signed,
@@ -267,6 +269,7 @@ def tracking_pending_result(*, raw: str = "", state: str = "") -> Dict[str, Any]
         "last_event": "",
         "checked_at": now_text(),
         "signed_at": "",
+        "signed_at_source": "",
         "error": "",
         "raw": raw[:5000],
         "is_signed": False,
@@ -281,6 +284,7 @@ def tracking_error_result(message: str, *, provider: str, raw: str = "", state: 
         "last_event": last_event,
         "checked_at": now_text(),
         "signed_at": "",
+        "signed_at_source": "",
         "error": message,
         "raw": raw[:5000],
         "is_signed": False,
