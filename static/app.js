@@ -457,7 +457,7 @@ function isActive(path) {
 }
 
 function roleName(user) {
-  return user?.role === "admin" ? "总部" : "门店";
+  return user?.role === "admin" ? "总部" : user?.store_kind === "team" ? "合作团队" : "门店";
 }
 
 function shell(content) {
@@ -469,7 +469,7 @@ function shell(content) {
       ? `
         <a class="${isActive("/admin")}" href="/admin" data-route>发货后台</a>
         <a class="${isActive("/admin/returns")}" href="/admin/returns" data-route>退货看板</a>
-        <a class="${isActive("/admin/stores")}" href="/admin/stores" data-route>门店</a>
+        <a class="${isActive("/admin/stores")}" href="/admin/stores" data-route>门店与团队</a>
         <a class="${isActive("/admin/products")}" href="/admin/products" data-route>商品</a>
         <a class="${isActive("/admin/shipping")}" href="/admin/shipping" data-route>面单设置</a>
       `
@@ -478,11 +478,11 @@ function shell(content) {
     state.user?.role === "staff"
       ? `
         <a class="${isActive("/shipments")}" href="/shipments" data-route>发货看板</a>
-        <a class="${isActive("/returns/new")}" href="/returns/new" data-route>新增退货</a>
-        <a class="${isActive("/returns")}" href="/returns" data-route>退货看板</a>
+        ${state.user.store_kind !== "team" ? `<a class="${isActive("/returns/new")}" href="/returns/new" data-route>新增退货</a>
+        <a class="${isActive("/returns")}" href="/returns" data-route>退货看板</a>` : ""}
       `
       : "";
-  const submitLink = `<a class="${isActive("/submit")}" href="/submit" data-route>新建发货</a>`;
+  const submitLink = `${state.user?.store_kind !== "team" ? `<a class="${isActive("/submit")}" href="/submit" data-route>普通发货</a>` : ""}<a class="${isActive("/special/new")}" href="/special/new" data-route>${state.user?.role === "admin" ? "售后与合作发货" : state.user?.store_kind === "team" ? "合作寄送" : "售后发货"}</a>`;
   return `
     <div class="app-shell">
       <header class="topbar">
@@ -749,7 +749,7 @@ function renderLogin() {
         }),
       });
       state.user = data.user;
-      navigate(state.user.role === "admin" ? "/admin" : "/submit");
+      navigate(state.user.role === "admin" ? "/admin" : state.user.store_kind === "team" ? "/special/new" : "/submit");
     } catch (error) {
       errorToast(error);
     }
@@ -784,6 +784,9 @@ function selectedProduct(barcode) {
 
 function itemsFromProductSnapshots(items) {
   return (items || []).map((item) => ({
+    item_kind: item.item_kind || "product",
+    name: item.item_kind === "material" ? item.product_name.slice(0, -(String(item.material_spec || "").length + 2)) : "",
+    material_spec: item.material_spec || "",
     category: item.product_category || "",
     barcode: item.product_barcode || "",
     quantity: item.quantity || 1,
@@ -792,8 +795,8 @@ function itemsFromProductSnapshots(items) {
 
 function validItems(items) {
   return items
-    .filter((item) => item.barcode && Number(item.quantity) > 0)
-    .map((item) => ({ barcode: item.barcode, quantity: Number(item.quantity) }));
+    .filter((item) => item.item_kind === "material" || item.barcode)
+    .map((item) => item.item_kind === "material" ? {item_kind: "material", name: item.name, material_spec: item.material_spec, quantity: Number(item.quantity)} : ({ barcode: item.barcode, quantity: Number(item.quantity) }));
 }
 
 function renderSubmitSummary() {
@@ -829,7 +832,7 @@ async function renderSubmit() {
           <label for="store_id">门店</label>
           <select class="select" id="store_id" name="store_id" required>
             <option value="">选择门店</option>
-            ${state.stores.map((store) => `<option value="${store.id}" ${String(store.id) === String(state.submitDraft.store_id) ? "selected" : ""}>${escapeHtml(store.name)}</option>`).join("")}
+            ${state.stores.filter(store => store.kind !== "team").map((store) => `<option value="${store.id}" ${String(store.id) === String(state.submitDraft.store_id) ? "selected" : ""}>${escapeHtml(store.name)}</option>`).join("")}
           </select>
         </div>
       `
@@ -1088,7 +1091,7 @@ async function renderStoreBoard({ refreshData = true } = {}) {
   const content = `
     ${pageHead(
       "发货看板",
-      "查看本门店所有发货记录、处理状态和快递单号。",
+      "查看本归属单位的发货记录、处理状态和快递单号。",
       `<div class="actions">
         <span class="count-pill">今日 ${todayCounts.total} 单</span>
         <span class="count-pill">今日待处理 ${todayCounts["待处理"] || 0}</span>
@@ -1099,6 +1102,7 @@ async function renderStoreBoard({ refreshData = true } = {}) {
       </div>`
     )}
     <section class="panel panel-pad">
+      ${classificationFilters("store")}
       <div class="filters store-filters">
         <div class="quick-filters">
           <button class="btn secondary small ${state.storeFilters.date_from === today && state.storeFilters.date_to === today ? "active" : ""}" data-store-preset="today" type="button">今日</button>
@@ -1151,7 +1155,7 @@ function renderStoreBoardTable(shipments) {
               (row) => `
                 <tr>
                   <td>${escapeHtml(formatDate(row.created_at))}</td>
-                  <td><strong>${escapeHtml(row.store_order_no)}</strong></td>
+                  <td>${shipmentContext(row)}<strong>${escapeHtml(row.store_order_no)}</strong></td>
                   <td>
                     <strong>${escapeHtml(row.recipient_name)}</strong><br />
                     <span class="muted">${escapeHtml(row.phone)}</span><br />
@@ -1239,6 +1243,7 @@ function renderShipmentItemEditor(row) {
         .map(
           (item, index) => `
             <div class="edit-product-row" data-edit-item-row="${index}">
+              ${item.item_kind === "material" ? `<div class="field"><label>临时物料名称</label><input class="input" data-edit-material-name="${index}" maxlength="100" value="${escapeHtml(item.name || "")}"></div><div class="field"><label>规格</label><input class="input" data-edit-material-spec="${index}" maxlength="100" value="${escapeHtml(item.material_spec || "")}"></div>` : `
               <div class="field">
                 <label>分类</label>
                 <select class="select" data-edit-item-category="${index}" aria-label="货品分类">
@@ -1251,6 +1256,7 @@ function renderShipmentItemEditor(row) {
                   ${productOptions(item.category, item.barcode)}
                 </select>
               </div>
+              `}
               <div class="field">
                 <label>数量</label>
                 <input class="input" type="number" min="1" step="1" value="${escapeHtml(item.quantity || 1)}" data-edit-item-quantity="${index}" aria-label="数量" />
@@ -1262,6 +1268,7 @@ function renderShipmentItemEditor(row) {
         .join("")}
       <div class="inline-actions">
         <button class="btn secondary small" data-add-edit-item type="button">添加</button>
+        ${["resend", "exchange", "influencer", "sample"].includes(row.shipment_type) ? `<button class="btn secondary small" data-add-edit-material type="button">添加临时物料</button>` : ""}
         <button class="btn primary small" data-save-edit-items="${row.id}" type="button">保存商品</button>
         <button class="btn ghost small" data-cancel-edit-items type="button">取消</button>
       </div>
@@ -1270,6 +1277,11 @@ function renderShipmentItemEditor(row) {
 }
 
 function bindShipmentItemEditor(sourceRows) {
+  document.querySelectorAll("[data-edit-material-name], [data-edit-material-spec]").forEach(node => node.addEventListener("input", () => {
+    const isName = node.hasAttribute("data-edit-material-name");
+    state.shipmentEditItems[Number(isName ? node.dataset.editMaterialName : node.dataset.editMaterialSpec)][isName ? "name" : "material_spec"] = node.value;
+  }));
+  document.querySelector("[data-add-edit-material]")?.addEventListener("click", () => { state.shipmentEditItems.push({item_kind: "material", name: "", material_spec: "", quantity: 1}); render({refreshData: false}); });
   document.querySelectorAll("[data-edit-shipment-items]").forEach((node) => {
     node.addEventListener("click", (event) => {
       const id = Number(event.currentTarget.dataset.editShipmentItems);
@@ -1358,6 +1370,7 @@ function bindStoreBoard() {
   });
   document.getElementById("applyStoreFilters").addEventListener("click", () => {
     state.storeFilters = {
+      ...state.storeFilters,
       status: document.getElementById("storeFilterStatus").value,
       date_from: document.getElementById("storeFilterFrom").value,
       date_to: document.getElementById("storeFilterTo").value,
@@ -1705,7 +1718,7 @@ function renderReturnTable(rows, admin = false) {
                   <td>${escapeHtml(formatDate(row.created_at))}</td>
                   ${admin ? `<td>${escapeHtml(row.store_name_snapshot)}</td>` : ""}
                   <td>${renderReturnTrackingInfo(row)}</td>
-                  <td class="items-cell">${renderItemLines(row.items)}</td>
+                  <td class="items-cell">${renderItemLines(row.items)}<div class="actions"><a class="btn secondary small" href="/special/new?source_return=${row.id}" data-route>发起售后发货</a><button class="text-link" data-return-aftersales="${row.id}" type="button">查看关联寄出</button></div></td>
                   <td><span class="status ${statusClass(row.status)}">${escapeHtml(row.status)}</span></td>
                   <td>
                     ${row.sender_phone ? `<div class="muted mini">电话：${escapeHtml(row.sender_phone)}</div>` : ""}
@@ -1840,12 +1853,13 @@ function renderShippingBatchPreview() {
         </div>
         <button class="btn primary" id="createShippingBatch" data-ready="${preview.settings_ready && preview.label_ready && configReady ? "1" : "0"}" type="button" ${selectedIds.size && preview.settings_ready && preview.label_ready && configReady ? "" : "disabled"}>确认提交 ${selectedIds.size} 单</button>
       </div>
+      <div class="notice" id="batchTypeCounts">${Object.entries(preview.type_counts || {}).filter(([, count]) => count).map(([key, count]) => `${SHIPMENT_TYPES[key]?.[0] || key} ${count} 单`).join(" · ")}（预览总量，确认时按实际勾选复核）</div>
       <div class="notice">提交后将立即获取快递单号并生成电子面单，不再创建上门取件预约。</div>
       <div class="batch-order-list">
         ${eligible.map((row) => `
           <div class="batch-order-row" data-batch-shipment="${row.id}">
             <input class="batch-order-checkbox" type="checkbox" data-batch-select value="${row.id}" aria-label="选择订单 ${escapeHtml(row.business_id)}" ${selectedIds.has(Number(row.id)) ? "checked" : ""} />
-            <div><strong>${escapeHtml(row.business_id)}</strong><div class="muted mini">${escapeHtml(row.store_name_snapshot)} · ${escapeHtml(row.recipient_name)} · ${escapeHtml(row.address)}</div></div>
+            <div>${shipmentTypeBadge(row)}<strong>${escapeHtml(row.business_id)}</strong><div class="muted mini">${escapeHtml(row.store_name_snapshot)} · ${escapeHtml(row.recipient_name)} · ${escapeHtml(row.address)}</div>${row.return_unsigned_warning ? `<p class="notice">退货尚未签收，请总部核对后决定发货</p>` : ""}</div>
             <select class="select" data-batch-company>${expressCompanyOptions(row.express_company)}</select>
           </div>
         `).join("") || `<div class="empty">当前筛选没有可下单订单</div>`}
@@ -1961,6 +1975,7 @@ function renderTaskAlertDialog() {
                     <span class="status exception">${escapeHtml(item.status)}</span>
                   </div>
                   <div class="task-alert-tags">
+                    ${!item.system_scope && !item.type.startsWith("退货") ? shipmentTypeBadge(item) : ""}
                     <span>${escapeHtml(item.category || "其他")}</span>
                     <span>${escapeHtml(item.reason || "其他问题")}</span>
                     <span class="${item.auto_retry ? "auto" : "manual"}">${item.auto_retry ? "系统继续检查" : "需要人工处理"}</span>
@@ -2218,6 +2233,7 @@ async function renderAdmin({ refreshData = true } = {}) {
       </div>`
     )}
     <div id="taskAlertDialogHost">${renderTaskAlertDialog()}</div>
+    ${classificationFilters("admin")}
     ${renderBatchPrintPanel()}
     ${renderShippingBatchPreview()}
     ${renderShippingBatchProgress()}
@@ -2354,6 +2370,7 @@ function renderAdminShipmentOrderCell(row) {
   if (editable && state.editingShipmentRemarkId === row.id) {
     return `
       <div class="admin-order-cell">
+        ${shipmentContext(row)}
         <strong class="order-number" translate="no">${escapeHtml(row.store_order_no)}</strong>
         <div class="store-remark-editor">
           <textarea class="table-input" data-admin-remark maxlength="500" rows="3" aria-label="订单备注">${escapeHtml(row.remark || "")}</textarea>
@@ -2367,6 +2384,7 @@ function renderAdminShipmentOrderCell(row) {
   }
   return `
     <div class="admin-order-cell">
+      ${shipmentContext(row)}
       <strong class="order-number" translate="no">${escapeHtml(row.store_order_no)}</strong>
       ${row.remark ? `<div class="muted mini order-remark">${escapeHtml(row.remark)}</div>` : `<div class="muted mini">无备注</div>`}
       ${editable ? `<button class="btn secondary small" data-edit-admin-remark="${row.id}" type="button">修改备注</button>` : ""}
@@ -2586,6 +2604,7 @@ function bindAdmin() {
     previewButton.addEventListener("click", async (event) => {
       try {
         state.batchFilters = {
+          ...state.adminFilters,
           store_id: state.adminFilters.store_id,
           status: "待处理",
           date_from: state.adminFilters.date_from,
@@ -2626,6 +2645,7 @@ function bindAdmin() {
   });
   document.getElementById("applyBatchFilters")?.addEventListener("click", async () => {
     state.batchFilters = {
+      ...state.batchFilters,
       store_id: document.getElementById("batchFilterStore").value,
       status: "待处理",
       date_from: document.getElementById("batchFilterFrom").value,
@@ -2640,7 +2660,7 @@ function bindAdmin() {
     }
   });
   document.getElementById("resetBatchFilters")?.addEventListener("click", async () => {
-    state.batchFilters = { store_id: "", status: "待处理", date_from: "", date_to: "", q: "" };
+    state.batchFilters = { ...state.batchFilters, store_id: "", status: "待处理", date_from: "", date_to: "", q: "" };
     try {
       await loadShippingBatchPreview(state.batchFilters);
       render({ refreshData: false });
@@ -2664,7 +2684,13 @@ function bindAdmin() {
       toast("请至少选择一个需要打单的订单。");
       return;
     }
-    if (!confirm(`确认向快递100提交 ${shipments.length} 张电子面单？成功后将立即取得快递单号。`)) return;
+    const selectedCounts = {};
+    for (const choice of shipments) {
+      const type = state.batchPreview.eligible.find(row => row.id === choice.id)?.shipment_type || "legacy";
+      selectedCounts[type] = (selectedCounts[type] || 0) + 1;
+    }
+    const typeSummary = Object.entries(selectedCounts).map(([type, count]) => `${SHIPMENT_TYPES[type][0]} ${count} 单`).join("、");
+    if (!confirm(`本批次：${typeSummary}。\n确认向快递100提交 ${shipments.length} 张电子面单？成功后将立即取得快递单号。`)) return;
     try {
       const data = await withButtonBusy(event.currentTarget, "正在创建任务…", () =>
         api("/api/admin/shipping-batches", {
@@ -2718,7 +2744,9 @@ function bindAdmin() {
     });
   });
   document.getElementById("applyFilters").addEventListener("click", () => {
+    clearShipmentSelections();
     state.adminFilters = {
+      ...state.adminFilters,
       store_id: document.getElementById("filterStore").value,
       status: document.getElementById("filterStatus").value,
       date_from: document.getElementById("filterFrom").value,
@@ -2729,6 +2757,7 @@ function bindAdmin() {
     render();
   });
   document.getElementById("resetFilters").addEventListener("click", () => {
+    clearShipmentSelections();
     state.adminFilters = { store_id: "", status: "", date_from: "", date_to: "", q: "" };
     state.adminShipmentPage = 1;
     render();
@@ -2909,13 +2938,14 @@ function bindAdmin() {
 async function renderStores() {
   await loadStores(true);
   const content = `
-    ${pageHead("门店", "维护门店和店员登录账号。")}
+    ${pageHead("门店与团队", "管理实体门店与合作团队。合作账号只能查看本团队寄送记录。")}
     <div class="grid-2">
       <section class="panel panel-pad">
-        <div class="section-title"><h2>新增门店</h2></div>
+        <div class="section-title"><h2>新增门店 / 合作团队</h2></div>
         <form id="storeForm" class="form-grid">
+          <label class="field full">归属类型<select class="select" name="kind"><option value="store">实体门店</option><option value="team">合作团队</option></select></label>
           <div class="field full">
-            <label for="storeName">门店名称</label>
+            <label for="storeName">门店或团队名称</label>
             <input class="input" id="storeName" name="name" required />
           </div>
           <div class="field">
@@ -2932,8 +2962,9 @@ async function renderStores() {
         </form>
       </section>
       <section class="panel panel-pad">
-        <div class="section-title"><h2>门店数量</h2><span class="count-pill">${state.stores.length}</span></div>
-        <p class="muted">停用门店会同步停用对应店员账号。</p>
+        <div class="section-title"><h2>实体门店数量</h2><span class="count-pill">${state.stores.filter(row => row.kind !== "team").length}</span></div>
+        <p>合作团队：${state.stores.filter(row => row.kind === "team").length} 个（不计入实体门店）</p>
+        <p class="muted">停用门店或团队会同步停用对应账号。</p>
       </section>
     </div>
     <section class="panel panel-pad" style="margin-top: 16px;">
@@ -3119,7 +3150,7 @@ function renderStoresTable() {
               (store) => `
                 <tr>
                   <td>${store.id}</td>
-                  <td><strong>${escapeHtml(store.name)}</strong></td>
+                  <td><strong>${escapeHtml(store.name)}</strong><br><span class="shipment-type">${store.kind === "team" ? "合作团队" : "实体门店"}</span></td>
                   <td>${escapeHtml(store.usernames || "")}</td>
                   <td><span class="status ${store.active ? "shipped" : "cancelled"}">${store.active ? "启用" : "停用"}</span></td>
                   <td>${escapeHtml(formatDate(store.created_at))}</td>
@@ -3145,9 +3176,10 @@ function bindStores() {
           name: form.get("name"),
           username: form.get("username"),
           password: form.get("password"),
+          kind: form.get("kind"),
         }),
       });
-      toast("门店已创建。");
+      toast("门店 / 团队及其账号已创建。");
       render();
     } catch (error) {
       errorToast(error);
@@ -3350,6 +3382,7 @@ function bindProducts() {
 }
 
 function bindCommon() {
+  bindSpecialControls();
   bindTrackingCopyButtons();
   bindTrackingDetails();
   bindShipmentPagination();
@@ -3396,19 +3429,21 @@ async function render({ refreshData = true } = {}) {
     return;
   }
   if (state.user && (path === "/" || path === "/login")) {
-    history.replaceState({}, "", state.user.role === "admin" ? "/admin" : "/submit");
+    history.replaceState({}, "", state.user.role === "admin" ? "/admin" : state.user.store_kind === "team" ? "/special/new" : "/submit");
   }
 
   try {
     if (location.pathname === "/login") {
       renderLogin();
+    } else if (location.pathname === "/special/new" || (location.pathname === "/submit" && state.user.store_kind === "team")) {
+      await renderSpecialShipment();
     } else if (location.pathname === "/submit") {
       await renderSubmit();
     } else if (location.pathname === "/shipments" && state.user.role === "staff") {
       await renderStoreBoard({ refreshData });
-    } else if (location.pathname === "/returns/new" && state.user.role === "staff") {
+    } else if (location.pathname === "/returns/new" && state.user.role === "staff" && state.user.store_kind !== "team") {
       await renderReturnNew();
-    } else if (location.pathname === "/returns" && state.user.role === "staff") {
+    } else if (location.pathname === "/returns" && state.user.role === "staff" && state.user.store_kind !== "team") {
       await renderReturnBoard(false);
     } else if (location.pathname === "/admin" && state.user.role === "admin") {
       await renderAdmin({ refreshData });
@@ -3421,7 +3456,7 @@ async function render({ refreshData = true } = {}) {
     } else if (location.pathname === "/admin/shipping" && state.user.role === "admin") {
       await renderShippingSettings();
     } else {
-      navigate(state.user.role === "admin" ? "/admin" : "/submit");
+      navigate(state.user.role === "admin" ? "/admin" : state.user.store_kind === "team" ? "/special/new" : "/submit");
     }
   } catch (error) {
     document.getElementById("app").innerHTML = shell(`<section class="panel panel-pad"><div class="empty">${escapeHtml(error.message)}</div></section>`);

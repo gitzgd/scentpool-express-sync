@@ -921,7 +921,7 @@ def app_summary(result: Dict[str, Any], *, daily: bool = False) -> Dict[str, Any
     if audit_payload_is_private(data):
         return schema_error(result, "日报响应出现不允许的敏感字段，已停止转发。")
     allowed = (
-        "date", "timezone", "metrics", "by_store", "exceptions", "historical_end_of_day",
+        "date", "timezone", "metrics", "by_store", "shipment_classification", "exceptions", "historical_end_of_day",
         "failures", "completeness", "long_waiting", "recent_7_day_average", "data_quality", "basis",
     )
     if data.get("date") is None or data.get("timezone") is None:

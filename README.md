@@ -28,6 +28,8 @@ python3 server.py --host 0.0.0.0 --port 8765
 
 ## 环境变量
 
+售后与合作发货无需新增环境变量。门店通过 `/special/new` 创建补发/换货；总部在“门店与团队”创建独立合作账号后，该账号直接进入合作寄送。历史订单保留未分类，内部用途不上面单。完整权限、统计及迁移/回滚说明见 [售后与合作发货](docs/features/special-shipments.md)。专项测试为 `python3 special_shipments_test.py`，已包含于完整烟测。
+
 - `PORT`：云端端口，Render 会自动注入。
 - `SCENTPOOL_ENV=production`：开启生产模式。
 - `SCENTPOOL_DB_PATH=/var/data/scentpool.db`：生产数据库路径。

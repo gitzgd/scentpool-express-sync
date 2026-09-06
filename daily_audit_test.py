@@ -455,12 +455,14 @@ def assert_contract(report: Dict[str, Any]) -> None:
     }
     expected_by_store = {
         "审计门店甲": {
+            "store_kind": "store",
             "new_shipments": 1,
             "shipped_shipments": 2,
             "signed_shipments": 1,
             "backlog_current_snapshot": 1,
         },
         "审计门店乙": {
+            "store_kind": "store",
             "new_shipments": 2,
             "shipped_shipments": 1,
             "signed_shipments": 0,

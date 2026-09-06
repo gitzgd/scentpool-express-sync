@@ -129,9 +129,11 @@ EXPORT_HEADERS = [
     "签收时间",
     "发货备注",
     "发货时间",
+    "发货大类", "发货类型", "归属类型", "原订单编号", "关联退货编号",
 ]
 
 EXPORT_COLUMN_WIDTHS = [28, 10, 20, 14, 18, 10, 12, 16, 36, 52, 24, 12, 22, 14, 46, 20, 20, 24, 20]
+EXPORT_COLUMN_WIDTHS += [16, 16, 14, 24, 16]
 
 
 def export_rows(shipments: Any) -> list[list[Any]]:
@@ -158,6 +160,10 @@ def export_rows(shipments: Any) -> list[list[Any]]:
                 row["tracking_signed_at"],
                 row["shipping_note"],
                 row["shipped_at"],
+                {"ordinary": "普通发货", "aftersales": "售后发货", "cooperation": "合作寄送", "legacy": "历史未分类"}.get(row.get("shipment_group"), "历史未分类"),
+                row.get("shipment_type_label", "历史未分类"),
+                "合作团队" if row.get("store_kind") == "team" else "实体门店",
+                row.get("original_business_id") or "", row.get("related_return_id") or "",
             ]
         )
     return rows
@@ -928,7 +934,7 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/static/"):
                 self.serve_static(path)
                 return
-            if path in {"/", "/login", "/submit", "/shipments", "/returns/new", "/returns", "/admin", "/admin/returns", "/admin/stores", "/admin/products", "/admin/shipping"}:
+            if path in {"/", "/login", "/submit", "/special/new", "/shipments", "/returns/new", "/returns", "/admin", "/admin/returns", "/admin/stores", "/admin/products", "/admin/shipping"}:
                 self.serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
                 return
             self.error_json("页面不存在。", 404)
@@ -1027,7 +1033,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/stores" and self.command == "GET":
             include_inactive = user["role"] == "admin" and query.get("all") == "1"
-            self.send_json({"stores": DB.list_stores(include_inactive=include_inactive)})
+            stores = DB.list_stores(include_inactive=include_inactive)
+            if user["role"] == "staff":
+                stores = [row for row in stores if row["id"] == user["store_id"]]
+            self.send_json({"stores": stores})
             return
 
         if path == "/api/stores" and self.command == "POST":
@@ -1037,6 +1046,7 @@ class Handler(BaseHTTPRequestHandler):
                 str(body.get("name", "")),
                 str(body.get("username", "")),
                 str(body.get("password", "")),
+                str(body.get("kind") or "store"),
             )
             self.send_json({"store": store}, status=201)
             return
@@ -1362,6 +1372,11 @@ class Handler(BaseHTTPRequestHandler):
                 log_audit_print_event("batch_print", "failure", request_started)
                 raise
             log_audit_print_event("batch_print", "success", request_started)
+            return
+
+        if path.startswith("/api/shipments/") and path.endswith("/context") and self.command == "PATCH":
+            shipment = DB.update_shipment_context(int(path.split("/")[3]), user, self.read_json())
+            self.send_json({"shipment": shipment})
             return
 
         if path.startswith("/api/shipments/") and path.endswith("/items") and self.command == "PATCH":

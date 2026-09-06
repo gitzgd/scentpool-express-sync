@@ -12,6 +12,8 @@
 
 当前记录：
 
+- [`ADR-0007-shipment-purpose-and-owner-kind.md`](ADR-0007-shipment-purpose-and-owner-kind.md)：分类和归属区分售后/合作，复用履约流程，内部用途与面单分离。
+
 - [`ADR-0001-sqlite-single-instance.md`](ADR-0001-sqlite-single-instance.md)：单实例阶段继续使用 SQLite。
 - [`ADR-0002-provider-confirmed-label-cancellation.md`](ADR-0002-provider-confirmed-label-cancellation.md)：只有供应商确认后才释放电子面单。
 - [`ADR-0003-default-delivery-and-local-acceptance.md`](ADR-0003-default-delivery-and-local-acceptance.md)：普通改动默认提交、发布，并提供合成数据本地验收界面。

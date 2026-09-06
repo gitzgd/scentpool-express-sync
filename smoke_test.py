@@ -28,7 +28,8 @@ import tracking
 import daily_audit_probe_test
 import daily_audit_test
 import shipment_time_integrity_test
-from database import AppError, DEFAULT_PRODUCT_FILE, Database
+import special_shipments_test
+from database import AppError, DEFAULT_PRODUCT_FILE, Database, now_text
 
 
 def request(opener, base, method, path, payload=None):
@@ -586,6 +587,10 @@ def main() -> None:
         with legacy_db.connect() as legacy_conn:
             migrated = legacy_conn.execute("SELECT * FROM shipments WHERE id = 1").fetchone()
             assert migrated["order_date"] == "2026-07-09"
+            assert migrated["shipment_type"] == "legacy"
+            assert migrated["internal_note"] == ""
+            assert migrated["original_shipment_id"] is None
+            assert legacy_conn.execute("SELECT kind FROM stores WHERE id=1").fetchone()[0] == "store"
             assert migrated["business_id"] == "20260709-S01-1001"
             assert legacy_conn.execute("SELECT COUNT(*) FROM shipment_items WHERE shipment_id = 1").fetchone()[0] == 1
             migrated_return = legacy_conn.execute("SELECT * FROM return_orders WHERE id = 1").fetchone()
@@ -1495,13 +1500,14 @@ def main() -> None:
         store_code = f"S{int(body['shipments'][0]['store_id']):02d}"
 
         def fake_query_tracking(_shipment):
+            event_time = now_text()
             return {
                 "provider": "kuaidi100",
                 "tracking_status": "已签收",
                 "state_code": "3",
-                "last_event": f"{created_date} 12:00:00 已签收",
-                "checked_at": f"{created_date}T12:05:00+08:00",
-                "signed_at": f"{created_date} 12:00:00",
+                "last_event": f"{event_time} 已签收",
+                "checked_at": event_time,
+                "signed_at": event_time,
                 "signed_at_source": "provider_event",
                 "error": "",
                 "raw": "{}",
@@ -1826,6 +1832,7 @@ def main() -> None:
         daily_audit_test.main()
         shipment_time_integrity_test.main()
         daily_audit_probe_test.main()
+        special_shipments_test.main()
         print("smoke test passed")
 
 

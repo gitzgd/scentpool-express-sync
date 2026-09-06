@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from zoneinfo import ZoneInfo
 
 from xlsx_importer import XlsxImportError, read_products
+from shipment_types import SHIPMENT_TYPES, SPECIAL_TYPES, GROUP_LABELS, type_info, category_counts, migrate as migrate_shipment_types
 
 
 DEFAULT_PRODUCT_FILE = "/Users/zgd/Downloads/万物香铺 商品资料 .xlsx"
@@ -533,6 +534,7 @@ class Database:
             self._ensure_return_tracking_columns(conn)
             self._ensure_shipping_batch_columns(conn)
             self._ensure_label_columns(conn)
+            migrate_shipment_types(conn)
             self._normalize_shipments_with_tracking(conn)
             self._ensure_audit_history(conn)
             self._ensure_shipment_time_integrity(conn)
@@ -1610,6 +1612,7 @@ class Database:
                     "message": message,
                     "updated_at": updated_at,
                     "batch_id": int(batch_id) if batch_id else None,
+                    **type_info(row["shipment_type"] if "shipment_type" in row.keys() else "legacy"),
                 }
             )
 
@@ -1619,6 +1622,7 @@ class Database:
                 SELECT
                     shipments.id,
                     shipments.business_id,
+                    shipments.shipment_type,
                     shipments.store_name_snapshot AS store_name,
                     shipments.booking_status,
                     shipments.booking_error,
@@ -2260,6 +2264,7 @@ class Database:
                 """
                 SELECT
                     COALESCE(NULLIF(TRIM(stores.name), ''), '未知门店') AS store_name,
+                    COALESCE(stores.kind, 'store') AS store_kind,
                     COALESCE(SUM(CASE WHEN julianday(shipments.created_at) >= julianday(?)
                         AND julianday(shipments.created_at) < julianday(?) THEN 1 ELSE 0 END), 0) AS new_shipments,
                     COALESCE(SUM(CASE WHEN julianday(shipments.shipped_at) >= julianday(?)
@@ -2276,6 +2281,18 @@ class Database:
                 """,
                 (day_start, day_end, day_start, day_end, day_start, day_end, day_end),
             ).fetchall()
+
+            type_rows = conn.execute("""SELECT shipment_type,
+                SUM(CASE WHEN julianday(created_at)>=julianday(?) AND julianday(created_at)<julianday(?) THEN 1 ELSE 0 END) AS new_shipments,
+                SUM(CASE WHEN julianday(shipped_at)>=julianday(?) AND julianday(shipped_at)<julianday(?) THEN 1 ELSE 0 END) AS shipped_shipments,
+                SUM(CASE WHEN julianday(tracking_signed_at)>=julianday(?) AND julianday(tracking_signed_at)<julianday(?) THEN 1 ELSE 0 END) AS signed_shipments,
+                SUM(CASE WHEN status='待处理' AND julianday(created_at)<julianday(?) THEN 1 ELSE 0 END) AS backlog_current_snapshot
+                FROM shipments GROUP BY shipment_type""", (day_start,day_end,day_start,day_end,day_start,day_end,day_end)).fetchall()
+            by_type = {key: {metric: 0 for metric in totals} for key in SHIPMENT_TYPES}
+            for row in type_rows:
+                by_type[row["shipment_type"]] = {metric: int(row[metric] or 0) for metric in totals}
+            by_group = {group: {metric: sum(by_type[key][metric] for key, value in SHIPMENT_TYPES.items() if value[2] == group)
+                                for metric in totals} for group in GROUP_LABELS}
 
             recent_totals = dict(
                 conn.execute(
@@ -2439,9 +2456,14 @@ class Database:
             "date": date_text,
             "timezone": "Asia/Shanghai",
             "metrics": {key: int(value or 0) for key, value in totals.items()},
+            "shipment_classification": {
+                "by_type": by_type, "by_group": by_group,
+                "basis": "same_timestamp_metrics_and_current_backlog_as_platform_totals_legacy_not_inferred",
+            },
             "by_store": [
                 {
                     "store_name": str(row["store_name"]),
+                    "store_kind": str(row["store_kind"]),
                     "new_shipments": int(row["new_shipments"] or 0),
                     "shipped_shipments": int(row["shipped_shipments"] or 0),
                     "signed_shipments": int(row["signed_shipments"] or 0),
@@ -2839,7 +2861,7 @@ class Database:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT users.*, stores.name AS store_name
+                SELECT users.*, stores.name AS store_name, stores.kind AS store_kind
                 FROM users
                 LEFT JOIN stores ON stores.id = users.store_id
                 WHERE username = ? AND users.active = 1
@@ -2871,7 +2893,7 @@ class Database:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT users.*, stores.name AS store_name, sessions.expires_at
+                SELECT users.*, stores.name AS store_name, stores.kind AS store_kind, sessions.expires_at
                 FROM sessions
                 JOIN users ON users.id = sessions.user_id
                 LEFT JOIN stores ON stores.id = users.store_id
@@ -2896,6 +2918,7 @@ class Database:
             "role": row["role"],
             "store_id": row["store_id"],
             "store_name": row["store_name"],
+            "store_kind": row["store_kind"],
         }
 
     def list_stores(self, include_inactive: bool = False) -> List[Dict[str, Any]]:
@@ -2912,9 +2935,11 @@ class Database:
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
-    def create_store(self, name: str, username: str, password: str) -> Dict[str, Any]:
+    def create_store(self, name: str, username: str, password: str, kind: str = "store") -> Dict[str, Any]:
         name = name.strip()
         username = username.strip()
+        if kind not in {"store", "team"}:
+            raise AppError("请选择实体门店或合作团队。")
         if not name:
             raise AppError("请输入门店名称。")
         if not username:
@@ -2925,8 +2950,8 @@ class Database:
         try:
             with self.connect() as conn:
                 cursor = conn.execute(
-                    "INSERT INTO stores (name, active, created_at, updated_at) VALUES (?, 1, ?, ?)",
-                    (name, now, now),
+                    "INSERT INTO stores (name, kind, active, created_at, updated_at) VALUES (?, ?, 1, ?, ?)",
+                    (name, kind, now, now),
                 )
                 store_id = cursor.lastrowid
                 conn.execute(
@@ -2938,7 +2963,7 @@ class Database:
                 )
         except sqlite3.IntegrityError as exc:
             raise AppError("门店名称或账号已存在。", 409) from exc
-        return {"id": store_id, "name": name, "username": username}
+        return {"id": store_id, "name": name, "username": username, "kind": kind}
 
     def update_store(self, store_id: int, active: bool) -> Dict[str, Any]:
         now = now_text()
@@ -3019,10 +3044,9 @@ class Database:
 
     def create_shipment(self, user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
         store_id = user.get("store_id") if user.get("role") == "staff" else payload.get("store_id")
-        try:
-            store_id = int(store_id)
-        except (TypeError, ValueError):
-            raise AppError("请选择门店。")
+        if isinstance(store_id, bool) or not re.fullmatch(r"[1-9][0-9]{0,11}", str(store_id)):
+            raise AppError("请选择有效的门店或团队。")
+        store_id = int(store_id)
 
         recipient_name = str(payload.get("recipient_name", "")).strip()
         phone = str(payload.get("phone", "")).strip()
@@ -3030,6 +3054,18 @@ class Database:
         store_order_no = str(payload.get("store_order_no", "")).strip()
         remark = str(payload.get("remark", "")).strip()
         raw_items = payload.get("items") or []
+        shipment_type = str(payload.get("shipment_type") or "standard")
+        if shipment_type not in SHIPMENT_TYPES or shipment_type == "legacy":
+            raise AppError("请选择有效的发货类型；历史未分类仅供旧记录保留。")
+        special = shipment_type in SPECIAL_TYPES
+        request_key = str(payload.get("submission_key") or "")
+        if special and not re.fullmatch(r"[A-Za-z0-9_-]{16,100}", request_key):
+            raise AppError("提交标识无效，请刷新新建页面后重试。")
+        context = self._shipment_context(payload, shipment_type)
+        digest = hashlib.sha256(json.dumps({
+            "type": shipment_type, "recipient_name": recipient_name, "phone": phone,
+            "address": address, "remark": remark, "items": raw_items, **context,
+        }, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
 
         if not recipient_name:
             raise AppError("请输入姓名。")
@@ -3037,22 +3073,39 @@ class Database:
             raise AppError("请输入有效联系电话。")
         if not address:
             raise AppError("请输入快递地址。")
-        if not store_order_no:
+        if not special and not store_order_no:
             raise AppError("请输入门店订单号。")
+        if len(remark) > 500 or len(recipient_name) > 100 or len(phone) > 80 or len(address) > 1000 or len(store_order_no) > 200:
+            raise AppError("填写内容过长，请缩短姓名、地址、备注或订单号。")
         if not isinstance(raw_items, list) or not raw_items:
             raise AppError("请至少选择一个货品。")
 
         now = now_text()
         order_date = now[:10]
+        if special:
+            prefix = "AS" if SHIPMENT_TYPES[shipment_type][2] == "aftersales" else "CO"
+            store_order_no = f"{prefix}-{secrets.token_hex(8).upper()}"
         business_id = shipment_business_id(order_date, store_id, store_order_no)
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             store = conn.execute(
                 "SELECT * FROM stores WHERE id = ? AND active = 1", (store_id,)
             ).fetchone()
             if not store:
                 raise AppError("门店不存在或已停用。")
-
-            items = self._resolve_items(conn, raw_items)
+            allowed = {"influencer", "sample"} if store["kind"] == "team" else {"standard", "resend", "exchange"}
+            if shipment_type not in allowed:
+                raise AppError("合作团队只能提交合作寄送；门店只能提交普通或售后发货。", 403)
+            if special:
+                previous = conn.execute("SELECT * FROM shipment_submissions WHERE store_id=? AND request_key=?", (store_id, request_key)).fetchone()
+                if previous:
+                    if previous["payload_hash"] != digest:
+                        raise AppError("本次提交内容已变化。请先确认上次是否成功，再作为新单提交。", 409)
+                    if previous["shipment_id"] is None:
+                        raise AppError("本次提交的记录已被删除，不会重复创建。请重新新建。", 409)
+                    return self._list_shipments_with_connection(conn, user, {"id": previous["shipment_id"]})[0]
+            self._validate_shipment_links(conn, store_id, context)
+            items = self._resolve_items(conn, raw_items, allow_materials=special)
             existing = conn.execute(
                 """
                 SELECT id, business_id
@@ -3072,9 +3125,10 @@ class Database:
                     """
                     INSERT INTO shipments (
                         order_date, business_id, store_id, store_name_snapshot, created_by, recipient_name, phone, address,
-                        store_order_no, remark, status, created_at, updated_at
+                        store_order_no, remark, status, created_at, updated_at,
+                        shipment_type, internal_note, cooperation_subject, original_shipment_id, related_return_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '待处理', ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '待处理', ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         order_date,
@@ -3089,39 +3143,104 @@ class Database:
                         remark,
                         now,
                         now,
+                        shipment_type, context["internal_note"], context["cooperation_subject"],
+                        context["original_shipment_id"], context["related_return_id"],
                     ),
                 )
             except sqlite3.IntegrityError as exc:
                 raise AppError("同一门店同一天的订单号不能重复。", 409) from exc
 
             shipment_id = cursor.lastrowid
-            for item in items:
-                conn.execute(
-                    """
-                    INSERT INTO shipment_items (
-                        shipment_id, product_barcode, product_name, product_category, unit_price, quantity
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        shipment_id,
-                        item["barcode"],
-                        item["name"],
-                        item["category"],
-                        item["price"],
-                        item["quantity"],
-                    ),
-                )
+            self._insert_shipment_items(conn, shipment_id, items)
+            if special:
+                conn.execute("INSERT INTO shipment_submissions VALUES (?,?,?,?)", (store_id, request_key, digest, shipment_id))
         return self.get_shipment(shipment_id, user)
 
-    def _resolve_items(self, conn: sqlite3.Connection, raw_items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _shipment_context(self, payload, shipment_type):
+        context = {key: str(payload.get(key) or "").strip() for key in ("internal_note", "cooperation_subject")}
+        if any(len(value) > 1000 for value in context.values()):
+            raise AppError("内部说明或合作对象不能超过 1000 字。")
+        for key in ("original_shipment_id", "related_return_id"):
+            raw = payload.get(key)
+            if raw is None or raw == "":
+                context[key] = None
+            elif isinstance(raw, bool) or not re.fullmatch(r"[1-9][0-9]{0,11}", str(raw)):
+                raise AppError("关联记录编号无效。")
+            else:
+                context[key] = int(raw)
+        group = SHIPMENT_TYPES[shipment_type][2]
+        if shipment_type in SPECIAL_TYPES and not context["internal_note"]:
+            raise AppError("请填写售后原因或寄送用途（仅内部可见）。")
+        if group == "cooperation" and not context["cooperation_subject"]:
+            raise AppError("请填写合作对象或项目。")
+        if group != "aftersales" and (context["original_shipment_id"] or context["related_return_id"]):
+            raise AppError("只有售后发货可以关联原发货或退货记录。")
+        if group != "cooperation" and context["cooperation_subject"]:
+            raise AppError("只有合作寄送可以填写合作对象或项目。")
+        if shipment_type == "standard" and context["internal_note"]:
+            raise AppError("普通发货不使用特殊用途说明。")
+        return context
+
+    def _validate_shipment_links(self, conn, store_id, context):
+        for key, table in (("original_shipment_id", "shipments"), ("related_return_id", "return_orders")):
+            if context[key] is not None:
+                row = conn.execute(f"SELECT store_id FROM {table} WHERE id=?", (context[key],)).fetchone()
+                if not row or row["store_id"] != store_id:
+                    raise AppError("关联记录不存在或不属于所选门店。", 403)
+
+    def update_shipment_context(self, shipment_id, user, payload):
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM shipments WHERE id=?", (shipment_id,)).fetchone()
+            if not row or (user.get("role") == "staff" and row["store_id"] != user.get("store_id")):
+                raise AppError("发货单不存在。", 404)
+            if row["shipment_type"] not in SPECIAL_TYPES:
+                raise AppError("此订单没有特殊发货说明。")
+            if row["status"] != "待处理" or row["booking_status"] not in BOOKING_EDITABLE_STATUSES:
+                raise AppError("订单已进入下单或发货流程，不能修改内部说明。", 409)
+            context = self._shipment_context({**dict(row), **payload}, row["shipment_type"])
+            if any(context[key] != row[key] for key in ("original_shipment_id", "related_return_id")):
+                raise AppError("提交后保留原始关联关系，不能替换关联记录。", 409)
+            self._validate_shipment_links(conn, row["store_id"], context)
+            if context["original_shipment_id"] == shipment_id:
+                raise AppError("不能关联当前订单自身。")
+            conn.execute("UPDATE shipments SET internal_note=?, cooperation_subject=?, original_shipment_id=?, related_return_id=?, updated_at=? WHERE id=?",
+                         (context["internal_note"], context["cooperation_subject"], context["original_shipment_id"],
+                          context["related_return_id"], now_text(), shipment_id))
+        return self.get_shipment(shipment_id, user)
+
+    @staticmethod
+    def _insert_shipment_items(conn, shipment_id, items):
+        for item in items:
+            conn.execute("""INSERT INTO shipment_items (
+                shipment_id, product_barcode, product_name, product_category, unit_price, quantity, item_kind, material_spec
+                ) VALUES (?,?,?,?,?,?,?,?)""", (shipment_id, item["barcode"], item["name"], item["category"],
+                item["price"], item["quantity"], item.get("item_kind", "product"), item.get("material_spec", "")))
+
+    def _resolve_items(self, conn: sqlite3.Connection, raw_items: Iterable[Dict[str, Any]], *, allow_materials=False) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
+        if not isinstance(raw_items, list) or len(raw_items) > 100:
+            raise AppError("每单最多填写 100 项明细。")
         for raw in raw_items:
+            if not isinstance(raw, dict):
+                raise AppError("货品明细格式不正确。")
             barcode = str(raw.get("barcode", "")).strip()
-            try:
-                quantity = int(raw.get("quantity", 0))
-            except (TypeError, ValueError):
-                quantity = 0
+            if not re.fullmatch(r"[1-9][0-9]{0,5}", str(raw.get("quantity", ""))):
+                raise AppError("数量必须为 1 至 999999 的正整数。")
+            quantity = int(raw["quantity"])
+            kind = raw.get("item_kind", "product")
+            if kind == "material":
+                if not allow_materials:
+                    raise AppError("仅售后与合作发货支持临时物料。")
+                name = str(raw.get("name") or "").strip()
+                spec = str(raw.get("material_spec") or "").strip()
+                if not name or not spec or len(name) > 100 or len(spec) > 100:
+                    raise AppError("临时物料请填写名称和规格，各不超过 100 字。")
+                items.append({"barcode": "", "name": f"{name}（{spec}）", "category": "临时物料", "price": "0.00",
+                              "quantity": quantity, "item_kind": kind, "material_spec": spec})
+                continue
+            if kind != "product":
+                raise AppError("明细类型不正确。")
             if not barcode or quantity <= 0:
                 raise AppError("货品和数量不能为空。")
             product = conn.execute(
@@ -3145,6 +3264,7 @@ class Database:
 
         now = now_text()
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             shipment = conn.execute("SELECT * FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
             if not shipment:
                 raise AppError("发货单不存在。", 404)
@@ -3155,25 +3275,9 @@ class Database:
             if shipment["booking_status"] not in BOOKING_EDITABLE_STATUSES:
                 raise AppError("快递下单处理中。如需修改，请先取消快递下单。", 409)
 
-            items = self._resolve_items(conn, raw_items)
+            items = self._resolve_items(conn, raw_items, allow_materials=shipment["shipment_type"] in SPECIAL_TYPES)
             conn.execute("DELETE FROM shipment_items WHERE shipment_id = ?", (shipment_id,))
-            for item in items:
-                conn.execute(
-                    """
-                    INSERT INTO shipment_items (
-                        shipment_id, product_barcode, product_name, product_category, unit_price, quantity
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        shipment_id,
-                        item["barcode"],
-                        item["name"],
-                        item["category"],
-                        item["price"],
-                        item["quantity"],
-                    ),
-                )
+            self._insert_shipment_items(conn, shipment_id, items)
             conn.execute("UPDATE shipments SET updated_at = ? WHERE id = ?", (now, shipment_id))
         return self.get_shipment(shipment_id, user)
 
@@ -3184,6 +3288,7 @@ class Database:
 
         now = now_text()
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             shipment = conn.execute(
                 "SELECT store_id, status, booking_status FROM shipments WHERE id = ?",
                 (shipment_id,),
@@ -3213,6 +3318,21 @@ class Database:
         if filters.get("id"):
             where.append("shipments.id = ?")
             params.append(filters["id"])
+
+        for key in ("original_shipment_id", "related_return_id"):
+            if filters.get(key):
+                where.append(f"shipments.{key} = ?")
+                params.append(filters[key])
+        group = str(filters.get("shipment_group") or "")
+        kind = str(filters.get("shipment_type") or "")
+        if group and group not in GROUP_LABELS:
+            raise AppError("发货大类无效。")
+        if kind and (kind not in SHIPMENT_TYPES or (group and SHIPMENT_TYPES[kind][2] != group)):
+            raise AppError("发货类型与大类不匹配。")
+        types = [kind] if kind else [key for key, value in SHIPMENT_TYPES.items() if value[2] == group]
+        if types:
+            where.append("shipments.shipment_type IN (" + ",".join("?" for _ in types) + ")")
+            params.extend(types)
 
         if user.get("role") == "staff":
             where.append("shipments.store_id = ?")
@@ -3334,7 +3454,14 @@ class Database:
             for column in self._shipment_columns
             if column not in excluded
         )
-        sql = f"SELECT {selected_columns} FROM shipments"
+        sql = f"""SELECT {selected_columns}, stores.kind AS store_kind,
+            original.business_id AS original_business_id, original.store_order_no AS original_store_order_no,
+            returns.status AS related_return_status,
+            (SELECT COUNT(*) FROM shipments child WHERE child.original_shipment_id=shipments.id) AS aftersales_count
+            FROM shipments
+            LEFT JOIN stores ON stores.id=shipments.store_id
+            LEFT JOIN shipments original ON original.id=shipments.original_shipment_id AND original.store_id=shipments.store_id
+            LEFT JOIN return_orders returns ON returns.id=shipments.related_return_id AND returns.store_id=shipments.store_id"""
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY shipments.created_at DESC, shipments.id DESC"
@@ -3357,6 +3484,8 @@ class Database:
             items_by_shipment.setdefault(item["shipment_id"], []).append(dict(item))
 
         for row in rows:
+            row.update(type_info(row["shipment_type"]))
+            row["return_unsigned_warning"] = bool(row["related_return_id"] and row["related_return_status"] != "已签收")
             row["items"] = items_by_shipment.get(row["id"], [])
             row["item_summary"] = "；".join(
                 f"{item['product_category']} / {item['product_name']} x{item['quantity']}"
@@ -3668,6 +3797,8 @@ class Database:
                     "recipient_name": shipment["recipient_name"],
                     "address": shipment["address"],
                     "express_company": company,
+                    **type_info(shipment["shipment_type"]),
+                    "return_unsigned_warning": shipment["return_unsigned_warning"],
                 }
                 eligible.append(row)
                 company_counts[company] += 1
@@ -3683,6 +3814,7 @@ class Database:
             "eligible": eligible,
             "excluded": excluded,
             "company_counts": company_counts,
+            "type_counts": category_counts(eligible),
             "settings_ready": bool(settings.get("sender_name") and settings.get("sender_mobile") and settings.get("sender_address")),
             "label_ready": bool(settings.get("partner_id") and settings.get("partner_key")),
         }
@@ -3695,6 +3827,8 @@ class Database:
     ) -> Dict[str, Any]:
         if not shipment_choices:
             raise AppError("没有可下单的发货单。")
+        if user.get("role") != "admin":
+            raise AppError("只有总部可以批量下单。", 403)
 
         now = now_text()
         seen: set[int] = set()
@@ -3715,8 +3849,11 @@ class Database:
 
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            filter_where, filter_params = self._shipment_filter_sql(user, filters or {})
             valid: List[tuple[sqlite3.Row, str]] = []
             for shipment_id, company in normalized:
+                if filter_where and not conn.execute("SELECT id FROM shipments WHERE id=? AND " + " AND ".join(filter_where), [shipment_id, *filter_params]).fetchone():
+                    raise AppError("所选订单不在当前筛选范围，请重新预览。", 409)
                 row = conn.execute("SELECT * FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
                 if row and self.shipment_booking_eligible(dict(row)):
                     valid.append((row, company))
@@ -4513,6 +4650,7 @@ class Database:
 
     def delete_shipment(self, shipment_id: int, user: Dict[str, Any]) -> Dict[str, Any]:
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             shipment = conn.execute(
                 "SELECT store_id, status, booking_status FROM shipments WHERE id = ?",
                 (shipment_id,),
@@ -4525,6 +4663,8 @@ class Database:
                 raise AppError("只有尚未发货的待处理订单可以删除。", 409)
             if shipment["booking_status"] not in BOOKING_EDITABLE_STATUSES:
                 raise AppError("快递下单处理中，不能直接删除。请先取消快递下单。", 409)
+            if conn.execute("SELECT 1 FROM shipments WHERE original_shipment_id=? LIMIT 1", (shipment_id,)).fetchone():
+                raise AppError("此订单已有售后关联，请保留原记录。", 409)
             cursor = conn.execute("DELETE FROM shipments WHERE id = ?", (shipment_id,))
         return {"id": shipment_id, "deleted": True}
 
@@ -4552,6 +4692,8 @@ class Database:
             store = conn.execute("SELECT * FROM stores WHERE id = ? AND active = 1", (store_id,)).fetchone()
             if not store:
                 raise AppError("门店不存在或已停用。")
+            if store["kind"] == "team":
+                raise AppError("合作团队只使用合作寄送，不创建门店退货。", 403)
 
             items = self._resolve_items(conn, raw_items)
             try:

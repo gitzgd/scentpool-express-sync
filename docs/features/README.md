@@ -7,6 +7,7 @@
 | 身份与权限 | 总部/门店登录、会话、门店数据隔离 | `server.py`, `database.py` |
 | 门店与商品 | 门店维护、商品维护、Excel 导入、条码标识 | `database.py`, `xlsx_importer.py`, `static/app.js` |
 | [发货单](shipment-pagination.md) | 门店创建、服务端分页看板、筛选、编辑限制、总部处理 | `database.py`, `server.py`, `static/app.js` |
+| [售后与合作发货](special-shipments.md) | 补发/换货/博主/样品分类、合作团队隔离、同店关联、临时物料、幂等提交和分类统计 | `shipment_types.py`, `database.py`, `server.py`, `static/special.js` |
 | [退货单](return-carrier-autodetect.md) | 门店创建、快递公司自动识别、总部看板、商品快照、退货物流 | `database.py`, `tracking.py`, `server.py`, `static/app.js` |
 | [发货与签收时间完整性](shipment-time-integrity.md) | 写入约束、证据等级、历史聚合预览与受控修复 | `database.py`, `tracking.py`, `manage.py` |
 | 物流 | 快递100查询、自动/手动同步、签收更新 | `tracking.py`, `server.py` |
