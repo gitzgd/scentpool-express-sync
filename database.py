@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import hashlib
 import json
 import os
@@ -547,6 +549,10 @@ class Database:
                 (DEFAULT_EXPRESS_COMPANY, now_text()),
             )
             self._seed_defaults(conn, production=production, admin_password=admin_password)
+
+        from tracking_queue import migrate as migrate_tracking_queue
+        with self.connect() as conn:
+            migrate_tracking_queue(conn)
 
         if self.count_products() == 0 and os.path.exists(product_file):
             self.import_products(product_file)
@@ -3059,12 +3065,13 @@ class Database:
             raise AppError("请选择有效的发货类型；历史未分类仅供旧记录保留。")
         special = shipment_type in SPECIAL_TYPES
         request_key = str(payload.get("submission_key") or "")
-        if special and not re.fullmatch(r"[A-Za-z0-9_-]{16,100}", request_key):
+        if (special or request_key) and not re.fullmatch(r"[A-Za-z0-9_-]{16,100}", request_key):
             raise AppError("提交标识无效，请刷新新建页面后重试。")
         context = self._shipment_context(payload, shipment_type)
         digest = hashlib.sha256(json.dumps({
             "type": shipment_type, "recipient_name": recipient_name, "phone": phone,
             "address": address, "remark": remark, "items": raw_items, **context,
+            **({"store_order_no": store_order_no} if not special else {}),
         }, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
 
         if not recipient_name:
@@ -3096,7 +3103,7 @@ class Database:
             allowed = {"influencer", "sample"} if store["kind"] == "team" else {"standard", "resend", "exchange"}
             if shipment_type not in allowed:
                 raise AppError("合作团队只能提交合作寄送；门店只能提交普通或售后发货。", 403)
-            if special:
+            if request_key:
                 previous = conn.execute("SELECT * FROM shipment_submissions WHERE store_id=? AND request_key=?", (store_id, request_key)).fetchone()
                 if previous:
                     if previous["payload_hash"] != digest:
@@ -3152,9 +3159,27 @@ class Database:
 
             shipment_id = cursor.lastrowid
             self._insert_shipment_items(conn, shipment_id, items)
-            if special:
+            if request_key:
                 conn.execute("INSERT INTO shipment_submissions VALUES (?,?,?,?)", (store_id, request_key, digest, shipment_id))
         return self.get_shipment(shipment_id, user)
+
+    def submission_status(self, user, query):
+        kind = query.get("kind")
+        key = str(query.get("submission_key") or "")
+        if kind not in {"shipment", "return"} or not re.fullmatch(r"[A-Za-z0-9_-]{16,100}", key):
+            raise AppError("提交标识或类型无效。")
+        store_id = user.get("store_id") if user.get("role") == "staff" else query.get("store_id")
+        if not str(store_id).isdigit():
+            raise AppError("请选择有效门店或团队。")
+        table, column = ("shipment_submissions", "shipment_id") if kind == "shipment" else ("return_submissions", "return_id")
+        with self.connect() as conn:
+            row = conn.execute(f"SELECT {column} FROM {table} WHERE store_id=? AND request_key=?", (int(store_id), key)).fetchone()
+        if not row:
+            return {"found": False}
+        if row[column] is None:
+            return {"found": True, "deleted": True}
+        result = self.get_shipment(row[column], user) if kind == "shipment" else self.get_return_order(row[column], user)
+        return {"found": True, "shipment" if kind == "shipment" else "return_order": result}
 
     def _shipment_context(self, payload, shipment_type):
         context = {key: str(payload.get(key) or "").strip() for key in ("internal_note", "cooperation_subject")}
@@ -3455,6 +3480,8 @@ class Database:
             if column not in excluded
         )
         sql = f"""SELECT {selected_columns}, stores.kind AS store_kind,
+            EXISTS(SELECT 1 FROM tracking_jobs tj WHERE tj.kind='shipment' AND tj.record_id=shipments.id
+                AND tj.revision=shipments.tracking_revision AND tj.state IN ('queued','running')) AS tracking_queued,
             original.business_id AS original_business_id, original.store_order_no AS original_store_order_no,
             returns.status AS related_return_status,
             (SELECT COUNT(*) FROM shipments child WHERE child.original_shipment_id=shipments.id) AS aftersales_count
@@ -3779,42 +3806,59 @@ class Database:
             and str(row.get("booking_status") or "未下单") in BOOKING_EDITABLE_STATUSES
         )
 
-    def preview_shipping_batch(self, user: Dict[str, Any], filters: Dict[str, Any]) -> Dict[str, Any]:
-        shipments = self.list_shipments(user, filters)
+    def _preview_rows(self, conn, user, filters):
+        where, params = self._shipment_filter_sql(user, filters)
+        return conn.execute("""SELECT shipments.id,shipments.business_id,shipments.store_name_snapshot,
+            shipments.store_order_no,shipments.recipient_name,shipments.address,shipments.express_company,
+            shipments.shipment_type,shipments.status,shipments.tracking_no,shipments.booking_status,
+            shipments.tracking_revision,shipments.content_revision,shipments.updated_at,
+            (shipments.related_return_id IS NOT NULL AND COALESCE(r.status,'')<>'已签收') return_unsigned_warning
+            FROM shipments LEFT JOIN return_orders r ON r.id=shipments.related_return_id AND r.store_id=shipments.store_id""" +
+            (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY shipments.created_at DESC,shipments.id DESC", params)
+
+    def _preview_fingerprint(self, conn, user, filters):
+        digest=hashlib.sha256()
+        default=conn.execute("SELECT default_company FROM shipping_settings WHERE id=1").fetchone()
+        digest.update(str(default[0] if default else DEFAULT_EXPRESS_COMPANY).encode())
+        for row in self._preview_rows(conn,user,filters):
+            digest.update(json.dumps(list(row),ensure_ascii=False,separators=(",", ":")).encode())
+        return digest.hexdigest()
+
+    def preview_shipping_batch(self, user: Dict[str, Any], filters: Dict[str, Any], *, page=1, page_size=50) -> Dict[str, Any]:
         settings = self.get_shipping_settings()
         default_company = settings.get("default_company") or DEFAULT_EXPRESS_COMPANY
         eligible = []
         excluded = []
         company_counts = {company: 0 for company in EXPRESS_COMPANIES}
-        for shipment in shipments:
-            if self.shipment_booking_eligible(shipment):
-                company = shipment.get("express_company") if shipment.get("express_company") in EXPRESS_COMPANIES else default_company
-                row = {
-                    "id": shipment["id"],
-                    "business_id": shipment["business_id"],
-                    "store_name_snapshot": shipment["store_name_snapshot"],
-                    "store_order_no": shipment["store_order_no"],
-                    "recipient_name": shipment["recipient_name"],
-                    "address": shipment["address"],
-                    "express_company": company,
-                    **type_info(shipment["shipment_type"]),
-                    "return_unsigned_warning": shipment["return_unsigned_warning"],
-                }
-                eligible.append(row)
-                company_counts[company] += 1
-            else:
-                reason = "状态不可下单"
-                if shipment.get("tracking_no"):
-                    reason = "已有快递单号"
-                elif shipment.get("booking_status") not in BOOKING_EDITABLE_STATUSES:
-                    reason = f"下单状态：{shipment.get('booking_status')}"
-                excluded.append({"id": shipment["id"], "business_id": shipment["business_id"], "reason": reason})
+        counts = category_counts([])
+        eligible_count = excluded_count = matched = 0
+        digest=hashlib.sha256(); offset=(page-1)*page_size
+        digest.update(str(settings.get("default_company") or DEFAULT_EXPRESS_COMPANY).encode())
+        with self.connect() as conn:
+            for raw in self._preview_rows(conn,user,filters):
+                digest.update(json.dumps(list(raw),ensure_ascii=False,separators=(",", ":")).encode())
+                shipment=dict(raw); matched+=1
+                if self.shipment_booking_eligible(shipment):
+                    company=shipment["express_company"] if shipment["express_company"] in EXPRESS_COMPANIES else default_company
+                    company_counts[company]+=1; counts[shipment["shipment_type"]]+=1
+                    if offset<=eligible_count<offset+page_size:
+                        eligible.append({**shipment,**type_info(shipment["shipment_type"]),"express_company":company})
+                    eligible_count+=1
+                else:
+                    if offset<=excluded_count<offset+page_size:
+                        reason="已有快递单号" if shipment["tracking_no"] else "状态不可下单"
+                        excluded.append({"id":shipment["id"],"business_id":shipment["business_id"],"reason":reason})
+                    excluded_count+=1
         return {
-            "matched": len(shipments),
+            "matched": matched, "eligible_count": eligible_count, "excluded_count": excluded_count,
             "eligible": eligible,
             "excluded": excluded,
             "company_counts": company_counts,
-            "type_counts": category_counts(eligible),
+            "type_counts": counts, "preview_fingerprint":digest.hexdigest(),
+            "pagination":{"page":page,"page_size":page_size,"total":max(eligible_count,excluded_count),
+                "total_pages":max(1,(max(eligible_count,excluded_count)+page_size-1)//page_size),
+                "eligible_pages":max(1,(eligible_count+page_size-1)//page_size),
+                "excluded_pages":max(1,(excluded_count+page_size-1)//page_size)},
             "settings_ready": bool(settings.get("sender_name") and settings.get("sender_mobile") and settings.get("sender_address")),
             "label_ready": bool(settings.get("partner_id") and settings.get("partner_key")),
         }
@@ -3824,8 +3868,9 @@ class Database:
         user: Dict[str, Any],
         shipment_choices: List[Dict[str, Any]],
         filters: Optional[Dict[str, Any]] = None,
+        *, selection_mode="selected", preview_fingerprint="", express_company="",
     ) -> Dict[str, Any]:
-        if not shipment_choices:
+        if not shipment_choices and selection_mode != "all_matching":
             raise AppError("没有可下单的发货单。")
         if user.get("role") != "admin":
             raise AppError("只有总部可以批量下单。", 403)
@@ -3838,24 +3883,55 @@ class Database:
                 shipment_id = int(choice.get("id"))
             except (TypeError, ValueError):
                 continue
-            company = str(choice.get("express_company") or DEFAULT_EXPRESS_COMPANY).strip()
-            if company not in EXPRESS_COMPANIES:
+            company = str(choice.get("express_company") or "").strip()
+            if company and company not in EXPRESS_COMPANIES:
                 raise AppError(f"不支持这个快递公司：{company}")
             if shipment_id not in seen:
                 seen.add(shipment_id)
                 normalized.append((shipment_id, company))
-        if not normalized:
+        if not normalized and selection_mode != "all_matching":
             raise AppError("没有可下单的发货单。")
+        if len(normalized)>5000:
+            raise AppError("单批下单最多 5000 单，请缩小筛选范围后重试。",413)
 
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            configured=conn.execute("SELECT default_company FROM shipping_settings WHERE id=1").fetchone()
+            default_company=str(configured[0] if configured else DEFAULT_EXPRESS_COMPANY)
+            if default_company not in EXPRESS_COMPANIES:
+                default_company=DEFAULT_EXPRESS_COMPANY
+            if selection_mode not in {"selected","all_matching"}:
+                raise AppError("选择方式无效。")
+            if preview_fingerprint and self._preview_fingerprint(conn,user,filters or {}) != preview_fingerprint:
+                raise AppError("预览后的订单范围或内容已变化，请重新预览确认。",409)
+            if selection_mode == "all_matching":
+                if not preview_fingerprint or self._preview_fingerprint(conn,user,filters or {}) != preview_fingerprint:
+                    raise AppError("预览后的订单范围或内容已变化，请重新预览确认。",409)
+                if express_company and express_company not in EXPRESS_COMPANIES:
+                    raise AppError("请选择有效快递公司。")
+                overrides=dict(normalized)
+                normalized=[]
+                for raw in self._preview_rows(conn,user,filters or {}):
+                    row=dict(raw)
+                    if self.shipment_booking_eligible(row):
+                        company=overrides.pop(row["id"],None) or express_company or row["express_company"] or default_company
+                        if company not in EXPRESS_COMPANIES:
+                            company=default_company
+                        normalized.append((row["id"],company))
+                        if len(normalized)>5000:
+                            raise AppError("当前范围超过单批下单 5000 单的安全上限，请缩小筛选范围。",413)
+                if overrides:
+                    raise AppError("指定的订单不在本次可下单范围，请重新预览。",409)
             filter_where, filter_params = self._shipment_filter_sql(user, filters or {})
             valid: List[tuple[sqlite3.Row, str]] = []
             for shipment_id, company in normalized:
-                if filter_where and not conn.execute("SELECT id FROM shipments WHERE id=? AND " + " AND ".join(filter_where), [shipment_id, *filter_params]).fetchone():
+                row = conn.execute("SELECT id,status,tracking_no,booking_status,booking_request_id,booking_salt,order_date,store_id,express_company FROM shipments WHERE id = ?" + (" AND "+" AND ".join(filter_where) if filter_where else ""), [shipment_id,*filter_params]).fetchone()
+                if filter_where and not row:
                     raise AppError("所选订单不在当前筛选范围，请重新预览。", 409)
-                row = conn.execute("SELECT * FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
                 if row and self.shipment_booking_eligible(dict(row)):
+                    company=company or express_company or row["express_company"] or default_company
+                    if company not in EXPRESS_COMPANIES:
+                        company=default_company
                     valid.append((row, company))
             if not valid:
                 raise AppError("所选订单已被处理，请刷新后重试。", 409)
@@ -4123,30 +4199,38 @@ class Database:
             (status, now, finished_at, batch_id),
         )
 
-    def get_shipping_batch(self, batch_id: int) -> Dict[str, Any]:
+    def get_shipping_batch(self, batch_id: int, *, page=1, page_size=50, status="") -> Dict[str, Any]:
+        status_clause=" AND shipping_batch_items.status=?" if status else ""
         with self.connect() as conn:
+            conn.execute("BEGIN")
             batch = conn.execute("SELECT * FROM shipping_batches WHERE id = ?", (batch_id,)).fetchone()
             if not batch:
                 raise AppError("下单批次不存在。", 404)
             items = conn.execute(
-                """
-                SELECT shipping_batch_items.*, shipments.business_id, shipments.store_order_no,
+                f"""
+                SELECT shipping_batch_items.id, shipping_batch_items.batch_id, shipping_batch_items.shipment_id,
+                       shipping_batch_items.express_company, shipping_batch_items.status,
+                       shipping_batch_items.attempt_count, shipping_batch_items.error,
+                       shipping_batch_items.created_at, shipping_batch_items.updated_at,
+                       shipments.business_id, shipments.store_order_no,
                        shipments.store_name_snapshot, shipments.recipient_name, shipments.tracking_no,
-                       shipments.booking_status
+                       shipments.booking_status, shipments.shipment_type
                 FROM shipping_batch_items
                 JOIN shipments ON shipments.id = shipping_batch_items.shipment_id
-                WHERE shipping_batch_items.batch_id = ?
-                ORDER BY shipping_batch_items.id
+                WHERE shipping_batch_items.batch_id = ?{status_clause}
+                ORDER BY shipping_batch_items.id LIMIT ? OFFSET ?
                 """,
-                (batch_id,),
+                (batch_id,*([status] if status else []), min(50,max(1,int(page_size))), (max(1,int(page))-1)*min(50,max(1,int(page_size)))),
             ).fetchall()
+            counts = {str(r["status"]):int(r["n"]) for r in conn.execute(
+                "SELECT status,COUNT(*) n FROM shipping_batch_items WHERE batch_id=? GROUP BY status",(batch_id,))}
         item_list = [dict(item) for item in items]
         for item in item_list:
-            item.pop("cancel_param_json", None)
-        counts: Dict[str, int] = {}
-        for item in item_list:
-            counts[item["status"]] = counts.get(item["status"], 0) + 1
-        return {"batch": dict(batch), "items": item_list, "counts": counts}
+            item.update(type_info(item["shipment_type"]))
+        total=counts.get(status,0) if status else sum(counts.values())
+        return {"batch": {k:batch[k] for k in ("id","status","total_count","created_at","updated_at","finished_at")},
+                "items": item_list, "counts": counts,
+                "pagination":{"page":page,"page_size":page_size,"total":total,"total_pages":max(1,(total+page_size-1)//page_size)}}
 
     def retry_shipping_batch(self, batch_id: int) -> Dict[str, Any]:
         now = now_text()
@@ -4474,7 +4558,7 @@ class Database:
             ).fetchone()
         return int(row["count"] or 0)
 
-    def apply_tracking_result(self, shipment_id: int, result: Dict[str, Any]) -> Dict[str, Any]:
+    def apply_tracking_result(self, shipment_id: int, result: Dict[str, Any], *, connection=None, expected_revision=None) -> Dict[str, Any]:
         checked_at = normalize_timestamp(result.get("checked_at") or now_text(), assume_local=True)
         signed_at = str(result.get("signed_at") or "").strip()
         tracking_status = str(result.get("tracking_status") or "")
@@ -4485,10 +4569,12 @@ class Database:
             signed_at = normalize_timestamp(signed_at, assume_local=True)
         status_update = "已签收" if is_signed else None
         now = now_text()
-        with self.connect() as conn:
+        with (nullcontext(connection) if connection is not None else self.connect()) as conn:
             existing = conn.execute("SELECT * FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
             if not existing:
                 raise AppError("发货单不存在。", 404)
+            if expected_revision is not None and existing["tracking_revision"] != expected_revision:
+                raise AppError("物流记录已变化，旧查询结果已丢弃。", 409)
             status = status_update or ("已发货" if existing["status"] == "待处理" and tracking_status and tracking_status != "查询失败" else existing["status"])
             signed_source = str(result.get("signed_at_source") or "")
             times = self._resolved_shipment_times(
@@ -4605,6 +4691,10 @@ class Database:
         )
 
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute("SELECT tracking_revision,booking_status FROM shipments WHERE id=?",(shipment_id,)).fetchone()
+            if not current or current["tracking_revision"] != existing["tracking_revision"] or current["booking_status"] not in BOOKING_EDITABLE_STATUSES:
+                raise AppError("订单已被其他操作更新或进入下单流程，请刷新核对后重试。",409)
             cursor = conn.execute(
                 """
                 UPDATE shipments
@@ -4680,6 +4770,12 @@ class Database:
         remark = str(payload.get("remark", "")).strip()
         raw_items = payload.get("items") or []
 
+        request_key = str(payload.get("submission_key") or payload.get("client_request_id") or "")
+        if request_key and not re.fullmatch(r"[A-Za-z0-9_-]{16,100}", request_key):
+            raise AppError("提交标识无效，请重新打开新建页面。")
+        digest = hashlib.sha256(json.dumps({"tracking_no": tracking_no, "sender_phone": sender_phone,
+            "remark": remark, "items": raw_items}, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
         if not tracking_no:
             raise AppError("请输入退货快递单号。")
         if sender_phone and not re_phone_ok(sender_phone):
@@ -4689,11 +4785,19 @@ class Database:
 
         now = now_text()
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             store = conn.execute("SELECT * FROM stores WHERE id = ? AND active = 1", (store_id,)).fetchone()
             if not store:
                 raise AppError("门店不存在或已停用。")
             if store["kind"] == "team":
                 raise AppError("合作团队只使用合作寄送，不创建门店退货。", 403)
+
+            if request_key:
+                prior = conn.execute("SELECT * FROM return_submissions WHERE store_id=? AND request_key=?", (store_id, request_key)).fetchone()
+                if prior:
+                    if prior["payload_hash"] != digest or prior["return_id"] is None:
+                        raise AppError("提交内容已变化或原记录已删除，请先核对原提交结果。", 409)
+                    return self.get_return_order(prior["return_id"], user)
 
             items = self._resolve_items(conn, raw_items)
             try:
@@ -4720,6 +4824,8 @@ class Database:
                 raise AppError("这个退货快递单号已经提交过。", 409) from exc
 
             return_id = cursor.lastrowid
+            if request_key:
+                conn.execute("INSERT INTO return_submissions VALUES(?,?,?,?)",(store_id,request_key,digest,return_id))
             for item in items:
                 conn.execute(
                     """
@@ -4740,12 +4846,12 @@ class Database:
         return self.get_return_order(return_id, user)
 
     def get_return_order(self, return_id: int, user: Dict[str, Any]) -> Dict[str, Any]:
-        returns = self.list_return_orders(user, {"id": return_id})
+        returns = self.list_return_orders(user, {"id": return_id, "include_tracking_raw": "1"})
         if not returns:
             raise AppError("退货单不存在。", 404)
         return returns[0]
 
-    def list_return_orders(self, user: Dict[str, Any], filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _return_filter_sql(self, user, filters):
         where = []
         params: List[Any] = []
 
@@ -4781,12 +4887,29 @@ class Database:
             )
             params.extend([q, q, q, q])
 
-        sql = "SELECT return_orders.* FROM return_orders"
+        return where, params
+
+    def list_return_orders(self, user: Dict[str, Any], filters: Dict[str, Any], *, limit=None, offset=0) -> List[Dict[str, Any]]:
+        where, params = self._return_filter_sql(user, filters)
+
+        sql = """SELECT return_orders.*,
+            EXISTS(SELECT 1 FROM tracking_jobs tj WHERE tj.kind='return' AND tj.record_id=return_orders.id
+                AND tj.revision=return_orders.tracking_revision AND tj.state IN ('queued','running')) AS tracking_queued
+            FROM return_orders"""
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY return_orders.created_at DESC, return_orders.id DESC"
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params.extend([limit,offset])
 
         with self.connect() as conn:
+            if not (filters.get("id") and str(filters.get("include_tracking_raw")) == "1"):
+                columns=getattr(self,"_return_columns",None)
+                if columns is None:
+                    columns=[r["name"] for r in conn.execute("PRAGMA table_info(return_orders)") if r["name"]!="tracking_raw"]
+                    self._return_columns=columns
+                sql=sql.replace("return_orders.*",",".join("return_orders."+column for column in columns))
             rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
             if not rows:
                 return []
@@ -4802,12 +4925,33 @@ class Database:
             items_by_return.setdefault(item["return_order_id"], []).append(dict(item))
 
         for row in rows:
+            if not (filters.get("id") and str(filters.get("include_tracking_raw")) == "1"):
+                row.pop("tracking_raw",None)
             row["items"] = items_by_return.get(row["id"], [])
             row["item_summary"] = "；".join(
                 f"{item['product_category']} / {item['product_name']} x{item['quantity']}"
                 for item in row["items"]
             )
         return rows
+
+    def return_status_counts(self, user, filters):
+        where, params=self._return_filter_sql(user,filters)
+        clause=" WHERE "+" AND ".join(where) if where else ""
+        with self.connect() as conn:
+            counts={status:0 for status in RETURN_STATUSES}
+            for row in conn.execute("SELECT status,COUNT(*) n FROM return_orders"+clause+" GROUP BY status",params):
+                counts[row["status"]]=row["n"]
+            counts["total"]=sum(counts.values())
+            today=now_text()[:10]
+            day_start,day_end=local_day_start(today),local_day_end(today)
+            row=conn.execute("SELECT COALESCE(SUM(datetime(created_at) BETWEEN datetime(?) AND datetime(?)),0),COALESCE(SUM(datetime(tracking_signed_at) BETWEEN datetime(?) AND datetime(?)),0) FROM return_orders"+clause,[day_start,day_end,day_start,day_end,*params]).fetchone()
+        return {"counts":counts,"today_count":row[0],"today_signed_count":row[1]}
+
+    def list_return_orders_page(self,user,filters,*,page=1,page_size=50):
+        counts=self.return_status_counts(user,filters)["counts"]
+        total=counts["total"]; pages=max(1,(total+page_size-1)//page_size); page=min(page,pages)
+        return {"returns":self.list_return_orders(user,filters,limit=page_size,offset=(page-1)*page_size),
+                "pagination":{"page":page,"page_size":page_size,"total":total,"total_pages":pages}}
 
     def return_tracking_candidates(self, stale_before: str = "", limit: int = 20) -> List[Dict[str, Any]]:
         where = [
@@ -4834,7 +4978,7 @@ class Database:
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
-    def apply_return_tracking_result(self, return_id: int, result: Dict[str, Any]) -> Dict[str, Any]:
+    def apply_return_tracking_result(self, return_id: int, result: Dict[str, Any], *, connection=None, expected_revision=None) -> Dict[str, Any]:
         checked_at = str(result.get("checked_at") or now_text())
         signed_at = str(result.get("signed_at") or "")
         tracking_status = str(result.get("tracking_status") or "")
@@ -4843,7 +4987,11 @@ class Database:
             signed_at = checked_at
         status = return_status_from_tracking(tracking_status, is_signed)
         now = now_text()
-        with self.connect() as conn:
+        with (nullcontext(connection) if connection is not None else self.connect()) as conn:
+            if expected_revision is not None:
+                current = conn.execute("SELECT tracking_revision FROM return_orders WHERE id=?", (return_id,)).fetchone()
+                if not current or current["tracking_revision"] != expected_revision:
+                    raise AppError("物流记录已变化，旧查询结果已丢弃。", 409)
             cursor = conn.execute(
                 """
                 UPDATE return_orders

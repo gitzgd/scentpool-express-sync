@@ -10,6 +10,7 @@ import mimetypes
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -37,6 +38,7 @@ from shipping import (
     verify_callback_signature,
 )
 from tracking import detect_tracking_company, manual_refresh_stale_before, query_tracking, tracking_auto_enabled, tracking_config_public, tracking_interval_minutes, tracking_stale_before
+from tracking_queue import TrackingQueue
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -75,6 +77,7 @@ TRACKING_SYNC_LOCK = threading.Lock()
 RETURN_TRACKING_SYNC_LOCK = threading.Lock()
 LABEL_BATCH_PRINT_LOCK = threading.Lock()
 SHIPPING_QUEUE_EVENT = threading.Event()
+TRACKING_QUEUE_EVENT = threading.Event()
 SHIPPING_IDLE_DELAYS_SECONDS = (2, 5, 15, 60)
 TRACKING_INCIDENT_KEY = "tracking:kuaidi100"
 
@@ -509,7 +512,7 @@ def tracking_service_result_from_error(exc: AppError, last_event: str = "") -> D
     }
 
 
-def refresh_tracking_for_shipment(shipment: Dict[str, Any]) -> Dict[str, Any]:
+def refresh_tracking_for_shipment(shipment: Dict[str, Any], *, persist=True) -> Dict[str, Any]:
     try:
         result = query_tracking(shipment)
     except AppError as exc:
@@ -518,14 +521,15 @@ def refresh_tracking_for_shipment(shipment: Dict[str, Any]) -> Dict[str, Any]:
             str(shipment.get("tracking_last_event") or ""),
         )
     if result.get("system_error"):
-        record_tracking_service_incident(result)
+        if persist:
+            record_tracking_service_incident(result)
         return {
             **result,
             "id": int(shipment["id"]),
             "status": str(shipment.get("status") or "已发货"),
             "tracking_status": str(shipment.get("tracking_status") or "待查询"),
         }
-    if result.get("provider_reached", True):
+    if persist and result.get("provider_reached", True):
         clear_tracking_service_incident()
     if (
         result.get("tracking_status") == "查询失败"
@@ -542,10 +546,10 @@ def refresh_tracking_for_shipment(shipment: Dict[str, Any]) -> Dict[str, Any]:
             "error": "",
             "is_signed": False,
         }
-    return DB.apply_tracking_result(int(shipment["id"]), result)
+    return DB.apply_tracking_result(int(shipment["id"]), result) if persist else result
 
 
-def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
+def refresh_tracking_for_return(return_order: Dict[str, Any], *, persist=True) -> Dict[str, Any]:
     company = str(return_order.get("express_company") or "").strip()
     company_code = str(return_order.get("express_company_code") or "").strip()
     company_source = str(return_order.get("express_company_source") or "manual").strip()
@@ -593,14 +597,15 @@ def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
                 "provider_reached": False,
             }
             if detection_service_error:
-                record_tracking_service_incident(result)
+                if persist:
+                    record_tracking_service_incident(result)
                 return {
                     **result,
                     "id": int(return_order["id"]),
                     "status": str(return_order.get("status") or "待查询"),
                     "tracking_status": str(return_order.get("tracking_status") or "待查询"),
                 }
-            return DB.apply_return_tracking_result(int(return_order["id"]), result)
+            return DB.apply_return_tracking_result(int(return_order["id"]), result) if persist else result
 
     try:
         result = query_tracking(return_order)
@@ -623,14 +628,15 @@ def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
             "is_signed": False,
         }
     if result.get("system_error"):
-        record_tracking_service_incident(result)
+        if persist:
+            record_tracking_service_incident(result)
         return {
             **result,
             "id": int(return_order["id"]),
             "status": str(return_order.get("status") or "待查询"),
             "tracking_status": str(return_order.get("tracking_status") or "待查询"),
         }
-    if result.get("provider_reached", True):
+    if persist and result.get("provider_reached", True):
         clear_tracking_service_incident()
     if detection_error and not detection_service_error and result.get("tracking_status") == "查询失败":
         detection_detail = detection_error.rstrip("。；; ")
@@ -647,7 +653,7 @@ def refresh_tracking_for_return(return_order: Dict[str, Any]) -> Dict[str, Any]:
             "express_company_code": company_code,
             "express_company_source": company_source,
         }
-    return DB.apply_return_tracking_result(int(return_order["id"]), result)
+    return DB.apply_return_tracking_result(int(return_order["id"]), result) if persist else result
 
 
 def recently_checked(row: Dict[str, Any]) -> bool:
@@ -738,21 +744,61 @@ def sync_return_tracking_batch(*, force: bool = False, limit: int = 20) -> Dict[
         RETURN_TRACKING_SYNC_LOCK.release()
 
 
-def tracking_worker() -> None:
-    time.sleep(60)
-    while True:
-        try:
-            shipment_result = sync_tracking_batch(force=False, limit=20)
-            if not shipment_result.get("provider_incident"):
-                sync_return_tracking_batch(force=False, limit=20)
-        except Exception as exc:
-            print(f"[tracking] 自动同步失败：{exc}")
-        time.sleep(1800)
+def process_next_tracking_job(connection) -> bool:
+    queue = TrackingQueue(DB)
+    job = queue.claim(connection)
+    if not job:
+        return False
+    started = time.monotonic()
+    try:
+        refresh = refresh_tracking_for_shipment if job["kind"] == "shipment" else refresh_tracking_for_return
+        result = refresh(job["row"], persist=False)
+    except Exception:
+        result = {"system_error": True, "error": "物流查询暂时未完成，系统将按规则重试。"}
+    outcome = queue.finish(connection, job, result, (time.monotonic() - started) * 1000)
+    if not outcome.get("discarded"):
+        if result.get("system_error"):
+            record_tracking_service_incident(result)
+        elif result.get("provider_reached", True):
+            clear_tracking_service_incident()
+    return True
+
+
+def tracking_worker(stop_event=None) -> None:
+    stop_event = stop_event or threading.Event()
+    connection = None
+    next_schedule = time.monotonic() + 60
+    next_prune = time.monotonic() + 300
+    idle_index = 0
+    try:
+        while not stop_event.is_set():
+            try:
+                if connection is None:
+                    connection = DB.connect()
+                if time.monotonic() >= next_prune:
+                    TrackingQueue(DB).prune(connection)
+                    next_prune = time.monotonic() + 3600
+                if tracking_auto_enabled() and time.monotonic() >= next_schedule:
+                    TrackingQueue(DB).schedule(connection, {"shipment": tracking_interval_minutes()*60,
+                                                          "return": return_tracking_interval_minutes()*60})
+                    next_schedule = time.monotonic() + 30
+                if process_next_tracking_job(connection):
+                    idle_index = 0
+                    continue
+            except Exception as exc:
+                print(f"[tracking-queue] worker_failure={type(exc).__name__}", flush=True)
+                if connection is not None:
+                    connection.close(); connection = None
+            TRACKING_QUEUE_EVENT.wait(SHIPPING_IDLE_DELAYS_SECONDS[idle_index])
+            TRACKING_QUEUE_EVENT.clear()
+            idle_index = min(idle_index+1, len(SHIPPING_IDLE_DELAYS_SECONDS)-1)
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def start_tracking_worker() -> None:
-    if not tracking_auto_enabled():
-        return
+    # Manual/initial work always runs; AUTO only controls periodic scheduling.
     thread = threading.Thread(target=tracking_worker, name="scentpool-tracking", daemon=True)
     thread.start()
 
@@ -791,11 +837,7 @@ def process_next_shipping_job(connection: Optional[sqlite3.Connection] = None) -
         )
     completed = DB.complete_shipping_job(int(job["batch_item_id"]), result)
     if completed.get("tracking_no"):
-        try:
-            shipment = DB.get_shipment(int(completed["shipment_id"]), {"role": "admin"})
-            refresh_tracking_for_shipment(shipment)
-        except Exception as exc:
-            print(f"[shipping] 首次物流查询失败：{exc}")
+        TRACKING_QUEUE_EVENT.set()
     return True
 
 
@@ -940,6 +982,11 @@ class Handler(BaseHTTPRequestHandler):
             self.error_json("页面不存在。", 404)
         except AppError as exc:
             self.error_json(exc.message, exc.status, exc.details)
+        except sqlite3.IntegrityError as exc:
+            if "tracking_queue_full" in str(exc):
+                self.error_json("物流任务暂时达到安全上限，本次修改未保存。请保留填写内容，稍后重试。", 503)
+            else:
+                self.error_json("本次操作未保存，数据状态已变化，请刷新核对后重试。", 409)
         except Exception as exc:  # pragma: no cover - final safety net for local prototype
             self.error_json(f"服务器错误：{exc}", 500)
         finally:
@@ -1020,12 +1067,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(
                 {
                     "sampled_at": now_text(),
-                    "storage": {"connections": DB.connection_diagnostics()},
+                    "storage": {"connections": DB.connection_diagnostics(), "connection_limits": {
+                        "request_workers": MAX_REQUEST_THREADS, "background_connections": 2,
+                        "transient_background_connections": 2,
+                        "peak_active_upper_bound": MAX_REQUEST_THREADS + 4}},
                 }
             )
             return
 
         user = self.require_user()
+
+        if path.startswith("/api/tracking/tasks/") and self.command == "GET":
+            self.send_json({"task": TrackingQueue(DB).task(path.rsplit("/",1)[-1], user)})
+            return
+
+        if path == "/api/submissions/status" and self.command == "GET":
+            self.send_json(DB.submission_status(user, query))
+            return
 
         if path == "/api/me" and self.command == "GET":
             self.send_json({"user": user})
@@ -1207,7 +1265,8 @@ class Handler(BaseHTTPRequestHandler):
             self.require_admin(user)
             body = self.read_json()
             filters = body.get("filters") if isinstance(body.get("filters"), dict) else {}
-            self.send_json({"preview": DB.preview_shipping_batch(user, filters)})
+            page,page_size=self.pagination_parameters(body)
+            self.send_json({"preview": DB.preview_shipping_batch(user, filters,page=page,page_size=page_size)})
             return
 
         if path == "/api/admin/shipping-batches" and self.command == "POST":
@@ -1229,6 +1288,9 @@ class Handler(BaseHTTPRequestHandler):
                 user,
                 choices,
                 body.get("filters") if isinstance(body.get("filters"), dict) else {},
+                selection_mode=str(body.get("selection_mode") or "selected"),
+                preview_fingerprint=str(body.get("preview_fingerprint") or ""),
+                express_company=str(body.get("express_company") or ""),
             )
             notify_shipping_worker()
             self.send_json(batch, status=202)
@@ -1245,21 +1307,24 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/admin/shipping-batches/") and self.command == "GET":
             self.require_admin(user)
             batch_id = int(path.rsplit("/", 1)[-1])
-            self.send_json(DB.get_shipping_batch(batch_id))
+            page,page_size=self.pagination_parameters(query)
+            self.send_json(DB.get_shipping_batch(batch_id,page=page,page_size=page_size,status=str(query.get("status") or "")))
             return
 
         if path == "/api/admin/tracking/sync" and self.command == "POST":
             self.require_admin(user)
             body = self.read_json()
-            result = sync_tracking_batch(force=bool(body.get("force")), limit=int(body.get("limit") or 0))
-            self.send_json({"result": result})
+            task = TrackingQueue(DB).request(user, "shipment", request_key=str(body.get("submission_key") or body.get("client_request_id") or ""))
+            TRACKING_QUEUE_EVENT.set()
+            self.send_json({"queued": True, "task": task, "message": task["message"]}, status=202)
             return
 
         if path == "/api/admin/return-tracking/sync" and self.command == "POST":
             self.require_admin(user)
             body = self.read_json()
-            result = sync_return_tracking_batch(force=bool(body.get("force")), limit=int(body.get("limit") or 20))
-            self.send_json({"result": result})
+            task = TrackingQueue(DB).request(user, "return", request_key=str(body.get("submission_key") or body.get("client_request_id") or ""))
+            TRACKING_QUEUE_EVENT.set()
+            self.send_json({"queued": True, "task": task, "message": task["message"]}, status=202)
             return
 
         if path == "/api/shipments" and self.command == "POST":
@@ -1289,11 +1354,9 @@ class Handler(BaseHTTPRequestHandler):
             self.require_admin(user)
             shipment_id = int(path.split("/")[3])
             shipment = DB.get_shipment(shipment_id, user)
-            require_manual_tracking_allowed(shipment)
-            refresh_result = refresh_tracking_for_shipment(shipment)
-            if refresh_result.get("system_error"):
-                raise AppError(str(refresh_result.get("error") or "物流查询服务暂时不可用。"), 503)
-            self.send_json({"shipment": DB.get_shipment(shipment_id, user)})
+            task = TrackingQueue(DB).request(user, "shipment", shipment_id)
+            TRACKING_QUEUE_EVENT.set()
+            self.send_json({"shipment": shipment, "queued": True, "task": task, "message": task["message"]}, status=202)
             return
 
         if path.startswith("/api/shipments/") and path.endswith("/label/cancel") and self.command == "POST":
@@ -1397,9 +1460,9 @@ class Handler(BaseHTTPRequestHandler):
             update_result = DB.update_shipment(shipment_id, self.read_json())
             shipment = DB.get_shipment(shipment_id, user)
             if update_result.get("should_refresh_tracking"):
-                refresh_tracking_for_shipment(shipment)
-                shipment = DB.get_shipment(shipment_id, user)
-            self.send_json({"shipment": shipment})
+                TRACKING_QUEUE_EVENT.set()
+            task=self.saved_tracking_task(user,"shipment",shipment_id) if update_result.get("should_refresh_tracking") else None
+            self.send_json({"shipment": shipment, "task":task,"tracking_queued": bool(update_result.get("should_refresh_tracking")), "message": "已保存，物流信息在后台更新，可继续操作。" if update_result.get("should_refresh_tracking") else "已保存。"})
             return
 
         if path.startswith("/api/shipments/") and self.command == "DELETE":
@@ -1409,23 +1472,30 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/returns" and self.command == "POST":
             return_order = DB.create_return_order(user, self.read_json())
-            refresh_tracking_for_return(return_order)
             return_order = DB.get_return_order(int(return_order["id"]), user)
-            self.send_json({"return_order": return_order}, status=201)
+            TRACKING_QUEUE_EVENT.set()
+            self.send_json({"return_order": return_order, "task":self.saved_tracking_task(user,"return",return_order["id"]),"tracking_queued": True, "message": "已保存，物流信息在后台更新，可继续操作。"}, status=201)
             return
 
         if path == "/api/returns" and self.command == "GET":
-            self.send_json({"returns": DB.list_return_orders(user, query), "statuses": RETURN_STATUSES})
+            page,page_size=self.pagination_parameters(query)
+            self.send_json({**DB.list_return_orders_page(user,query,page=page,page_size=page_size), "statuses": RETURN_STATUSES})
+            return
+
+        if path == "/api/returns/summary" and self.command == "GET":
+            self.send_json(DB.return_status_counts(user,query))
+            return
+
+        if path.startswith("/api/returns/") and path.endswith("/tracking") and self.command == "GET":
+            self.send_json({"return_order":DB.get_return_order(int(path.split("/")[3]),user)})
             return
 
         if path.startswith("/api/returns/") and path.endswith("/tracking/refresh") and self.command == "POST":
             return_id = int(path.split("/")[3])
             return_order = DB.get_return_order(return_id, user)
-            require_manual_tracking_allowed(return_order)
-            refresh_result = refresh_tracking_for_return(return_order)
-            if refresh_result.get("system_error"):
-                raise AppError(str(refresh_result.get("error") or "物流查询服务暂时不可用。"), 503)
-            self.send_json({"return_order": DB.get_return_order(return_id, user)})
+            task = TrackingQueue(DB).request(user, "return", return_id)
+            TRACKING_QUEUE_EVENT.set()
+            self.send_json({"return_order": return_order, "queued": True, "task": task, "message": task["message"]}, status=202)
             return
 
         if path == "/api/export/shipments.csv" and self.command == "GET":
@@ -1597,6 +1667,24 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(data, dict):
             raise AppError("请求内容必须是对象。")
         return data
+
+    @staticmethod
+    def pagination_parameters(query):
+        try:
+            page=int(query.get("page",1)); page_size=int(query.get("page_size",50))
+        except (TypeError,ValueError):
+            raise AppError("页码和每页数量必须是正整数。") from None
+        if page<1 or not 1<=page_size<=50:
+            raise AppError("页码须为正数，每页最多显示 50 单。")
+        return page,page_size
+
+    @staticmethod
+    def saved_tracking_task(user, kind, record_id):
+        try:
+            return TrackingQueue(DB).request(user,kind,record_id,subscribe=True)
+        except Exception:
+            # Business + query intent have already committed. A progress-receipt failure is not a failed save.
+            return None
 
     def read_form(self) -> Dict[str, str]:
         length = int(self.headers.get("Content-Length", "0"))

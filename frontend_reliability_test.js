@@ -1,0 +1,166 @@
+/* Synthetic, network-free tests against the actual browser functions. */
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const vm = require("node:vm");
+const path = require("node:path");
+
+function harness() {
+  const timers = new Map(), storage = new Map(), listeners = new Map(), messages = [];
+  let serial = 0;
+  const emptyClassList = { add() {}, remove() {}, toggle() {} };
+  const element = () => ({ dataset: {}, style: {}, classList: emptyClassList, isConnected: true,
+    setAttribute() {}, removeAttribute() {}, append() {}, remove() {}, querySelector() { return null; }, querySelectorAll() { return []; }, addEventListener() {} });
+  const document = { visibilityState: "visible", activeElement: null, body: element(), documentElement: element(),
+    querySelector: () => null, querySelectorAll: () => [], getElementById: () => null, createElement: element,
+    addEventListener: (name, callback) => listeners.set(name, callback) };
+  const context = vm.createContext({ document, location: { pathname: "/admin", search: "" },
+    history: { pushState() {}, replaceState() {} }, window: { addEventListener() {} }, navigator: {},
+    sessionStorage: { getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, String(value)), removeItem: key => storage.delete(key) },
+    crypto: { randomUUID: () => "00000000-0000-4000-8000-000000000001" },
+    AbortController, URLSearchParams, FormData, URL, console,
+    setTimeout: (fn, ms) => { const id = ++serial; timers.set(id, { fn, ms }); return id; }, clearTimeout: id => timers.delete(id),
+    fetch: async () => { throw Error("Unexpected network call"); }, confirm: () => true, messages });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "static/special.js"), "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "static/app.js"), "utf8").replace(/\nrender\(\);\s*$/, "\n"), context);
+  vm.runInContext('state.user = {id: 1, role: "admin"}; toast = (message) => messages.push(message);', context);
+  const run = code => vm.runInContext(code, context);
+  return { context, run, document, timers, storage, listeners, messages, element };
+}
+
+function response(data, status = 200) { return { ok: status < 400, status, headers: { get: () => "application/json" }, json: async () => data }; }
+async function flush() { await Promise.resolve(); await Promise.resolve(); }
+
+async function main() {
+  {
+    const h = harness(), pending = [];
+    h.context.fetch = (url) => new Promise(resolve => pending.push({ url, resolve }));
+    h.run('state.adminFilters = {q:"old"}');
+    const first = h.run('loadShipments()').catch(error => error.constructor.name);
+    h.run('state.adminFilters = {q:"new"}');
+    const second = h.run('loadShipments()');
+    for (const request of pending.filter(item => item.url.includes("q=new"))) request.resolve(response(request.url.includes("summary") ? { counts: {total: 2} } : { shipments: [{id: 2}], pagination: {page: 1} }));
+    await second;
+    for (const request of pending.filter(item => item.url.includes("q=old"))) request.resolve(response(request.url.includes("summary") ? { counts: {total: 1} } : { shipments: [{id: 1}], pagination: {page: 1} }));
+    assert.equal(await first, "StaleViewError");
+    assert.equal(h.run('state.shipments[0].id'), 2);
+    assert.equal(h.run('state.adminShipmentSummary.total'), 2);
+  }
+  {
+    const h = harness(); let release;
+    h.context.fetch = () => new Promise(resolve => { release = resolve; });
+    const pending = h.run('loadShipments({loadSummary:false})').catch(error => error.constructor.name);
+    h.run('invalidatePage({clearIdentity:true}); state.user={id:2,role:"staff"}');
+    release(response({ shipments: [{id: 999}] }));
+    assert.equal(await pending, "StaleViewError");
+    assert.equal(h.run('state.shipments.length'), 0);
+    assert.equal(h.run('state.user.id'), 2);
+  }
+  {
+    const h = harness(); let calls = 0, finish;
+    const button = h.element(); button.textContent = "保存"; button.disabled = false;
+    h.context.button = button;
+    h.context.operation = () => { calls++; return new Promise(resolve => { finish = resolve; }); };
+    const first = h.run('withButtonBusy(button,"保存中…",operation)');
+    const second = h.run('withButtonBusy(button,"保存中…",operation)');
+    assert.equal(button.disabled, true); await flush(); assert.equal(calls, 1);
+    finish({ saved: true }); await Promise.all([first, second]); assert.equal(button.disabled, false);
+  }
+  {
+    const h = harness(), requests = [];
+    h.context.fetch = async (url, options) => { requests.push([url, options.method]); if (options.method === "POST") throw new TypeError("response lost"); return response({ found: true, shipment: {id: 3, business_id: "SYNTHETIC"} }); };
+    const result = await h.run('createWithConfirmation("shipment",{store_id:2,store_order_no:"SYNTHETIC"})');
+    assert.equal(result.shipment.id, 3);
+    assert.equal(requests.filter(item => item[1] === "POST").length, 1);
+    assert.match(requests[1][0], /submissions\/status\?kind=shipment/);
+    assert.equal(h.storage.has("scentpool_submission:1:shipment"), false);
+    h.context.fetch = async (url, options) => { if (options.method === "POST") throw new TypeError("lost"); return response({found:true, deleted:true}); };
+    await assert.rejects(h.run('createWithConfirmation("shipment",{store_id:2})'), /原提交记录已被删除/);
+    assert.equal(h.storage.has("scentpool_submission:1:shipment"), true);
+  }
+  {
+    const h = harness();
+    h.run('state.activeShippingBatch={batch:{id:1,status:"处理中"},counts:{"成功":1}}; loadActiveShippingBatch=async()=>{}; updateShippingBatchUi=()=>{}; render=()=>{throw Error("whole-page redraw")};');
+    h.document.visibilityState = "hidden"; h.run('scheduleShippingBatchPoll()'); assert.equal(h.timers.size, 0);
+    h.document.visibilityState = "visible"; h.run('scheduleShippingBatchPoll()');
+    const timer = [...h.timers.entries()][0]; h.timers.delete(timer[0]); await timer[1].fn();
+    assert.equal([...h.timers.values()].some(item => item.ms === 2500), true);
+    h.run('invalidatePage()'); assert.equal(h.timers.size, 0);
+  }
+  {
+    const h = harness();
+    h.run('scheduleTaskAlertPoll()'); const id = h.run('state.taskAlertsPollTimer');
+    h.run('scheduleTaskAlertPoll()'); assert.equal(h.run('state.taskAlertsPollTimer'), id);
+    h.storage.set("scentpool_tracking_tasks:1", JSON.stringify(["abc_DEF-01234567890123456", "../invalid"]));
+    h.run('restoreTrackingTasks()'); assert.equal(h.run('state.trackingTasks.size'), 1);
+    h.run('state.trackingTasks.set("partial",{id:"partial",status:"completed",total:10,completed:8,failed:2,remaining:0})');
+    assert.match(h.run('renderTrackingTasks()'), /失败 2/);
+    assert.match(h.run('renderTrackingTasks()'), /失败项没有被隐藏/);
+    h.run('for(let n=0;n<25;n++) state.trackingTasks.set("extra"+n,{id:"extra"+n,status:n<12?"completed":"queued",total:1,remaining:1});');
+    const bounded = h.run('renderTrackingTasks()');
+    assert.equal(h.run('state.trackingTasks.size'),10);
+    assert.equal((bounded.match(/<section /g)||[]).length,10);
+    assert.match(bounded,/其他任务仍在后台执行或已结束/);
+  }
+  {
+    const h = harness();
+    const fields = { "data-tracking": {value:"UNSAVED-SYNTHETIC"}, "data-note": {value:"未保存包装要求"} };
+    const row = { dataset:{shipment:"6",dirty:"1"}, querySelector: selector => fields[selector.slice(1,-1)] || null };
+    h.document.querySelectorAll = () => [row]; h.document.querySelector = () => row;
+    h.run('captureAdminRowDrafts()'); fields["data-note"].value = "server";
+    h.run('restoreAdminRowDrafts()'); assert.equal(fields["data-note"].value,"未保存包装要求");
+    h.run('clearAdminRowDraft(6)'); assert.equal(h.run('state.adminRowDrafts.size'),0);
+  }
+  {
+    const h = harness(), summary = {innerHTML:""};
+    h.document.getElementById = id => id === "adminShipmentSummary" ? summary : null;
+    h.run('state.adminShipmentSummary={total:81,"待处理":74,"已发货":7};updateShipmentRows([])');
+    assert.match(summary.innerHTML,/待处理 74/); assert.match(summary.innerHTML,/已发货 7/);
+  }
+  {
+    const h = harness();
+    h.run('state.batchPreview={matched:150,eligible_count:120,eligible:[{id:1,express_company:"顺丰",shipment_type:"resend"}],excluded:[],pagination:{page:1,total_pages:3},settings_ready:true,label_ready:true};state.batchSelectAll=true;state.shippingConfig={enabled:true,configured:true}');
+    const html = h.run('renderShippingBatchPreview()');
+    assert.match(html,/确认提交 120 单/); assert.match(html,/整个筛选范围/); assert.match(html,/第 1 \/ 3 页/);
+    h.run('state.activeShippingBatch={batch:{id:1,total_count:150,status:"部分完成"},counts:{"失败":2},items:[],pagination:{page:1,total_pages:3}}');
+    assert.match(h.run('renderShippingBatchProgress()'),/查看全部 2 项失败/);
+  }
+  {
+    const h = harness();
+    h.run('state.batchPreview={type_counts:{sale:8,resend:2},company_counts:{"顺丰":8,"圆通":2}};state.batchSelectAll=true;state.batchKnownCompanies={1:"顺丰",2:"圆通"};state.batchKnownTypes={1:"sale",2:"resend"}');
+    let summary = h.run('shippingBatchConfirmationSummary([{id:1,express_company:"京东"}],10)');
+    assert.match(summary.companySummary,/顺丰 7 单/); assert.match(summary.companySummary,/京东 1 单/);
+    h.run('state.batchBulkCompany="圆通"');
+    summary = h.run('shippingBatchConfirmationSummary([{id:1,express_company:"京东"}],10)');
+    assert.match(summary.companySummary,/圆通 9 单/); assert.doesNotMatch(summary.companySummary,/顺丰/);
+    h.run('state.batchSelectAll=false;state.batchBulkCompany=""');
+    summary = h.run('shippingBatchConfirmationSummary([{id:1},{id:2}],2)');
+    assert.match(summary.companySummary,/顺丰 1 单/); assert.match(summary.companySummary,/圆通 1 单/);
+  }
+  {
+    const h = harness(), handlers = {};
+    const button = h.element(); button.dataset.saveShipment = "7"; button.textContent="保存";
+    button.addEventListener = (name, callback) => { handlers[name] = callback; };
+    const fields = {"[data-status]":{value:"待处理"},"[data-company]":{value:"顺丰"},"[data-tracking]":{value:""},"[data-note]":{value:"合成备注"}};
+    const row = {matches: selector => selector === '[data-shipment="7"]', querySelector: selector => fields[selector] || null, querySelectorAll: selector => selector === '[data-save-shipment]' ? [button] : []};
+    h.context.row=row; h.run('render=()=>{}; clearAdminRowDraft=()=>{}');
+    let body;
+    h.context.fetch = async (_url, options) => {body=JSON.parse(options.body); return response({message:"已保存。"});};
+    h.run('bindAdmin(row)'); await handlers.click({currentTarget:button});
+    assert.equal(body.express_company,"顺丰"); assert.equal(body.shipping_note,"合成备注");
+    assert.equal(h.messages.at(-1),"已保存。");
+    h.document.querySelectorAll = () => {throw Error("row update must not rebind all item editors")};
+    h.run('bindShipmentItemEditor([],row)');
+  }
+  {
+    const h = harness(), handlers = {};
+    const cancel={focus(){},addEventListener:(name,fn)=>{handlers.cancel=fn}}, accept={addEventListener:(name,fn)=>{handlers.accept=fn}};
+    const overlay={remove(){this.removed=true},querySelector:selector=>selector.includes("cancel")?cancel:accept,addEventListener(){}};
+    h.document.createElement=()=>overlay; h.document.body.appendChild=()=>{};
+    const decision=h.run('confirmShippingBatch({total:2,scope:"已勾选",typeSummary:"普通 2",companySummary:"顺丰 2"})');
+    assert.match(overlay.innerHTML,/role="dialog"/); assert.match(overlay.innerHTML,/顺丰 2/);
+    h.run('invalidatePage()'); assert.equal(await decision,false); assert.equal(overlay.removed,true);
+  }
+  console.log("frontend reliability tests passed: latest response, identity isolation, double click, lost/deleted submission, hidden/navigation lifecycle, local progress, independent alerts, opaque task recovery, partial failures, drafts, full-scope pagination");
+}
+
+main().catch(error => { console.error(error); process.exitCode = 1; });

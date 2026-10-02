@@ -47,6 +47,22 @@ const state = {
   taskAlertsOpen: false,
   taskAlertsCategory: "全部",
   taskAlertsPollTimer: null,
+  returnPages: { admin: 1, store: 1 },
+  returnPagination: { admin: {}, store: {} },
+  returnSummary: { admin: {}, store: {} },
+  returnTodaySummary: { admin: {}, store: {} },
+  trackingTasks: new Map(),
+  trackingTasksOverflow: false,
+  trackingPollTimer: null,
+  batchPreviewPage: 1,
+  batchSelectAll: false,
+  batchCompanyOverrides: {},
+  batchKnownTypes: {},
+  batchKnownCompanies: {},
+  batchBulkCompany: "",
+  adminRowDrafts: new Map(),
+  batchProgressPage: 1,
+  batchProgressFailedOnly: false,
 };
 
 const EXPRESS_COMPANIES = ["圆通", "京东", "顺丰"];
@@ -55,6 +71,60 @@ const CATEGORY_COLOR_COUNT = 10;
 const SHIPMENT_PAGE_SIZE = 50;
 const pendingGetRequests = new Map();
 let activeDataLoads = 0;
+let pageEpoch = 0;
+let viewRevision = 0;
+let renderSequence = 0;
+let currentRoute = `${location.pathname}${location.search}`;
+const loadVersions = new Map();
+const activeReadControllers = new Set();
+const busyOperations = new WeakMap();
+const activeConfirmations = new Set();
+
+class StaleViewError extends Error {}
+
+function beginLoad(key) {
+  const version = (loadVersions.get(key) || 0) + 1;
+  loadVersions.set(key, version);
+  const epoch = pageEpoch;
+  const user = state.user?.id;
+  return () => {
+    if (epoch !== pageEpoch || user !== state.user?.id || loadVersions.get(key) !== version) throw new StaleViewError();
+  };
+}
+
+function beginView() {
+  const revision = ++viewRevision;
+  const epoch = pageEpoch;
+  return () => {
+    if (revision !== viewRevision || epoch !== pageEpoch) throw new StaleViewError();
+  };
+}
+
+function invalidatePage({ clearIdentity = false } = {}) {
+  pageEpoch += 1;
+  viewRevision += 1;
+  activeConfirmations.forEach(cancel => cancel());
+  activeReadControllers.forEach(controller => controller.abort());
+  activeReadControllers.clear();
+  pendingGetRequests.clear();
+  stopTaskAlertPoll();
+  clearTimeout(state.shippingBatchPollTimer);
+  clearTimeout(state.trackingPollTimer);
+  state.shippingBatchPollTimer = state.trackingPollTimer = null;
+  state.adminRowDrafts.clear();
+  if (clearIdentity) {
+    state.stores = []; state.productsGrouped = null; state.productsAll = [];
+    state.shipments = []; state.storeShipments = []; state.returnOrders = []; state.storeReturnOrders = [];
+    state.adminBoardLoaded = state.storeBoardLoaded = false;
+    state.activeShippingBatch = null; state.trackingTasks.clear(); state.trackingTasksOverflow = false;
+    state.taskAlerts = { counts: { total: 0 }, items: [] };
+    state.submitDraft = {}; state.returnDraft = {};
+    state.submitItems = [{ category: "", barcode: "", quantity: 1 }];
+    state.returnItems = [{ category: "", barcode: "", quantity: 1 }];
+    clearShipmentSelections();
+    if (typeof specialDraft !== "undefined") specialDraft = null;
+  }
+}
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -291,20 +361,25 @@ function toast(message, options = {}) {
 }
 
 function errorToast(error, fallback = "操作失败，请稍后重试。") {
+  if (error instanceof StaleViewError) return;
   const message = String(error?.message || error || fallback).trim() || fallback;
   toast(`操作未完成：${message}`, { type: "error" });
 }
 
 async function withButtonBusy(button, busyLabel, operation) {
   if (!button) return operation();
+  if (busyOperations.has(button)) return busyOperations.get(button);
   const originalLabel = button.textContent;
   const wasDisabled = button.disabled;
   button.disabled = true;
   button.setAttribute("aria-busy", "true");
   button.textContent = busyLabel;
+  const running = Promise.resolve().then(operation);
+  busyOperations.set(button, running);
   try {
-    return await operation();
+    return await running;
   } finally {
+    busyOperations.delete(button);
     if (button.isConnected) {
       button.disabled = wasDisabled;
       button.removeAttribute("aria-busy");
@@ -335,8 +410,10 @@ async function copyText(value) {
   toast("已复制快递单号。");
 }
 
-function bindTrackingCopyButtons() {
-  document.querySelectorAll("[data-copy-tracking]").forEach((node) => {
+function bindTrackingCopyButtons(root = document) {
+  root.querySelectorAll("[data-copy-tracking]").forEach((node) => {
+    if (node.dataset.copyBound) return;
+    node.dataset.copyBound = "1";
     node.addEventListener("click", async (event) => {
       const row = event.currentTarget.closest("[data-shipment]");
       const explicitTrackingNo = event.currentTarget.dataset.copyTracking || "";
@@ -349,8 +426,10 @@ function bindTrackingCopyButtons() {
   });
 }
 
-function bindTrackingDetails() {
-  document.querySelectorAll("[data-tracking-details]").forEach((details) => {
+function bindTrackingDetails(root = document) {
+  root.querySelectorAll("[data-tracking-details]").forEach((details) => {
+    if (details.dataset.detailsBound) return;
+    details.dataset.detailsBound = "1";
     details.addEventListener("toggle", async () => {
       if (!details.open || details.dataset.trackingLoaded === "1" || details.dataset.trackingLoading === "1") {
         return;
@@ -360,13 +439,15 @@ function bindTrackingDetails() {
       if (!Number.isInteger(shipmentId) || shipmentId < 1 || !target) return;
       details.dataset.trackingLoading = "1";
       try {
-        const data = await api(`/api/shipments?id=${shipmentId}&include_tracking_raw=1`);
-        const row = (data.shipments || [])[0];
+        const data = await api(details.dataset.trackingKind === "return" ? `/api/returns/${shipmentId}/tracking` : `/api/shipments?id=${shipmentId}&include_tracking_raw=1`);
+        if (!details.isConnected) return;
+        const row = data.return_order || data.tracking || (data.shipments || [])[0];
         if (!row) throw new Error("发货单不存在。");
         const parts = trackingDetailParts(row);
         target.innerHTML = parts.length ? parts.join("") : `<div class="muted mini">暂无详细物流轨迹</div>`;
         details.dataset.trackingLoaded = "1";
       } catch (error) {
+        if (error instanceof StaleViewError || !details.isConnected) return;
         target.innerHTML = `<div class="tracking-error">${escapeHtml(error.message || "物流详情加载失败。")}</div>`;
       } finally {
         delete details.dataset.trackingLoading;
@@ -406,16 +487,17 @@ function bindShipmentPagination() {
 
 async function api(path, options = {}) {
   const method = String(options.method || "GET").toUpperCase();
-  if (method === "GET" && pendingGetRequests.has(path)) {
-    return pendingGetRequests.get(path);
+  const key = `${pageEpoch}:${path}`;
+  if (method === "GET" && pendingGetRequests.has(key)) {
+    return pendingGetRequests.get(key);
   }
   const request = apiRequest(path, options);
   if (method !== "GET") return request;
-  pendingGetRequests.set(path, request);
+  pendingGetRequests.set(key, request);
   try {
     return await request;
   } finally {
-    pendingGetRequests.delete(path);
+    if (pendingGetRequests.get(key) === request) pendingGetRequests.delete(key);
   }
 }
 
@@ -429,15 +511,36 @@ class ApiError extends Error {
 }
 
 async function apiRequest(path, options = {}) {
-  const headers = options.headers || {};
+  const epoch = pageEpoch;
+  const method = String(options.method || "GET").toUpperCase();
+  const headers = { ...(options.headers || {}) };
   if (options.body && !(options.body instanceof FormData)) {
     headers["Content-Type"] = "application/json";
   }
-  const response = await fetch(path, { ...options, headers });
-  const contentType = response.headers.get("content-type") || "";
-  const data = contentType.includes("application/json") ? await response.json() : await response.text();
+  const controller = new AbortController();
+  if (method === "GET") activeReadControllers.add(controller);
+  // PDF printing uses its existing dedicated fetch. Uploads and provider-backed
+  // label operations retain a longer budget; ordinary reads/writes are bounded.
+  const longOperation = options.body instanceof FormData || /shipping-settings|\/labels?\//.test(path);
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs || (longOperation ? 180000 : 30000));
+  let response;
+  let data;
+  try {
+    response = await fetch(path, { ...options, headers, signal: controller.signal });
+    const contentType = response.headers.get("content-type") || "";
+    data = contentType.includes("application/json") ? await response.json() : await response.text();
+  } catch (error) {
+    if (epoch !== pageEpoch) throw new StaleViewError();
+    if (method !== "GET") throw new ApiError("暂未确认提交结果。请保留当前内容，先核对结果，不要另建一笔重复提交。", 0, { uncertain: true });
+    throw new ApiError(error.name === "AbortError" ? "读取超时，请检查网络后重试。" : "暂时无法连接，请检查网络。", 0);
+  } finally {
+    clearTimeout(timer);
+    activeReadControllers.delete(controller);
+  }
+  if (epoch !== pageEpoch) throw new StaleViewError();
   if (!response.ok) {
     if (response.status === 401 && location.pathname !== "/login") {
+      invalidatePage({ clearIdentity: true });
       state.user = null;
       navigate("/login");
     }
@@ -448,8 +551,62 @@ async function apiRequest(path, options = {}) {
 }
 
 function navigate(path) {
+  invalidatePage();
   history.pushState({}, "", path);
+  currentRoute = `${location.pathname}${location.search}`;
   render();
+}
+
+async function createWithConfirmation(kind, payload) {
+  const storageKey = `scentpool_submission:${state.user.id}:${kind}`;
+  const key = payload.submission_key || sessionStorage.getItem(storageKey) || crypto.randomUUID();
+  sessionStorage.setItem(storageKey, key);
+  const body = { ...payload, submission_key: key };
+  try {
+    const data = await api(kind === "return" ? "/api/returns" : "/api/shipments", { method: "POST", body: JSON.stringify(body) });
+    sessionStorage.removeItem(storageKey);
+    return data;
+  } catch (error) {
+    if (error instanceof StaleViewError) throw error;
+    if (error.status && error.status < 500) {
+      // Keep conflicting keys: generating a new key after 409 could create a
+      // second real shipment when an earlier response was lost.
+      if (error.status !== 409) sessionStorage.removeItem(storageKey);
+      throw error;
+    }
+    toast("暂未收到提交结果，正在核对原提交，请不要重复点击。", { duration: 0 });
+    try {
+      const params = new URLSearchParams({ kind, submission_key: key });
+      if (state.user.role === "admin") params.set("store_id", String(payload.store_id || ""));
+      const result = await api(`/api/submissions/status?${params}`);
+      if (result.found && result.deleted) throw new ApiError("原提交记录已被删除。内容和原提交编号已保留，请先联系总部核对，不要再次寄送。", 409, { deleted: true });
+      if (result.found && (result.shipment || result.return_order)) { sessionStorage.removeItem(storageKey); return result; }
+    } catch (checkError) { if (checkError instanceof StaleViewError || checkError.details?.deleted) throw checkError; }
+    throw new ApiError("暂未确认保存结果，填写内容已保留。请保持原内容再次提交核对，系统会沿用同一次编号，避免重复创建；不要开始另一张同内容新单。", 0, { uncertain: true });
+  }
+}
+
+function renderSubmissionRecovery(kind) {
+  return `<div class="submission-recovery"><button class="btn secondary small" type="button" data-check-submission="${kind}">核对上次提交</button><span class="mini muted" data-submission-result role="status">网络中断时先核对，不要另建重复订单。</span></div>`;
+}
+
+function bindSubmissionRecovery() {
+  document.querySelectorAll("[data-check-submission]").forEach(button => button.addEventListener("click", async () => {
+    const kind = button.dataset.checkSubmission, keyName = `scentpool_submission:${state.user.id}:${kind}`;
+    const key = sessionStorage.getItem(keyName), target = button.parentElement.querySelector("[data-submission-result]");
+    if (!key) { target.textContent = "没有尚待核对的提交。已成功的订单可在看板查看。"; return; }
+    try {
+      const params = new URLSearchParams({kind, submission_key: key});
+      if (state.user.role === "admin") params.set("store_id", String(button.closest("form").querySelector('[name="store_id"]')?.value || ""));
+      const result = await withButtonBusy(button, "核对中…", () => api(`/api/submissions/status?${params}`));
+      if (!result.found) { target.textContent = "暂未找到已提交结果。请保留原内容再次提交核对，继续使用原编号；不要另建同内容订单。"; return; }
+      target.textContent = result.deleted ? "原提交记录已被删除，请联系总部核对。" : `上次已经保存${result.shipment?.business_id ? `：${result.shipment.business_id}` : ""}，无需重复提交。`;
+      if (confirm(`${target.textContent}\n确认已经核对原订单，且接下来确实要开始另一张不同的新单？`)) {
+        sessionStorage.removeItem(keyName);
+        target.textContent += " 已允许开始另一张新单，请检查并修改本次内容后再提交。";
+      }
+    } catch (error) { errorToast(error); }
+  }));
 }
 
 function isActive(path) {
@@ -502,27 +659,35 @@ function shell(content) {
 }
 
 async function loadMe() {
+  const epoch = pageEpoch;
   try {
     const data = await api("/api/me");
+    if (epoch !== pageEpoch) return;
     state.user = data.user;
   } catch {
+    if (epoch !== pageEpoch) return;
     state.user = null;
   }
 }
 
 async function ensureProductsGrouped() {
   if (!state.productsGrouped) {
+    const current = beginLoad("productsGrouped");
     const data = await api("/api/products");
+    current();
     state.productsGrouped = data.categories || {};
   }
 }
 
 async function loadStores(all = false) {
+  const current = beginLoad("stores");
   const data = await api(`/api/stores${all ? "?all=1" : ""}`);
+  current();
   state.stores = data.stores || [];
 }
 
 async function loadShipments({ loadSummary = true } = {}) {
+  const current = beginLoad("shipments");
   const params = new URLSearchParams();
   Object.entries(state.adminFilters).forEach(([key, value]) => {
     if (value) params.set(key, value);
@@ -537,6 +702,7 @@ async function loadShipments({ loadSummary = true } = {}) {
     api(`/api/shipments?${params.toString()}`),
     loadSummary ? api(`/api/shipments/summary?${summaryParams.toString()}`) : Promise.resolve(null),
   ]);
+  current();
   state.shipments = data.shipments || [];
   state.adminShipmentPagination = data.pagination || { page: 1, page_size: SHIPMENT_PAGE_SIZE, total: state.shipments.length, total_pages: 1 };
   state.adminShipmentPage = state.adminShipmentPagination.page || 1;
@@ -545,26 +711,43 @@ async function loadShipments({ loadSummary = true } = {}) {
 }
 
 async function loadShippingSettings() {
+  const current = beginLoad("shippingSettings");
   const data = await api("/api/admin/shipping-settings");
+  current();
   state.shippingSettings = data.settings || {};
   state.shippingConfig = data.shipping || {};
 }
 
-async function loadShippingBatchPreview(filters) {
+async function loadShippingBatchPreview(filters, { reset = true } = {}) {
+  const current = beginLoad("batchPreview");
+  if (reset) {
+    state.batchPreviewPage = 1; state.batchSelectAll = true; state.batchSelectedIds = [];
+    state.batchCompanyOverrides = {}; state.batchKnownTypes = {}; state.batchKnownCompanies = {}; state.batchBulkCompany = "";
+  }
   const data = await api("/api/admin/shipping-batches/preview", {
     method: "POST",
-    body: JSON.stringify({ filters }),
+    body: JSON.stringify({ filters, page: state.batchPreviewPage, page_size: 50 }),
   });
+  current();
   state.batchPreview = data.preview || null;
-  state.batchSelectedIds = (state.batchPreview?.eligible || []).map((row) => Number(row.id));
+  for (const row of state.batchPreview?.eligible || []) {
+    state.batchKnownTypes[row.id] = row.shipment_type || "legacy";
+    state.batchKnownCompanies[row.id] = row.express_company || DEFAULT_EXPRESS_COMPANY;
+  }
 }
 
+function shippingBatchStorageKey() { return `scentpool_shipping_batch_id:${state.user?.id || "none"}`; }
+
 async function loadTaskAlerts() {
+  const current = beginLoad("taskAlerts");
   try {
     const data = await api("/api/admin/task-alerts");
+    current();
     state.taskAlerts = data || { counts: { total: 0 }, items: [] };
     state.taskAlertsLoadError = "";
   } catch (error) {
+    if (error instanceof StaleViewError) return;
+    try { current(); } catch { return; }
     state.taskAlertsLoadError = error.message || "异常提醒暂时无法读取。";
   }
 }
@@ -575,10 +758,11 @@ function stopTaskAlertPoll() {
 }
 
 function scheduleTaskAlertPoll() {
-  stopTaskAlertPoll();
+  if (state.taskAlertsPollTimer) return;
   if (location.pathname !== "/admin" || state.user?.role !== "admin") return;
   const seconds = Math.max(15, Number(state.taskAlerts?.refresh?.alerts_seconds || 60));
   state.taskAlertsPollTimer = setTimeout(async () => {
+    state.taskAlertsPollTimer = null;
     if (location.pathname !== "/admin" || state.user?.role !== "admin") return;
     if (document.visibilityState === "visible") {
       await loadTaskAlerts();
@@ -589,16 +773,21 @@ function scheduleTaskAlertPoll() {
 }
 
 async function loadActiveShippingBatch() {
-  const batchId = state.activeShippingBatch?.batch?.id || sessionStorage.getItem("scentpool_shipping_batch_id");
+  const current = beginLoad("shippingBatch");
+  const batchId = state.activeShippingBatch?.batch?.id || sessionStorage.getItem(shippingBatchStorageKey());
   if (!batchId) return;
   try {
-    state.activeShippingBatch = await api(`/api/admin/shipping-batches/${batchId}`);
+    const data = await api(`/api/admin/shipping-batches/${batchId}?page=${state.batchProgressPage}&page_size=50${state.batchProgressFailedOnly ? "&status=" + encodeURIComponent("失败") : ""}`);
+    current();
+    state.activeShippingBatch = data;
     state.shippingBatchPollError = "";
   } catch (error) {
+    if (error instanceof StaleViewError) return;
+    try { current(); } catch { return; }
     if (error.status === 404) {
       state.activeShippingBatch = null;
       state.shippingBatchPollError = "";
-      sessionStorage.removeItem("scentpool_shipping_batch_id");
+      sessionStorage.removeItem(shippingBatchStorageKey());
     } else {
       state.shippingBatchPollError = `批次进度暂时无法刷新：${error.message || "请检查网络后重试。"}`;
     }
@@ -608,18 +797,25 @@ async function loadActiveShippingBatch() {
 function scheduleShippingBatchPoll() {
   if (state.shippingBatchPollTimer) clearTimeout(state.shippingBatchPollTimer);
   const status = state.activeShippingBatch?.batch?.status;
-  if (!status || !["排队中", "处理中"].includes(status) || location.pathname !== "/admin") return;
+  if (!status || !["排队中", "处理中"].includes(status) || location.pathname !== "/admin" || document.visibilityState === "hidden") return;
+  const epoch = pageEpoch;
   state.shippingBatchPollTimer = setTimeout(async () => {
+    state.shippingBatchPollTimer = null;
     try {
       const previousCounts = JSON.stringify(state.activeShippingBatch?.counts || {});
       const previousStatus = state.activeShippingBatch?.batch?.status || "";
       await loadActiveShippingBatch();
+      if (epoch !== pageEpoch) return;
       const nextCounts = JSON.stringify(state.activeShippingBatch?.counts || {});
       const nextStatus = state.activeShippingBatch?.batch?.status || "";
       if (previousCounts !== nextCounts || previousStatus !== nextStatus) {
+        const oldRows = state.shipments;
         await Promise.all([loadShipments(), loadTaskAlerts()]);
+        if (epoch !== pageEpoch) return;
+        updateShipmentRows(oldRows);
+        updateTaskAlertUi();
       }
-      await render({ refreshData: false });
+      updateShippingBatchUi();
       if (["排队中", "处理中"].includes(previousStatus) && !["排队中", "处理中"].includes(nextStatus)) {
         const failed = state.activeShippingBatch?.counts?.["失败"] || 0;
         if (failed) {
@@ -629,13 +825,218 @@ function scheduleShippingBatchPoll() {
         }
       }
     } catch (error) {
+      if (error instanceof StaleViewError || epoch !== pageEpoch) return;
       state.shippingBatchPollError = `批次进度暂时无法刷新：${error.message || "请检查网络后重试。"}`;
-      await render({ refreshData: false });
+      updateShippingBatchUi();
+    } finally {
+      if (epoch === pageEpoch) scheduleShippingBatchPoll();
     }
   }, 2500);
 }
 
+function updateShippingBatchUi() {
+  const host = document.getElementById("shippingBatchProgressHost");
+  if (!host) return;
+  const focusId = host.contains(document.activeElement) ? document.activeElement.id : "";
+  host.innerHTML = renderShippingBatchProgress();
+  bindAdmin(host);
+  if (focusId) document.getElementById(focusId)?.focus({ preventScroll: true });
+}
+
+function updateBatchPreviewUi() {
+  const host = document.getElementById("shippingBatchPreviewHost");
+  if (host) { host.innerHTML = renderShippingBatchPreview(); bindAdmin(host); }
+}
+
+function updateShipmentRows(previousRows) {
+  const summary = document.getElementById("adminShipmentSummary");
+  if (summary) summary.innerHTML = renderAdminShipmentSummary();
+  const previous = new Map(previousRows.map(row => [Number(row.id), row]));
+  const latestIds = new Set(state.shipments.map(row => Number(row.id)));
+  const batchItems = new Map((state.activeShippingBatch?.items || []).map(item => [Number(item.shipment_id), item]));
+  const leftFilter = previousRows.filter(row => !latestIds.has(Number(row.id)));
+  const updates = [...state.shipments];
+  for (const old of leftFilter) {
+    const item = batchItems.get(Number(old.id));
+    if (item?.status === "成功" && item.tracking_no) {
+      updates.push({ ...old, status: "已发货", booking_status: item.booking_status, tracking_no: item.tracking_no, express_company: item.express_company, _live_partial: true });
+    } else {
+      const node = document.querySelector(`tr[data-shipment="${Number(old.id)}"]`);
+      if (!node) continue;
+      let notice = node.querySelector("[data-live-conflict]");
+      if (!notice) { notice = document.createElement("div"); notice.dataset.liveConflict = "1"; notice.className = "notice live-update-notice"; node.querySelector(".status-cell")?.append(notice); }
+      notice.textContent = "此单已不符合当前筛选，以下是保留的旧内容。请完成其他编辑后点击筛选核对，不能保存旧内容。";
+      node.querySelectorAll("[data-save-shipment], [data-save-admin-remark], [data-edit-shipment-items], [data-delete-shipment]").forEach(button => { button.disabled = true; });
+    }
+  }
+  for (const row of updates) {
+    if (JSON.stringify(previous.get(Number(row.id))) === JSON.stringify(row)) continue;
+    const node = document.querySelector(`tr[data-shipment="${Number(row.id)}"]`);
+    if (!node) continue;
+    const editing = node.dataset.dirty === "1" || node.contains(document.activeElement) || node.querySelector("details[open]") ||
+      [state.editingShipmentId, state.editingShipmentRemarkId, state.editingShipmentShippingId].includes(row.id);
+    if (editing) {
+      let notice = node.querySelector("[data-live-conflict]");
+      if (!notice) {
+        notice = document.createElement("div"); notice.dataset.liveConflict = "1";
+        notice.className = "notice live-update-notice"; notice.setAttribute("role", "status");
+        node.querySelector(".status-cell")?.append(notice);
+      }
+      notice.textContent = bookingEditable(row) ? "后台状态已更新；你的输入已保留，保存时将再次核对。" : "此单已进入面单或发货流程。输入已保留供核对，请刷新后查看；不能再保存旧内容。";
+      if (!bookingEditable(row)) node.querySelectorAll("[data-save-shipment], [data-save-admin-remark], [data-save-edit-items], [data-edit-shipment-items], [data-delete-shipment]").forEach(button => { button.disabled = true; });
+      continue;
+    }
+    const template = document.createElement("template");
+    template.innerHTML = renderShipmentTable([row]);
+    const replacement = template.content.querySelector("tr[data-shipment]");
+    if (!replacement) continue;
+    node.replaceWith(replacement);
+    bindAdmin(replacement); bindTrackingCopyButtons(replacement); bindTrackingDetails(replacement); bindSpecialControls(replacement);
+  }
+  // Membership/order is changed only on an explicit filter/page refresh. This
+  // keeps an in-progress edit and current selection from disappearing mid-use.
+  if (previousRows.map(row => row.id).join() !== state.shipments.map(row => row.id).join()) {
+    const notice = document.getElementById("shipmentListUpdateNotice");
+    if (notice) { notice.hidden = false; notice.textContent = "部分订单状态已变化，当前行保留便于核对；完成编辑后点击“筛选”更新列表。"; }
+  }
+}
+
+const ROW_DRAFT_FIELDS = ["data-status", "data-company", "data-tracking", "data-note", "data-admin-remark"];
+
+function captureAdminRowDrafts() {
+  if (location.pathname !== "/admin") return;
+  for (const node of document.querySelectorAll('tr[data-shipment][data-dirty="1"]')) {
+    const fields = {};
+    for (const key of ROW_DRAFT_FIELDS) {
+      const input = node.querySelector(`[${key}]`);
+      if (input) fields[key] = input.value;
+    }
+    state.adminRowDrafts.set(Number(node.dataset.shipment), fields);
+  }
+  // Drafts never leave memory or grow beyond the currently displayed page.
+  const visible = new Set([...document.querySelectorAll("tr[data-shipment]")].map(node => Number(node.dataset.shipment)));
+  for (const id of state.adminRowDrafts.keys()) if (!visible.has(id)) state.adminRowDrafts.delete(id);
+}
+
+function restoreAdminRowDrafts() {
+  for (const [id, fields] of state.adminRowDrafts) {
+    const row = document.querySelector(`tr[data-shipment="${id}"]`);
+    if (!row) { state.adminRowDrafts.delete(id); continue; }
+    row.dataset.dirty = "1";
+    for (const [key, value] of Object.entries(fields)) {
+      const input = row.querySelector(`[${key}]`);
+      if (input) input.value = value;
+    }
+    const data = state.shipments.find(item => Number(item.id) === id);
+    if (data && !bookingEditable(data)) {
+      const notice = document.createElement("div"); notice.className = "notice live-update-notice";
+      notice.textContent = "后台已锁定此单，原输入保留供核对，不能保存旧内容。";
+      // The read-only editor no longer exposes inputs; retain draft as text for
+      // the employee to review rather than silently discarding their work.
+      const draft = document.createElement("details"); const summary = document.createElement("summary");
+      summary.textContent = "查看未保存内容"; draft.append(summary);
+      const text = document.createElement("p"); text.textContent = Object.values(fields).join(" · "); draft.append(text); notice.append(draft);
+      row.querySelector(".status-cell")?.append(notice);
+      row.querySelectorAll("[data-save-shipment], [data-save-admin-remark]").forEach(button => { button.disabled = true; });
+    }
+  }
+}
+
+function clearAdminRowDraft(id) {
+  state.adminRowDrafts.delete(Number(id));
+  const row = document.querySelector(`tr[data-shipment="${Number(id)}"]`);
+  if (row) delete row.dataset.dirty;
+}
+
+function trackingTaskStorageKey() { return `scentpool_tracking_tasks:${state.user?.id || "none"}`; }
+function trackingTaskPending(task) { return ["queued", "running", "retry_wait", "排队中", "处理中", "等待重试"].includes(task.status); }
+
+function trimTrackingTasks() {
+  while (state.trackingTasks.size > 10) {
+    const ended = [...state.trackingTasks.entries()].find(([, task]) => !trackingTaskPending(task));
+    state.trackingTasks.delete(ended ? ended[0] : state.trackingTasks.keys().next().value);
+    state.trackingTasksOverflow = true;
+  }
+}
+
+function acceptTrackingTask(data) {
+  if (data?.task?.id) {
+    state.trackingTasks.set(String(data.task.id), data.task);
+    trimTrackingTasks();
+    sessionStorage.setItem(trackingTaskStorageKey(), JSON.stringify([...state.trackingTasks.keys()].slice(-10)));
+    updateTrackingTaskUi(); scheduleTrackingPoll();
+  }
+  toast(data?.message || "物流查询已加入后台队列，无需重复点击，可继续其他操作。");
+}
+
+function renderTrackingTasks() {
+  trimTrackingTasks();
+  const labels = { queued: "排队中", running: "查询中", retry_wait: "等待重试", completed: "已完成", failed: "有查询失败", cancelled: "已停止" };
+  return (state.trackingTasksOverflow ? `<p class="mini muted">这里只保留最近 10 个查询任务，优先保留进行中的任务；其他任务仍在后台执行或已结束，结果和失败原因请在对应订单及异常提醒中核对。</p>` : "") + [...state.trackingTasks.values()].map(task => `<section class="notice tracking-task ${Number(task.failed) || task.load_error || task.failure_categories?.provider_unavailable ? "danger-notice" : ""}" role="status">
+    <strong>物流查询：${escapeHtml(labels[task.status] || task.status || "正在核对")}</strong>
+    <span>共 ${Number(task.total || 0)} 项 · 完成 ${Number(task.completed || 0)} · 失败 ${Number(task.failed || 0)} · 跳过 ${Number(task.skipped || 0)} · 等待 ${Number(task.remaining || 0)}</span>
+    ${task.load_error ? `<span>${escapeHtml(task.load_error)} 后台任务可能仍在执行，请勿重复提交。</span>` : ""}
+    ${task.message || task.service_error ? `<span>${escapeHtml(task.message || task.service_error)}</span>` : ""}
+    ${task.failure_categories?.provider_unavailable ? `<span>物流服务暂时不可用，订单和已有物流已保留。${trackingTaskPending(task) ? "系统将按保护间隔重试，请勿反复点击。" : "自动尝试已结束，请联系总部核查异常提醒。"}</span>` : ""}
+    <span class="mini">${trackingTaskPending(task) ? "关闭页面不会取消任务；系统按查询间隔处理，请勿重复点击。" : Number(task.failed) ? "失败项没有被隐藏；总部可在异常提醒或对应记录查看原因。" : "结果已更新。"}${task.updated_at ? ` 最近更新 ${escapeHtml(formatDate(task.updated_at))}` : ""}</span>
+  </section>`).join("");
+}
+
+function updateTrackingTaskUi() {
+  const host = document.getElementById("trackingTaskHost");
+  if (host) host.innerHTML = renderTrackingTasks();
+}
+
+function scheduleTrackingPoll(immediate = false) {
+  clearTimeout(state.trackingPollTimer); state.trackingPollTimer = null;
+  if (!state.user || document.visibilityState === "hidden" || !document.getElementById("trackingTaskHost")) return;
+  const tasks = [...state.trackingTasks.values()].filter(task => trackingTaskPending(task) || task.load_error);
+  const visibleRows = location.pathname === "/admin" ? state.shipments : location.pathname === "/admin/returns" ? state.returnOrders : location.pathname === "/returns" ? state.storeReturnOrders : [];
+  const hasQueuedRows = visibleRows.some(row => row.tracking_queued);
+  if (!tasks.length && !hasQueuedRows) return;
+  const epoch = pageEpoch;
+  state.trackingPollTimer = setTimeout(async () => {
+    state.trackingPollTimer = null;
+    let changed = hasQueuedRows;
+    for (const old of tasks) {
+      try {
+        const data = await api(`/api/tracking/tasks/${encodeURIComponent(old.id)}`);
+        if (epoch !== pageEpoch) return;
+        changed ||= JSON.stringify(old) !== JSON.stringify(data.task);
+        state.trackingTasks.set(String(old.id), data.task);
+      } catch (error) {
+        if (epoch !== pageEpoch || error instanceof StaleViewError) return;
+        if ([403, 404].includes(error.status)) state.trackingTasks.delete(String(old.id));
+        else state.trackingTasks.set(String(old.id), { ...old, load_error: error.message });
+      }
+    }
+    if (epoch !== pageEpoch) return;
+    updateTrackingTaskUi();
+    if (changed) {
+      try {
+        if (location.pathname === "/admin") {
+          const oldRows = state.shipments;
+          await loadShipments(); updateShipmentRows(oldRows);
+        } else if (["/admin/returns", "/returns"].includes(location.pathname)) {
+          await loadReturnOrders(location.pathname === "/admin/returns");
+          if (epoch === pageEpoch) updateReturnRows(location.pathname === "/admin/returns");
+        }
+      } catch (error) { if (!(error instanceof StaleViewError)) errorToast(error); }
+    }
+    if (epoch === pageEpoch) scheduleTrackingPoll();
+  }, immediate ? 0 : 5000);
+}
+
+function restoreTrackingTasks() {
+  if (!state.user || state.trackingTasks.size) return;
+  try {
+    const ids = JSON.parse(sessionStorage.getItem(trackingTaskStorageKey()) || "[]");
+    for (const id of ids.slice(-10)) if (/^[A-Za-z0-9_-]{16,80}$/.test(String(id))) state.trackingTasks.set(String(id), { id, status: "queued" });
+  } catch { /* No recipient fields are persisted. Ignore a corrupt ID list. */ }
+}
+
 async function loadStoreShipments({ loadSummary = true } = {}) {
+  const current = beginLoad("storeShipments");
   const params = new URLSearchParams();
   Object.entries(state.storeFilters).forEach(([key, value]) => {
     if (value) params.set(key, value);
@@ -650,6 +1051,7 @@ async function loadStoreShipments({ loadSummary = true } = {}) {
     api(`/api/shipments?${params.toString()}`),
     loadSummary ? api(`/api/shipments/summary?${summaryParams.toString()}`) : Promise.resolve(null),
   ]);
+  current();
   state.storeShipments = data.shipments || [];
   state.storeShipmentPagination = data.pagination || { page: 1, page_size: SHIPMENT_PAGE_SIZE, total: state.storeShipments.length, total_pages: 1 };
   state.storeShipmentPage = state.storeShipmentPagination.page || 1;
@@ -658,18 +1060,33 @@ async function loadStoreShipments({ loadSummary = true } = {}) {
 }
 
 async function loadStoreTodaySummary() {
+  const current = beginLoad("storeTodaySummary");
   const today = localDate();
   const data = await api(`/api/shipments/summary?date_from=${today}&date_to=${today}`);
+  current();
   state.storeTodaySummary = data.counts || { total: 0 };
 }
 
 async function loadReturnOrders(admin = false) {
+  const scope = admin ? "admin" : "store";
+  const current = beginLoad(`returns:${scope}`);
   const filters = admin ? state.adminReturnFilters : state.storeReturnFilters;
   const params = new URLSearchParams();
   Object.entries(filters).forEach(([key, value]) => {
     if (value) params.set(key, value);
   });
-  const data = await api(`/api/returns?${params.toString()}`);
+  const summaryParams = new URLSearchParams(params);
+  summaryParams.delete("status");
+  params.set("page", String(state.returnPages[scope]));
+  params.set("page_size", "50");
+  const [data, summary] = await Promise.all([
+    api(`/api/returns?${params}`), api(`/api/returns/summary?${summaryParams}`),
+  ]);
+  current();
+  state.returnPagination[scope] = data.pagination || { page: 1, total: data.returns?.length || 0, total_pages: 1, page_size: 50 };
+  state.returnPages[scope] = state.returnPagination[scope].page || 1;
+  state.returnSummary[scope] = summary.counts || {};
+  state.returnTodaySummary[scope] = { total: summary.today_count || 0, "已签收": summary.today_signed_count || 0 };
   if (admin) {
     state.returnOrders = data.returns || [];
   } else {
@@ -679,7 +1096,9 @@ async function loadReturnOrders(admin = false) {
 }
 
 async function loadProductsAll() {
+  const current = beginLoad("productsAll");
   const data = await api("/api/products?all=1");
+  current();
   state.productsAll = data.products || [];
 }
 
@@ -823,6 +1242,7 @@ function renderSubmitSummary() {
 }
 
 async function renderSubmit() {
+  const currentView = beginView();
   await ensureProductsGrouped();
   if (state.user.role === "admin" && state.stores.length === 0) await loadStores();
   const storeField =
@@ -898,6 +1318,7 @@ async function renderSubmit() {
             <span class="muted mini">同一门店同一天的订单号不能重复；次日可重新从 1001 开始。</span>
             <button class="btn primary" type="submit">提交总部</button>
           </div>
+          ${renderSubmissionRecovery("shipment")}
         </form>
       </section>
       <aside class="panel panel-pad">
@@ -910,6 +1331,7 @@ async function renderSubmit() {
       ${renderMiniShipments(recent.shipments.slice(0, 6))}
     </section>
   `;
+  currentView();
   document.getElementById("app").innerHTML = shell(content);
   bindCommon();
   bindSubmit();
@@ -966,9 +1388,10 @@ function renderTrackingDetailBlock(row, options = {}) {
         <span>${escapeHtml(companyLabel)} ${escapeHtml(row.tracking_no)}</span>
         ${showCopy ? `<button class="btn secondary small" data-copy-tracking="${escapeHtml(row.tracking_no)}" type="button">复制</button>` : ""}
       </div>
+      <div class="muted mini">${row.tracking_last_checked_at ? `上次查询 ${escapeHtml(formatDate(row.tracking_last_checked_at))}` : "尚未完成查询"}${row.tracking_queued ? " · 已排队，后台更新中" : ""}</div>
       ${
-        detailParts.length
-          ? `<details class="tracking-details" data-tracking-details="${row.id}" data-tracking-loaded="${row.tracking_raw ? "1" : "0"}"><summary>显示详细物流信息</summary><div class="tracking-detail-lines" data-tracking-detail-lines>${detailParts.join("")}</div></details>`
+        row.tracking_no
+          ? `<details class="tracking-details" data-tracking-kind="${options.kind || "shipment"}" data-tracking-details="${row.id}" data-tracking-loaded="${row.tracking_raw ? "1" : "0"}"><summary>显示详细物流信息</summary><div class="tracking-detail-lines" data-tracking-detail-lines>${detailParts.join("") || "展开后读取物流详情"}</div></details>`
           : ""
       }
     </div>
@@ -1054,6 +1477,9 @@ function bindSubmit() {
   });
   document.getElementById("shipmentForm").addEventListener("submit", async (event) => {
     event.preventDefault();
+    captureSubmitDraft();
+    const submitButton = event.currentTarget.querySelector('button[type="submit"]');
+    if (busyOperations.has(submitButton)) return;
     const form = new FormData(event.currentTarget);
     const payload = {
       store_id: form.get("store_id"),
@@ -1065,7 +1491,7 @@ function bindSubmit() {
       items: validSubmitItems(),
     };
     try {
-      await api("/api/shipments", { method: "POST", body: JSON.stringify(payload) });
+      await withButtonBusy(submitButton, "正在保存…", () => createWithConfirmation("shipment", payload));
       state.submitItems = [{ category: "", barcode: "", quantity: 1 }];
       state.submitDraft = { store_id: "", recipient_name: "", phone: "", address: "", store_order_no: "", remark: "" };
       toast("已同步到总部。");
@@ -1077,6 +1503,7 @@ function bindSubmit() {
 }
 
 async function renderStoreBoard({ refreshData = true } = {}) {
+  const currentView = beginView();
   if (refreshData) {
     const loads = [loadStoreShipments(), loadStoreTodaySummary()];
     if (!state.storeBoardLoaded) loads.push(ensureProductsGrouped());
@@ -1134,6 +1561,7 @@ async function renderStoreBoard({ refreshData = true } = {}) {
       ${renderShipmentPagination("store", pageData)}
     </section>
   `;
+  currentView();
   document.getElementById("app").innerHTML = shell(content);
   bindCommon();
   bindStoreBoard();
@@ -1276,13 +1704,13 @@ function renderShipmentItemEditor(row) {
   `;
 }
 
-function bindShipmentItemEditor(sourceRows) {
-  document.querySelectorAll("[data-edit-material-name], [data-edit-material-spec]").forEach(node => node.addEventListener("input", () => {
+function bindShipmentItemEditor(sourceRows, root = document) {
+  root.querySelectorAll("[data-edit-material-name], [data-edit-material-spec]").forEach(node => node.addEventListener("input", () => {
     const isName = node.hasAttribute("data-edit-material-name");
     state.shipmentEditItems[Number(isName ? node.dataset.editMaterialName : node.dataset.editMaterialSpec)][isName ? "name" : "material_spec"] = node.value;
   }));
-  document.querySelector("[data-add-edit-material]")?.addEventListener("click", () => { state.shipmentEditItems.push({item_kind: "material", name: "", material_spec: "", quantity: 1}); render({refreshData: false}); });
-  document.querySelectorAll("[data-edit-shipment-items]").forEach((node) => {
+  root.querySelector("[data-add-edit-material]")?.addEventListener("click", () => { state.shipmentEditItems.push({item_kind: "material", name: "", material_spec: "", quantity: 1}); render({refreshData: false}); });
+  root.querySelectorAll("[data-edit-shipment-items]").forEach((node) => {
     node.addEventListener("click", (event) => {
       const id = Number(event.currentTarget.dataset.editShipmentItems);
       const row = sourceRows.find((item) => item.id === id);
@@ -1291,7 +1719,7 @@ function bindShipmentItemEditor(sourceRows) {
       render({ refreshData: false });
     });
   });
-  document.querySelectorAll("[data-edit-item-category]").forEach((node) => {
+  root.querySelectorAll("[data-edit-item-category]").forEach((node) => {
     node.addEventListener("change", (event) => {
       const index = Number(event.currentTarget.dataset.editItemCategory);
       state.shipmentEditItems[index].category = event.currentTarget.value;
@@ -1299,27 +1727,27 @@ function bindShipmentItemEditor(sourceRows) {
       render({ refreshData: false });
     });
   });
-  document.querySelectorAll("[data-edit-item-product]").forEach((node) => {
+  root.querySelectorAll("[data-edit-item-product]").forEach((node) => {
     node.addEventListener("change", (event) => {
       const index = Number(event.currentTarget.dataset.editItemProduct);
       state.shipmentEditItems[index].barcode = event.currentTarget.value;
       render({ refreshData: false });
     });
   });
-  document.querySelectorAll("[data-edit-item-quantity]").forEach((node) => {
+  root.querySelectorAll("[data-edit-item-quantity]").forEach((node) => {
     node.addEventListener("input", (event) => {
       const index = Number(event.currentTarget.dataset.editItemQuantity);
       state.shipmentEditItems[index].quantity = Math.max(1, Number(event.currentTarget.value || 1));
     });
   });
-  const addEditItem = document.querySelector("[data-add-edit-item]");
+  const addEditItem = root.querySelector("[data-add-edit-item]");
   if (addEditItem) {
     addEditItem.addEventListener("click", () => {
       state.shipmentEditItems.push({ category: "", barcode: "", quantity: 1 });
       render({ refreshData: false });
     });
   }
-  document.querySelectorAll("[data-remove-edit-item]").forEach((node) => {
+  root.querySelectorAll("[data-remove-edit-item]").forEach((node) => {
     node.addEventListener("click", (event) => {
       const index = Number(event.currentTarget.dataset.removeEditItem);
       state.shipmentEditItems.splice(index, 1);
@@ -1327,7 +1755,7 @@ function bindShipmentItemEditor(sourceRows) {
       render({ refreshData: false });
     });
   });
-  const cancelEditItems = document.querySelector("[data-cancel-edit-items]");
+  const cancelEditItems = root.querySelector("[data-cancel-edit-items]");
   if (cancelEditItems) {
     cancelEditItems.addEventListener("click", () => {
       state.editingShipmentId = null;
@@ -1335,14 +1763,14 @@ function bindShipmentItemEditor(sourceRows) {
       render({ refreshData: false });
     });
   }
-  document.querySelectorAll("[data-save-edit-items]").forEach((node) => {
+  root.querySelectorAll("[data-save-edit-items]").forEach((node) => {
     node.addEventListener("click", async (event) => {
       const id = event.currentTarget.dataset.saveEditItems;
       try {
-        await api(`/api/shipments/${id}/items`, {
+        await withButtonBusy(event.currentTarget, "保存中…", () => api(`/api/shipments/${id}/items`, {
           method: "PATCH",
           body: JSON.stringify({ items: validItems(state.shipmentEditItems) }),
-        });
+        }));
         state.editingShipmentId = null;
         state.shipmentEditItems = [];
         toast("商品明细已更新。");
@@ -1475,6 +1903,7 @@ function renderReturnSummary() {
 }
 
 async function renderReturnNew() {
+  const currentView = beginView();
   await ensureProductsGrouped();
   const itemRows = state.returnItems
     .map(
@@ -1528,6 +1957,7 @@ async function renderReturnNew() {
             <span class="muted mini">同一门店内退货快递单号不能重复。</span>
             <button class="btn primary" type="submit">提交退货</button>
           </div>
+          ${renderSubmissionRecovery("return")}
         </form>
       </section>
       <aside class="panel panel-pad">
@@ -1536,6 +1966,7 @@ async function renderReturnNew() {
       </aside>
     </div>
   `;
+  currentView();
   document.getElementById("app").innerHTML = shell(content);
   bindCommon();
   bindReturnNew();
@@ -1585,6 +2016,9 @@ function bindReturnNew() {
   });
   document.getElementById("returnForm").addEventListener("submit", async (event) => {
     event.preventDefault();
+    captureReturnDraft();
+    const submitButton = event.currentTarget.querySelector('button[type="submit"]');
+    if (busyOperations.has(submitButton)) return;
     const form = new FormData(event.currentTarget);
     const payload = {
       tracking_no: form.get("tracking_no"),
@@ -1593,10 +2027,10 @@ function bindReturnNew() {
       items: validReturnItems(),
     };
     try {
-      const submitButton = event.currentTarget.querySelector('button[type="submit"]');
-      const data = await withButtonBusy(submitButton, "正在识别并提交…", () =>
-        api("/api/returns", { method: "POST", body: JSON.stringify(payload) })
+      const data = await withButtonBusy(submitButton, "正在保存…", () =>
+        createWithConfirmation("return", payload)
       );
+      if (data.task) acceptTrackingTask(data);
       state.returnItems = [{ category: "", barcode: "", quantity: 1 }];
       state.returnDraft = { store_id: "", tracking_no: "", sender_phone: "", remark: "" };
       navigate("/returns");
@@ -1605,7 +2039,7 @@ function bindReturnNew() {
       } else if (data.return_order?.express_company) {
         toast(`退货已提交，快递100识别为“${data.return_order.express_company}”。`);
       } else {
-        toast("退货已提交，快递公司正在识别。");
+        toast("退货已保存，快递公司识别和物流查询正在后台处理，可继续操作。");
       }
     } catch (error) {
       errorToast(error);
@@ -1614,37 +2048,22 @@ function bindReturnNew() {
 }
 
 async function renderReturnBoard(admin = false) {
-  if (admin) await loadStores();
-  await loadReturnOrders(admin);
+  const currentView = beginView();
+  await Promise.all([loadReturnOrders(admin), admin ? loadStores() : Promise.resolve()]);
   const filters = admin ? state.adminReturnFilters : state.storeReturnFilters;
   const rows = admin ? state.returnOrders : state.storeReturnOrders;
   const today = localDate();
   const yesterday = localDate(-1);
-  const todayData = await api(`/api/returns?date_from=${today}&date_to=${today}`).catch(() => ({ returns: [] }));
-  const todayCounts = (todayData.returns || []).reduce(
-    (acc, row) => {
-      acc.total += 1;
-      acc[row.status] = (acc[row.status] || 0) + 1;
-      return acc;
-    },
-    { total: 0 }
-  );
-  const counts = rows.reduce(
-    (acc, row) => {
-      acc.total += 1;
-      acc[row.status] = (acc[row.status] || 0) + 1;
-      return acc;
-    },
-    { total: 0 }
-  );
+  const todayCounts = state.returnTodaySummary[admin ? "admin" : "store"];
+  const counts = state.returnSummary[admin ? "admin" : "store"];
   const extra = `
     <div class="actions">
       ${admin ? `<button class="btn secondary" id="syncReturnTracking" type="button">同步退货物流</button>` : `<a class="btn primary" href="/returns/new" data-route>新增退货</a>`}
-      <span class="count-pill">今日 ${todayCounts.total} 单</span>
-      <span class="count-pill">今日签收 ${todayCounts["已签收"] || 0}</span>
-      <span class="count-pill">共 ${counts.total} 单</span>
-      <span class="count-pill">运输中 ${counts["运输中"] || 0}</span>
-      <span class="count-pill">已签收 ${counts["已签收"] || 0}</span>
+      <span class="count-pill" data-return-count="today">今日 ${todayCounts.total} 单</span>
+      <span class="count-pill" data-return-count="todaySigned">今日签收 ${todayCounts["已签收"] || 0}</span>
+      <span class="count-pill" data-return-count="total">共 ${counts.total} 单</span>
+      <span class="count-pill" data-return-count="transit">运输中 ${counts["运输中"] || 0}</span>
+      <span class="count-pill" data-return-count="signed">已签收 ${counts["已签收"] || 0}</span>
     </div>
   `;
   const storeFilter = admin
@@ -1662,6 +2081,7 @@ async function renderReturnBoard(admin = false) {
     : "";
   const content = `
     ${pageHead(admin ? "退货看板" : "退货看板", admin ? "总部查看所有门店退货和签收进度。" : "查看本门店退货快递进度。", extra)}
+    <div id="trackingTaskHost">${renderTrackingTasks()}</div>
     <section class="panel panel-pad">
       <div class="filters ${admin ? "admin-return-filters" : "store-return-filters"}">
         <div class="quick-filters">
@@ -1691,9 +2111,11 @@ async function renderReturnBoard(admin = false) {
         <button class="btn primary" id="applyReturnFilters" type="button">筛选</button>
         <button class="btn secondary" id="resetReturnFilters" type="button">清空</button>
       </div>
-      ${renderReturnTable(rows, admin)}
+      <div id="returnRowsHost">${renderReturnTable(rows, admin)}</div>
+      <div id="returnPaginationHost">${renderReturnPagination(admin)}</div>
     </section>
   `;
+  currentView();
   document.getElementById("app").innerHTML = shell(content);
   bindCommon();
   bindReturnBoard(admin);
@@ -1736,22 +2158,51 @@ function renderReturnTable(rows, admin = false) {
 }
 
 function renderReturnTrackingInfo(row) {
-  return renderTrackingDetailBlock(row);
+  return renderTrackingDetailBlock(row, { kind: "return" });
+}
+
+function renderReturnPagination(admin) {
+  const pagination = state.returnPagination[admin ? "admin" : "store"];
+  const page = Number(pagination.page || 1), pages = Number(pagination.total_pages || pagination.pages || 1);
+  return `<div class="shipment-pagination"><span>共 ${Number(pagination.total || 0)} 单 · 第 ${page} / ${pages} 页 · 每页 50 单</span><div class="actions"><button class="btn secondary small" data-return-page="${page - 1}" ${page <= 1 ? "disabled" : ""}>上一页</button><button class="btn secondary small" data-return-page="${page + 1}" ${page >= pages ? "disabled" : ""}>下一页</button></div></div>`;
+}
+
+function updateReturnRows(admin) {
+  const host = document.getElementById("returnRowsHost");
+  if (!host) return;
+  const opened = [...host.querySelectorAll("details[open]")].map(node => node.dataset.trackingDetails);
+  host.innerHTML = renderReturnTable(admin ? state.returnOrders : state.storeReturnOrders, admin);
+  for (const id of opened) host.querySelector(`[data-tracking-details="${Number(id)}"]`)?.setAttribute("open", "");
+  bindTrackingDetails(host); bindSpecialControls(host); bindReturnRefresh(host);
+  const counts = state.returnSummary[admin ? "admin" : "store"], today = state.returnTodaySummary[admin ? "admin" : "store"];
+  const labels = {today:`今日 ${today.total || 0} 单`, todaySigned:`今日签收 ${today["已签收"] || 0}`, total:`共 ${counts.total || 0} 单`, transit:`运输中 ${counts["运输中"] || 0}`, signed:`已签收 ${counts["已签收"] || 0}`};
+  document.querySelectorAll("[data-return-count]").forEach(node => { node.textContent = labels[node.dataset.returnCount]; });
+  const pagination = document.getElementById("returnPaginationHost");
+  if (pagination) { pagination.innerHTML = renderReturnPagination(admin); bindReturnPagination(admin); }
+}
+
+function bindReturnPagination(admin) {
+  document.querySelectorAll("[data-return-page]").forEach(node => node.addEventListener("click", () => {
+    state.returnPages[admin ? "admin" : "store"] = Number(node.dataset.returnPage); render();
+  }));
 }
 
 function bindReturnBoard(admin = false) {
   const filters = admin ? state.adminReturnFilters : state.storeReturnFilters;
+  bindReturnPagination(admin);
   document.querySelectorAll("[data-return-preset]").forEach((node) => {
     node.addEventListener("click", (event) => {
       const preset = event.currentTarget.dataset.returnPreset;
       const targetDate = preset === "yesterday" ? localDate(-1) : localDate();
       const next = { ...filters, date_from: targetDate, date_to: targetDate };
+      state.returnPages[admin ? "admin" : "store"] = 1;
       if (admin) state.adminReturnFilters = next;
       else state.storeReturnFilters = next;
       render();
     });
   });
   document.getElementById("applyReturnFilters").addEventListener("click", () => {
+    state.returnPages[admin ? "admin" : "store"] = 1;
     const next = {
       store_id: admin ? document.getElementById("returnFilterStore").value : "",
       status: document.getElementById("returnFilterStatus").value,
@@ -1764,6 +2215,7 @@ function bindReturnBoard(admin = false) {
     render();
   });
   document.getElementById("resetReturnFilters").addEventListener("click", () => {
+    state.returnPages[admin ? "admin" : "store"] = 1;
     const empty = { store_id: "", status: "", date_from: "", date_to: "", q: "" };
     if (admin) state.adminReturnFilters = empty;
     else state.storeReturnFilters = empty;
@@ -1779,32 +2231,23 @@ function bindReturnBoard(admin = false) {
             body: JSON.stringify({ limit: 50 }),
           })
         );
-        const result = data.result || {};
-        if (result.busy) {
-          errorToast("退货物流同步正在运行，本次没有重复启动。请稍后刷新查看结果。");
-        } else if (result.provider_incident) {
-          errorToast(result.service_error || "快递100服务暂时不可用，本轮同步已停止；无需逐个处理订单。");
-        } else if (result.errors) {
-          errorToast(`退货物流同步完成，但有 ${result.errors} 单查询失败。请查看页面上的红色错误提示。`);
-        } else {
-          toast(`已同步 ${result.checked || 0} 单，签收 ${result.signed || 0} 单。`);
-        }
-        render();
+        acceptTrackingTask(data);
       } catch (error) {
         errorToast(error, "退货物流同步失败。");
       }
     });
   }
-  document.querySelectorAll("[data-refresh-return]").forEach((node) => {
-    node.addEventListener("click", async (event) => {
-      const id = event.currentTarget.dataset.refreshReturn;
+  bindReturnRefresh();
+}
+
+function bindReturnRefresh(root = document) {
+  root.querySelectorAll("[data-refresh-return]").forEach(node => {
+    node.addEventListener("click", async event => {
       try {
-        await api(`/api/returns/${id}/tracking/refresh`, { method: "POST", body: JSON.stringify({}) });
-        toast("退货物流已刷新。");
-        render();
-      } catch (error) {
-        errorToast(error);
-      }
+        const data = await withButtonBusy(event.currentTarget, "正在排队…", () =>
+          api(`/api/returns/${node.dataset.refreshReturn}/tracking/refresh`, { method: "POST", body: "{}" }));
+        acceptTrackingTask(data);
+      } catch (error) { errorToast(error); }
     });
   });
 }
@@ -1814,14 +2257,17 @@ function renderShippingBatchPreview() {
   if (!preview) return "";
   const eligible = preview.eligible || [];
   const eligibleIds = new Set(eligible.map((row) => Number(row.id)));
-  const selectedIds = new Set(state.batchSelectedIds.filter((id) => eligibleIds.has(Number(id))).map(Number));
+  const selectedIds = new Set(state.batchSelectAll ? [...eligibleIds] : state.batchSelectedIds.map(Number));
+  const selectedCount = state.batchSelectAll ? Number(preview.eligible_count ?? eligible.length) : selectedIds.size;
+  const pagination = preview.pagination || {};
+  const page = Number(pagination.page || state.batchPreviewPage), pages = Number(pagination.total_pages || pagination.pages || 1);
   const config = state.shippingConfig || {};
   const configReady = Boolean(config.enabled && config.configured);
   const missingConfig = Array.isArray(config.missing) ? config.missing : [];
   return `
     <section class="panel panel-pad shipping-batch-panel">
       <div class="section-title">
-        <div><h2>选择需要打单的订单</h2><div class="muted mini">筛选匹配 ${preview.matched || 0} 单，可打单 ${eligible.length} 单，已选择 <span id="batchSelectedCount">${selectedIds.size}</span> 单</div></div>
+        <div><h2>选择需要打单的订单</h2><div class="muted mini">筛选匹配 ${preview.matched || 0} 单，可打单 ${preview.eligible_count ?? eligible.length} 单，已选择 <span id="batchSelectedCount">${selectedCount}</span> 单</div><div id="batchSelectionMode" class="notice">${state.batchSelectAll ? "已选择整个筛选范围，包含其他预览页。" : "仅提交手动勾选的订单；翻页保留已选项。"}</div></div>
         <button class="btn ghost small" id="closeBatchPreview" type="button">关闭</button>
       </div>
       <div class="batch-filter-grid">
@@ -1845,13 +2291,13 @@ function renderShippingBatchPreview() {
       <div class="batch-controls label-batch-controls">
         <div class="field">
           <label>已选订单统一改为</label>
-          <select class="select" id="batchBulkCompany">${expressCompanyOptions(DEFAULT_EXPRESS_COMPANY)}</select>
+          <select class="select" id="batchBulkCompany"><option value="" ${state.batchBulkCompany ? "" : "selected"}>保持各单原快递</option>${EXPRESS_COMPANIES.map(company => `<option value="${company}" ${company === state.batchBulkCompany ? "selected" : ""}>${company}</option>`).join("")}</select>
         </div>
         <div class="inline-actions batch-selection-actions">
           <button class="btn secondary small" id="selectAllBatchOrders" type="button">全选筛选结果</button>
           <button class="btn ghost small" id="clearBatchOrders" type="button">取消全选</button>
         </div>
-        <button class="btn primary" id="createShippingBatch" data-ready="${preview.settings_ready && preview.label_ready && configReady ? "1" : "0"}" type="button" ${selectedIds.size && preview.settings_ready && preview.label_ready && configReady ? "" : "disabled"}>确认提交 ${selectedIds.size} 单</button>
+        <button class="btn primary" id="createShippingBatch" data-ready="${preview.settings_ready && preview.label_ready && configReady ? "1" : "0"}" type="button" ${selectedCount && preview.settings_ready && preview.label_ready && configReady ? "" : "disabled"}>确认提交 ${selectedCount} 单</button>
       </div>
       <div class="notice" id="batchTypeCounts">${Object.entries(preview.type_counts || {}).filter(([, count]) => count).map(([key, count]) => `${SHIPMENT_TYPES[key]?.[0] || key} ${count} 单`).join(" · ")}（预览总量，确认时按实际勾选复核）</div>
       <div class="notice">提交后将立即获取快递单号并生成电子面单，不再创建上门取件预约。</div>
@@ -1860,11 +2306,12 @@ function renderShippingBatchPreview() {
           <div class="batch-order-row" data-batch-shipment="${row.id}">
             <input class="batch-order-checkbox" type="checkbox" data-batch-select value="${row.id}" aria-label="选择订单 ${escapeHtml(row.business_id)}" ${selectedIds.has(Number(row.id)) ? "checked" : ""} />
             <div>${shipmentTypeBadge(row)}<strong>${escapeHtml(row.business_id)}</strong><div class="muted mini">${escapeHtml(row.store_name_snapshot)} · ${escapeHtml(row.recipient_name)} · ${escapeHtml(row.address)}</div>${row.return_unsigned_warning ? `<p class="notice">退货尚未签收，请总部核对后决定发货</p>` : ""}</div>
-            <select class="select" data-batch-company>${expressCompanyOptions(row.express_company)}</select>
+            <select class="select" data-batch-company>${expressCompanyOptions(state.batchCompanyOverrides[row.id] || state.batchBulkCompany || row.express_company)}</select>
           </div>
         `).join("") || `<div class="empty">当前筛选没有可下单订单</div>`}
       </div>
-      ${(preview.excluded || []).length ? `<details class="tracking-details"><summary>查看被排除的 ${(preview.excluded || []).length} 单</summary><div class="tracking-detail-lines">${preview.excluded.map((row) => `<div>${escapeHtml(row.business_id)}：${escapeHtml(row.reason)}</div>`).join("")}</div></details>` : ""}
+      <div class="shipment-pagination"><span>预览明细第 ${page} / ${pages} 页，每类每页最多 50 单</span><div class="actions"><button class="btn secondary small" data-batch-preview-page="${page - 1}" ${page <= 1 ? "disabled" : ""}>上一页</button><button class="btn secondary small" data-batch-preview-page="${page + 1}" ${page >= pages ? "disabled" : ""}>下一页</button></div></div>
+      ${(preview.excluded || []).length ? `<details class="tracking-details"><summary>被排除共 ${preview.excluded_count ?? preview.excluded.length} 单（本次显示 ${preview.excluded.length} 单）</summary><div class="tracking-detail-lines">${preview.excluded.map((row) => `<div>${escapeHtml(row.business_id)}：${escapeHtml(row.reason)}</div>`).join("")}</div></details>` : ""}
     </section>
   `;
 }
@@ -1955,7 +2402,7 @@ function renderTaskAlertDialog() {
           <button class="task-alert-close" id="closeTaskAlerts" type="button" aria-label="关闭异常提醒">×</button>
         </div>
         <div class="task-alert-refresh-note">
-          提醒每 ${Number(refresh.alerts_seconds || 60)} 秒自动刷新；发货物流每 ${formatTaskInterval(refresh.shipment_tracking_minutes || 360)}查询，退货物流每 ${formatTaskInterval(refresh.return_tracking_minutes || 720)}查询。
+          提醒每 ${Number(refresh.alerts_seconds || 60)} 秒自动刷新；自动物流的最短查询间隔：发货 ${formatTaskInterval(refresh.shipment_tracking_minutes || 360)}，退货 ${formatTaskInterval(refresh.return_tracking_minutes || 720)}。实际更新时间受排队和快递服务影响。
         </div>
         <div class="task-alert-categories" role="tablist" aria-label="异常分类">
           ${categories.map((category) => {
@@ -2099,7 +2546,7 @@ function bindTaskAlertControls() {
         state.activeShippingBatch = await withButtonBusy(event.currentTarget, "重新排队中…", () =>
           api(`/api/admin/shipping-batches/${batchId}/retry`, { method: "POST", body: JSON.stringify({}) })
         );
-        sessionStorage.setItem("scentpool_shipping_batch_id", String(batchId));
+        sessionStorage.setItem(shippingBatchStorageKey(), String(batchId));
         await Promise.all([loadShipments(), loadTaskAlerts()]);
         toast("失败订单已重新加入队列，页面会持续显示处理结果。");
         render({ refreshData: false });
@@ -2177,6 +2624,7 @@ function renderShippingBatchProgress() {
   const batch = data.batch;
   const counts = data.counts || {};
   const failed = counts["失败"] || 0;
+  const page = Number(data.pagination?.page || state.batchProgressPage), pages = Number(data.pagination?.total_pages || data.pagination?.pages || 1);
   return `
     <section class="panel panel-pad shipping-batch-panel">
       <div class="section-title">
@@ -2191,17 +2639,27 @@ function renderShippingBatchProgress() {
         <span class="count-pill">失败 ${failed}</span>
       </div>
       <div class="inline-actions">
+        ${failed ? `<button class="btn secondary small" id="showBatchFailures" type="button">${state.batchProgressFailedOnly ? "查看全部进度" : `查看全部 ${failed} 项失败`}</button>` : ""}
         ${failed ? `<button class="btn secondary small" id="retryShippingBatch" type="button">仅重试失败订单</button>` : ""}
         <button class="btn ghost small" id="closeShippingBatch" type="button">收起批次</button>
       </div>
       ${state.shippingBatchPollError ? `<div class="notice danger-notice"><strong>批次进度刷新失败。</strong><br>${escapeHtml(state.shippingBatchPollError)}<br>后台任务不一定停止，请检查网络后刷新页面，不要重复提交同一批订单。</div>` : ""}
       ${failed ? `<div class="notice danger-notice"><strong>本批次有 ${failed} 单没有取得快递单号。</strong><br>请阅读下方原因，检查信息后点击“仅重试失败订单”；不要为同一订单重新创建另一批次。</div>` : ""}
       ${failed ? `<div class="batch-errors">${(data.items || []).filter((item) => item.status === "失败").map((item) => `<div class="batch-error-item"><strong>${escapeHtml(item.business_id)}</strong><div>失败原因：${escapeHtml(item.error || "电子面单没有成功生成。")}</div><div>怎么处理：${escapeHtml(taskAlertAdvice("面单下单失败", item.error))}</div></div>`).join("")}</div>` : ""}
+      ${failed && !(data.items || []).some(item => item.status === "失败") ? `<p class="notice">本页没有失败明细，请点“查看全部 ${failed} 项失败”，不会因分页隐藏失败记录。</p>` : ""}
+      ${pages > 1 ? `<div class="shipment-pagination"><span>进度明细第 ${page} / ${pages} 页</span><div class="actions"><button class="btn secondary small" data-batch-progress-page="${page - 1}" ${page <= 1 ? "disabled" : ""}>上一页</button><button class="btn secondary small" data-batch-progress-page="${page + 1}" ${page >= pages ? "disabled" : ""}>下一页</button></div></div>` : ""}
     </section>
   `;
 }
 
+function renderAdminShipmentSummary() {
+  const counts = state.adminShipmentSummary || {};
+  return `<span class="count-pill">当前范围 ${counts.total || 0} 单</span>${["待处理","已发货","已签收","异常"].map(status => `<span class="count-pill">${status} ${counts[status] || 0}</span>`).join("")}`;
+}
+
 async function renderAdmin({ refreshData = true } = {}) {
+  const currentView = beginView();
+  captureAdminRowDrafts();
   if (refreshData) {
     const loads = [loadShipments()];
     if (!state.adminBoardLoaded) {
@@ -2235,16 +2693,12 @@ async function renderAdmin({ refreshData = true } = {}) {
     <div id="taskAlertDialogHost">${renderTaskAlertDialog()}</div>
     ${classificationFilters("admin")}
     ${renderBatchPrintPanel()}
-    ${renderShippingBatchPreview()}
-    ${renderShippingBatchProgress()}
+    <div id="shippingBatchPreviewHost">${renderShippingBatchPreview()}</div>
+    <div id="shippingBatchProgressHost">${renderShippingBatchProgress()}</div>
+    <div id="trackingTaskHost">${renderTrackingTasks()}</div>
+    <div id="shipmentListUpdateNotice" class="notice" role="status" hidden></div>
     <section class="panel panel-pad">
-      <div class="status-overview">
-        <span class="count-pill">当前范围 ${counts.total} 单</span>
-        <span class="count-pill">待处理 ${counts["待处理"] || 0}</span>
-        <span class="count-pill">已发货 ${counts["已发货"] || 0}</span>
-        <span class="count-pill">已签收 ${counts["已签收"] || 0}</span>
-        <span class="count-pill">异常 ${counts["异常"] || 0}</span>
-      </div>
+      <div class="status-overview" id="adminShipmentSummary">${renderAdminShipmentSummary()}</div>
       <div class="filters admin-filters">
         <div class="quick-filters">
           <button class="btn secondary small ${state.adminFilters.date_from === today && state.adminFilters.date_to === today ? "active" : ""}" data-admin-preset="today" type="button">今日</button>
@@ -2285,7 +2739,9 @@ async function renderAdmin({ refreshData = true } = {}) {
       ${renderShipmentPagination("admin", pageData)}
     </section>
   `;
+  currentView();
   document.getElementById("app").innerHTML = shell(content);
+  restoreAdminRowDrafts();
   bindCommon();
   bindAdmin();
   scheduleShippingBatchPoll();
@@ -2321,7 +2777,7 @@ function renderShipmentBoard(shipments) {
 
 function shipmentShippingEditing(row) {
   if (!bookingEditable(row)) return false;
-  return state.editingShipmentShippingId === row.id || !String(row.tracking_no || "").trim();
+  return state.editingShipmentShippingId === row.id || state.adminRowDrafts.get(Number(row.id))?.["data-tracking"] !== undefined || !String(row.tracking_no || "").trim();
 }
 
 function renderAdminShipmentStatusCell(row) {
@@ -2367,7 +2823,7 @@ function renderAdminShipmentShippingCell(row) {
 
 function renderAdminShipmentOrderCell(row) {
   const editable = row.status === "待处理" && bookingEditable(row);
-  if (editable && state.editingShipmentRemarkId === row.id) {
+  if (editable && (state.editingShipmentRemarkId === row.id || state.adminRowDrafts.get(Number(row.id))?.["data-admin-remark"] !== undefined)) {
     return `
       <div class="admin-order-cell">
         ${shipmentContext(row)}
@@ -2393,6 +2849,7 @@ function renderAdminShipmentOrderCell(row) {
 }
 
 function renderShipmentActions(row) {
+  if (row._live_partial) return `<span class="muted mini">已取得快递单号。完成编辑后点击“筛选”，查看完整面单操作。</span>`;
   const editing = shipmentShippingEditing(row);
   const shippedAt = row.shipped_at ? `<div class="muted mini action-time">${escapeHtml(formatDate(row.shipped_at))}</div>` : "";
   if (!bookingEditable(row)) {
@@ -2490,44 +2947,109 @@ function renderShipmentTable(shipments) {
   `;
 }
 
-function bindAdmin() {
-  bindTaskAlertControls();
-  document.getElementById("openBatchPrint")?.addEventListener("click", () => {
+function shippingBatchConfirmationSummary(shipments, total) {
+  const typeCounts = state.batchSelectAll ? { ...state.batchPreview.type_counts } : {};
+  const companyCounts = state.batchSelectAll
+    ? (state.batchBulkCompany ? { [state.batchBulkCompany]: total } : { ...state.batchPreview.company_counts })
+    : {};
+  for (const choice of shipments) {
+    const company = choice.express_company || state.batchKnownCompanies[choice.id] || DEFAULT_EXPRESS_COMPANY;
+    if (state.batchSelectAll) {
+      const original = state.batchBulkCompany || state.batchKnownCompanies[choice.id] || DEFAULT_EXPRESS_COMPANY;
+      companyCounts[original] = (companyCounts[original] || 0) - 1;
+    } else {
+      const type = state.batchKnownTypes[choice.id] || "legacy";
+      typeCounts[type] = (typeCounts[type] || 0) + 1;
+    }
+    companyCounts[company] = (companyCounts[company] || 0) + 1;
+  }
+  return {
+    total,
+    scope: state.batchSelectAll ? "整个筛选范围（包含其他预览页）" : "仅手动勾选的订单（包含跨页勾选）",
+    typeSummary: Object.entries(typeCounts).filter(([, count]) => count > 0).map(([type, count]) => `${SHIPMENT_TYPES[type]?.[0] || "历史未分类"} ${count} 单`).join("、"),
+    companySummary: Object.entries(companyCounts).filter(([, count]) => count > 0).map(([company, count]) => `${company} ${count} 单`).join("、"),
+  };
+}
+
+function confirmShippingBatch(summary) {
+  return new Promise(resolve => {
+    const previousFocus = document.activeElement;
+    const overlay = document.createElement("div");
+    overlay.className = "batch-confirm-backdrop";
+    overlay.innerHTML = `<section class="batch-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="batchConfirmTitle" aria-describedby="batchConfirmDescription" tabindex="-1">
+      <h2 id="batchConfirmTitle">核对本批次电子面单</h2>
+      <div id="batchConfirmDescription"><p>本次将提交 <strong>${Number(summary.total)} 单</strong>，快递公司接单成功后将生成快递单号。</p>
+      <dl><dt>提交范围</dt><dd>${escapeHtml(summary.scope)}</dd><dt>发货类别</dt><dd>${escapeHtml(summary.typeSummary)}</dd><dt>快递公司</dt><dd>${escapeHtml(summary.companySummary)}</dd></dl>
+      <p class="muted">请再次核对范围和快递公司。返回修改不会创建任务。</p></div>
+      <div class="batch-confirm-actions"><button type="button" class="btn secondary" data-batch-confirm-cancel>返回修改</button><button type="button" class="btn primary" data-batch-confirm-accept>确认创建 ${Number(summary.total)} 单任务</button></div>
+    </section>`;
+    const cancel = () => finish(false);
+    const finish = accepted => {
+      activeConfirmations.delete(cancel);
+      overlay.remove();
+      if (previousFocus?.isConnected) previousFocus.focus();
+      resolve(accepted);
+    };
+    activeConfirmations.add(cancel);
+    overlay.querySelector("[data-batch-confirm-cancel]").addEventListener("click", cancel);
+    overlay.querySelector("[data-batch-confirm-accept]").addEventListener("click", () => finish(true));
+    overlay.addEventListener("keydown", event => {
+      if (event.key === "Escape") { event.preventDefault(); cancel(); }
+      if (event.key === "Tab") {
+        const buttons = Array.from(overlay.querySelectorAll("button"));
+        const first = buttons[0], last = buttons[buttons.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      }
+    });
+    document.body.appendChild(overlay);
+    overlay.querySelector("[data-batch-confirm-cancel]").focus();
+  });
+}
+
+function bindAdmin(root = document) {
+  const dom = root === document ? document : {
+    querySelectorAll: selector => root.querySelectorAll(selector),
+    querySelector: selector => root.matches(selector) ? root : root.querySelector(selector),
+    getElementById: id => root.querySelector(`#${id}`),
+  };
+  if (root === document) bindTaskAlertControls();
+  dom.getElementById("openBatchPrint")?.addEventListener("click", () => {
     state.batchPrintSelectedIds = batchPrintableShipments().map((row) => Number(row.id));
     state.batchPrintOpen = true;
     render({ refreshData: false });
   });
-  document.getElementById("closeBatchPrint")?.addEventListener("click", () => {
+  dom.getElementById("closeBatchPrint")?.addEventListener("click", () => {
     state.batchPrintOpen = false;
     state.batchPrintSelectedIds = [];
     state.batchPrintError = "";
     render({ refreshData: false });
   });
   const updateBatchPrintSelection = () => {
-    const selected = Array.from(document.querySelectorAll("[data-batch-print-select]:checked"))
+    const selected = Array.from(dom.querySelectorAll("[data-batch-print-select]:checked"))
       .map((node) => Number(node.value));
     state.batchPrintSelectedIds = selected;
-    const count = document.getElementById("batchPrintSelectedCount");
+    const count = dom.getElementById("batchPrintSelectedCount");
     if (count) count.textContent = String(selected.length);
-    const submit = document.getElementById("mergeBatchPrint");
+    const submit = dom.getElementById("mergeBatchPrint");
     if (submit) {
       submit.textContent = `合并并打印 ${selected.length} 单`;
       submit.disabled = !selected.length;
     }
   };
-  document.querySelectorAll("[data-batch-print-select]").forEach((node) => {
+  dom.querySelectorAll("[data-batch-print-select]").forEach((node) => {
     node.addEventListener("change", updateBatchPrintSelection);
   });
-  document.getElementById("selectAllBatchPrint")?.addEventListener("click", () => {
-    document.querySelectorAll("[data-batch-print-select]").forEach((node) => { node.checked = true; });
+  dom.getElementById("selectAllBatchPrint")?.addEventListener("click", () => {
+    dom.querySelectorAll("[data-batch-print-select]").forEach((node) => { node.checked = true; });
     updateBatchPrintSelection();
   });
-  document.getElementById("clearBatchPrint")?.addEventListener("click", () => {
-    document.querySelectorAll("[data-batch-print-select]").forEach((node) => { node.checked = false; });
+  dom.getElementById("clearBatchPrint")?.addEventListener("click", () => {
+    dom.querySelectorAll("[data-batch-print-select]").forEach((node) => { node.checked = false; });
     updateBatchPrintSelection();
   });
-  document.getElementById("mergeBatchPrint")?.addEventListener("click", async () => {
-    const shipmentIds = Array.from(document.querySelectorAll("[data-batch-print-select]:checked"))
+  dom.getElementById("mergeBatchPrint")?.addEventListener("click", async () => {
+    const shipmentIds = Array.from(dom.querySelectorAll("[data-batch-print-select]:checked"))
       .map((node) => Number(node.value));
     if (!shipmentIds.length) {
       toast("请至少选择一张待打印面单。");
@@ -2541,8 +3063,8 @@ function bindAdmin() {
     }
     printWindow.document.write("<!doctype html><meta charset='utf-8'><title>正在合并面单</title><p style='font-family:sans-serif;padding:32px;line-height:1.7'>正在合并面单，请稍候。<br>订单较多时可能需要 10–30 秒，请不要重复点击或关闭此窗口。</p>");
     printWindow.document.close();
-    const button = document.getElementById("mergeBatchPrint");
-    const progress = document.getElementById("batchPrintStatus");
+    const button = dom.getElementById("mergeBatchPrint");
+    const progress = dom.getElementById("batchPrintStatus");
     state.batchPrintError = "";
     if (button) {
       button.disabled = true;
@@ -2599,7 +3121,7 @@ function bindAdmin() {
       }
     }
   });
-  const previewButton = document.getElementById("previewShippingBatch");
+  const previewButton = dom.getElementById("previewShippingBatch");
   if (previewButton) {
     previewButton.addEventListener("click", async (event) => {
       try {
@@ -2612,105 +3134,124 @@ function bindAdmin() {
           q: state.adminFilters.q,
         };
         await withButtonBusy(event.currentTarget, "正在加载…", () => loadShippingBatchPreview(state.batchFilters));
-        render({ refreshData: false });
+        updateBatchPreviewUi(); updateShippingBatchUi(); scheduleShippingBatchPoll();
       } catch (error) {
         errorToast(error);
       }
     });
   }
-  document.getElementById("closeBatchPreview")?.addEventListener("click", () => {
+  dom.getElementById("closeBatchPreview")?.addEventListener("click", () => {
     state.batchPreview = null;
     state.batchSelectedIds = [];
-    render({ refreshData: false });
+    updateBatchPreviewUi(); updateShippingBatchUi(); scheduleShippingBatchPoll();
   });
   const updateBatchSelection = () => {
-    const selected = Array.from(document.querySelectorAll("[data-batch-select]:checked")).map((node) => Number(node.value));
-    state.batchSelectedIds = selected;
-    const count = document.getElementById("batchSelectedCount");
-    if (count) count.textContent = String(selected.length);
-    const submit = document.getElementById("createShippingBatch");
+    const selected = Array.from(dom.querySelectorAll("[data-batch-select]:checked")).map((node) => Number(node.value));
+    const pageIds = new Set((state.batchPreview?.eligible || []).map(row => Number(row.id)));
+    state.batchSelectedIds = [...state.batchSelectedIds.filter(id => !pageIds.has(id)), ...selected];
+    const total = state.batchSelectAll ? Number(state.batchPreview?.eligible_count || 0) : state.batchSelectedIds.length;
+    const count = dom.getElementById("batchSelectedCount");
+    if (count) count.textContent = String(total);
+    const mode = dom.getElementById("batchSelectionMode");
+    if (mode) mode.textContent = state.batchSelectAll ? "已选择整个筛选范围，包含其他预览页。" : "仅提交手动勾选的订单；翻页保留已选项。";
+    const submit = dom.getElementById("createShippingBatch");
     if (submit) {
-      submit.textContent = `确认提交 ${selected.length} 单`;
-      submit.disabled = !selected.length || submit.dataset.ready !== "1";
+      submit.textContent = `确认提交 ${total} 单`;
+      submit.disabled = !total || submit.dataset.ready !== "1";
     }
   };
-  document.querySelectorAll("[data-batch-select]").forEach((node) => node.addEventListener("change", updateBatchSelection));
-  document.getElementById("selectAllBatchOrders")?.addEventListener("click", () => {
-    document.querySelectorAll("[data-batch-select]").forEach((node) => { node.checked = true; });
+  dom.querySelectorAll("[data-batch-select]").forEach((node) => node.addEventListener("change", () => {
+    if (state.batchSelectAll) {
+      state.batchSelectAll = false; state.batchSelectedIds = [];
+      toast("已改为手动勾选模式：仅当前页勾选项已选中，其他页未自动选择。");
+    }
+    updateBatchSelection();
+  }));
+  dom.getElementById("selectAllBatchOrders")?.addEventListener("click", () => {
+    state.batchSelectAll = true;
+    dom.querySelectorAll("[data-batch-select]").forEach((node) => { node.checked = true; });
     updateBatchSelection();
   });
-  document.getElementById("clearBatchOrders")?.addEventListener("click", () => {
-    document.querySelectorAll("[data-batch-select]").forEach((node) => { node.checked = false; });
+  dom.getElementById("clearBatchOrders")?.addEventListener("click", () => {
+    state.batchSelectAll = false; state.batchSelectedIds = [];
+    dom.querySelectorAll("[data-batch-select]").forEach((node) => { node.checked = false; });
     updateBatchSelection();
   });
-  document.getElementById("applyBatchFilters")?.addEventListener("click", async () => {
+  dom.getElementById("applyBatchFilters")?.addEventListener("click", async () => {
     state.batchFilters = {
       ...state.batchFilters,
-      store_id: document.getElementById("batchFilterStore").value,
+      store_id: dom.getElementById("batchFilterStore").value,
       status: "待处理",
-      date_from: document.getElementById("batchFilterFrom").value,
-      date_to: document.getElementById("batchFilterTo").value,
-      q: document.getElementById("batchFilterQ").value.trim(),
+      date_from: dom.getElementById("batchFilterFrom").value,
+      date_to: dom.getElementById("batchFilterTo").value,
+      q: dom.getElementById("batchFilterQ").value.trim(),
     };
     try {
       await loadShippingBatchPreview(state.batchFilters);
-      render({ refreshData: false });
+      updateBatchPreviewUi(); updateShippingBatchUi(); scheduleShippingBatchPoll();
     } catch (error) {
       errorToast(error);
     }
   });
-  document.getElementById("resetBatchFilters")?.addEventListener("click", async () => {
+  dom.getElementById("resetBatchFilters")?.addEventListener("click", async () => {
     state.batchFilters = { ...state.batchFilters, store_id: "", status: "待处理", date_from: "", date_to: "", q: "" };
     try {
       await loadShippingBatchPreview(state.batchFilters);
-      render({ refreshData: false });
+      updateBatchPreviewUi(); updateShippingBatchUi(); scheduleShippingBatchPoll();
     } catch (error) {
       errorToast(error);
     }
   });
-  document.getElementById("batchBulkCompany")?.addEventListener("change", (event) => {
-    document.querySelectorAll("[data-batch-shipment]").forEach((row) => {
-      if (row.querySelector("[data-batch-select]")?.checked) row.querySelector("[data-batch-company]").value = event.currentTarget.value;
+  dom.getElementById("batchBulkCompany")?.addEventListener("change", (event) => {
+    state.batchBulkCompany = event.currentTarget.value;
+    state.batchCompanyOverrides = {};
+    dom.querySelectorAll("[data-batch-shipment]").forEach((row) => {
+      if (row.querySelector("[data-batch-select]")?.checked) row.querySelector("[data-batch-company]").value = state.batchBulkCompany || state.batchPreview.eligible.find(item => Number(item.id) === Number(row.dataset.batchShipment))?.express_company || DEFAULT_EXPRESS_COMPANY;
     });
   });
-  document.getElementById("createShippingBatch")?.addEventListener("click", async (event) => {
-    const shipments = Array.from(document.querySelectorAll("[data-batch-shipment]"))
-      .filter((row) => row.querySelector("[data-batch-select]")?.checked)
-      .map((row) => ({
-        id: Number(row.dataset.batchShipment),
-        express_company: row.querySelector("[data-batch-company]").value,
-      }));
-    if (!shipments.length) {
+  dom.querySelectorAll("[data-batch-company]").forEach(node => node.addEventListener("change", () => {
+    state.batchCompanyOverrides[node.closest("[data-batch-shipment]").dataset.batchShipment] = node.value;
+  }));
+  dom.querySelectorAll("[data-batch-preview-page]").forEach(node => node.addEventListener("click", async () => {
+    state.batchPreviewPage = Number(node.dataset.batchPreviewPage);
+    try { await withButtonBusy(node, "读取中…", () => loadShippingBatchPreview(state.batchFilters, { reset: false })); updateBatchPreviewUi(); }
+    catch (error) { errorToast(error); }
+  }));
+  dom.getElementById("createShippingBatch")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    if (busyOperations.has(button)) return;
+    const shipments = (state.batchSelectAll ? Object.keys(state.batchCompanyOverrides).map(Number) : state.batchSelectedIds)
+      .map(id => ({ id, ...(state.batchCompanyOverrides[id] || state.batchBulkCompany ? { express_company: state.batchCompanyOverrides[id] || state.batchBulkCompany } : {}) }));
+    const total = state.batchSelectAll ? Number(state.batchPreview.eligible_count || 0) : shipments.length;
+    if (!total) {
       toast("请至少选择一个需要打单的订单。");
       return;
     }
-    const selectedCounts = {};
-    for (const choice of shipments) {
-      const type = state.batchPreview.eligible.find(row => row.id === choice.id)?.shipment_type || "legacy";
-      selectedCounts[type] = (selectedCounts[type] || 0) + 1;
-    }
-    const typeSummary = Object.entries(selectedCounts).map(([type, count]) => `${SHIPMENT_TYPES[type][0]} ${count} 单`).join("、");
-    if (!confirm(`本批次：${typeSummary}。\n确认向快递100提交 ${shipments.length} 张电子面单？成功后将立即取得快递单号。`)) return;
+    const summary = shippingBatchConfirmationSummary(shipments, total);
+    const payload = {
+      filters: { ...state.batchFilters }, shipments,
+      selection_mode: state.batchSelectAll ? "all_matching" : "selected",
+      preview_fingerprint: state.batchPreview.preview_fingerprint || state.batchPreview.fingerprint,
+      express_company: state.batchBulkCompany,
+    };
+    const epoch = pageEpoch;
     try {
-      const data = await withButtonBusy(event.currentTarget, "正在创建任务…", () =>
-        api("/api/admin/shipping-batches", {
-          method: "POST",
-          body: JSON.stringify({
-            filters: state.batchFilters,
-            shipments,
-          }),
-        })
-      );
+      const data = await withButtonBusy(button, "等待核对…", async () => {
+        if (!await confirmShippingBatch(summary) || epoch !== pageEpoch) return null;
+        button.textContent = "正在创建任务…";
+        return api("/api/admin/shipping-batches", { method: "POST", body: JSON.stringify(payload) });
+      });
+      if (!data) return;
       state.batchPreview = null;
       state.activeShippingBatch = data;
-      sessionStorage.setItem("scentpool_shipping_batch_id", String(data.batch.id));
+      sessionStorage.setItem(shippingBatchStorageKey(), String(data.batch.id));
       toast("电子面单任务已创建。即使关闭页面，后台也会继续处理。");
-      render({ refreshData: false });
+      updateBatchPreviewUi(); updateShippingBatchUi(); scheduleShippingBatchPoll();
     } catch (error) {
       errorToast(error, "电子面单任务创建失败。");
     }
   });
-  document.getElementById("retryShippingBatch")?.addEventListener("click", async (event) => {
+  dom.getElementById("retryShippingBatch")?.addEventListener("click", async (event) => {
     const batchId = state.activeShippingBatch?.batch?.id;
     if (!batchId) return;
     if (!confirm("确认只重新提交本批次中的失败订单？已经成功的订单不会重复下单。")) return;
@@ -2720,17 +3261,25 @@ function bindAdmin() {
       );
       await loadTaskAlerts();
       toast("失败订单已重新加入队列，页面会持续显示处理结果。");
-      render({ refreshData: false });
+      updateBatchPreviewUi(); updateShippingBatchUi(); scheduleShippingBatchPoll();
     } catch (error) {
       errorToast(error, "失败订单重新提交失败。");
     }
   });
-  document.getElementById("closeShippingBatch")?.addEventListener("click", () => {
-    state.activeShippingBatch = null;
-    sessionStorage.removeItem("scentpool_shipping_batch_id");
-    render({ refreshData: false });
+  dom.getElementById("showBatchFailures")?.addEventListener("click", async () => {
+    state.batchProgressFailedOnly = !state.batchProgressFailedOnly; state.batchProgressPage = 1;
+    await loadActiveShippingBatch(); updateShippingBatchUi();
   });
-  document.querySelectorAll("[data-admin-preset]").forEach((node) => {
+  dom.querySelectorAll("[data-batch-progress-page]").forEach(node => node.addEventListener("click", async () => {
+    state.batchProgressPage = Number(node.dataset.batchProgressPage);
+    await loadActiveShippingBatch(); updateShippingBatchUi();
+  }));
+  dom.getElementById("closeShippingBatch")?.addEventListener("click", () => {
+    state.activeShippingBatch = null;
+    sessionStorage.removeItem(shippingBatchStorageKey());
+    updateBatchPreviewUi(); updateShippingBatchUi(); scheduleShippingBatchPoll();
+  });
+  dom.querySelectorAll("[data-admin-preset]").forEach((node) => {
     node.addEventListener("click", (event) => {
       const preset = event.currentTarget.dataset.adminPreset;
       const targetDate = preset === "yesterday" ? localDate(-1) : localDate();
@@ -2743,26 +3292,26 @@ function bindAdmin() {
       render();
     });
   });
-  document.getElementById("applyFilters").addEventListener("click", () => {
+  dom.getElementById("applyFilters")?.addEventListener("click", () => {
     clearShipmentSelections();
     state.adminFilters = {
       ...state.adminFilters,
-      store_id: document.getElementById("filterStore").value,
-      status: document.getElementById("filterStatus").value,
-      date_from: document.getElementById("filterFrom").value,
-      date_to: document.getElementById("filterTo").value,
-      q: document.getElementById("filterQ").value.trim(),
+      store_id: dom.getElementById("filterStore").value,
+      status: dom.getElementById("filterStatus").value,
+      date_from: dom.getElementById("filterFrom").value,
+      date_to: dom.getElementById("filterTo").value,
+      q: dom.getElementById("filterQ").value.trim(),
     };
     state.adminShipmentPage = 1;
     render();
   });
-  document.getElementById("resetFilters").addEventListener("click", () => {
+  dom.getElementById("resetFilters")?.addEventListener("click", () => {
     clearShipmentSelections();
     state.adminFilters = { store_id: "", status: "", date_from: "", date_to: "", q: "" };
     state.adminShipmentPage = 1;
     render();
   });
-  document.getElementById("syncTracking").addEventListener("click", async (event) => {
+  dom.getElementById("syncTracking")?.addEventListener("click", async (event) => {
     try {
       const data = await withButtonBusy(event.currentTarget, "同步中…", () =>
         api("/api/admin/tracking/sync", {
@@ -2770,50 +3319,38 @@ function bindAdmin() {
           body: JSON.stringify({ force: true, limit: 0 }),
         })
       );
-      const result = data.result || {};
-      const skipped = result.skipped_recent || 0;
-      const failed = result.errors || 0;
-      if (result.busy) {
-        errorToast("物流同步任务正在运行，本次没有重复启动。请稍后刷新查看结果。");
-      } else if (result.provider_incident) {
-        errorToast(result.service_error || "快递100服务暂时不可用，本轮同步已停止；无需逐个处理订单。");
-      } else if (failed) {
-        errorToast(`物流同步完成，但有 ${failed} 单查询失败。请打开页面顶部“异常提醒”查看。`);
-      } else {
-        toast(`已同步 ${result.checked || 0} 单，签收 ${result.signed || 0} 单${skipped ? `；另有 ${skipped} 单在 30 分钟保护期内` : ""}。`);
-      }
-      render();
+      acceptTrackingTask(data);
     } catch (error) {
       errorToast(error, "物流同步失败。");
     }
   });
-  document.querySelectorAll("[data-edit-shipping]").forEach((node) => {
+  dom.querySelectorAll("[data-edit-shipping]").forEach((node) => {
     node.addEventListener("click", (event) => {
       state.editingShipmentShippingId = Number(event.currentTarget.dataset.editShipping);
       render({ refreshData: false });
     });
   });
-  document.querySelectorAll("[data-cancel-shipping]").forEach((node) => {
+  dom.querySelectorAll("[data-cancel-shipping]").forEach((node) => {
     node.addEventListener("click", () => {
+      clearAdminRowDraft(node.closest("tr[data-shipment]")?.dataset.shipment);
       state.editingShipmentShippingId = null;
       render({ refreshData: false });
     });
   });
-  document.querySelectorAll("[data-refresh-tracking]").forEach((node) => {
+  dom.querySelectorAll("[data-refresh-tracking]").forEach((node) => {
     node.addEventListener("click", async (event) => {
       const id = event.currentTarget.dataset.refreshTracking;
       try {
-        await withButtonBusy(event.currentTarget, "查询中…", () =>
+        const data = await withButtonBusy(event.currentTarget, "正在排队…", () =>
           api(`/api/shipments/${id}/tracking/refresh`, { method: "POST", body: JSON.stringify({}) })
         );
-        toast("物流已刷新。");
-        render();
+        acceptTrackingTask(data);
       } catch (error) {
         errorToast(error);
       }
     });
   });
-  document.querySelectorAll("[data-cancel-label]").forEach((node) => {
+  dom.querySelectorAll("[data-cancel-label]").forEach((node) => {
     node.addEventListener("click", async (event) => {
       const id = event.currentTarget.dataset.cancelLabel;
       if (!confirm("确认取消并回收这张电子面单？快递100与快递公司确认成功后，订单会恢复为待处理，并可重新下单生成新面单。")) return;
@@ -2831,7 +3368,7 @@ function bindAdmin() {
       }
     });
   });
-  document.querySelectorAll("[data-reprint-label]").forEach((node) => {
+  dom.querySelectorAll("[data-reprint-label]").forEach((node) => {
     node.addEventListener("click", async (event) => {
       const id = event.currentTarget.dataset.reprintLabel;
       try {
@@ -2843,7 +3380,7 @@ function bindAdmin() {
       }
     });
   });
-  document.querySelectorAll("[data-label-printed]").forEach((node) => {
+  dom.querySelectorAll("[data-label-printed]").forEach((node) => {
     node.addEventListener("click", async (event) => {
       const id = event.currentTarget.dataset.labelPrinted;
       try {
@@ -2855,17 +3392,17 @@ function bindAdmin() {
       }
     });
   });
-  document.querySelectorAll("[data-tracking]").forEach((node) => {
+  dom.querySelectorAll("[data-tracking]").forEach((node) => {
     node.addEventListener("input", (event) => {
       const row = event.currentTarget.closest("[data-shipment]");
       const button = row?.querySelector("[data-copy-tracking]");
       if (button) button.style.display = event.currentTarget.value.trim() ? "" : "none";
     });
   });
-  document.querySelectorAll("[data-save-shipment]").forEach((node) => {
+  dom.querySelectorAll("[data-save-shipment]").forEach((node) => {
     node.addEventListener("click", async (event) => {
       const id = event.currentTarget.dataset.saveShipment;
-      const row = document.querySelector(`[data-shipment="${id}"]`);
+      const row = dom.querySelector(`[data-shipment="${id}"]`);
       const payload = {
         status: row.querySelector("[data-status]").value,
         express_company: row.querySelector("[data-company]").value,
@@ -2873,30 +3410,33 @@ function bindAdmin() {
         shipping_note: row.querySelector("[data-note]").value,
       };
       try {
-        await withButtonBusy(event.currentTarget, "保存中…", () =>
+        const data = await withButtonBusy(event.currentTarget, "保存中…", () =>
           api(`/api/shipments/${id}`, { method: "PATCH", body: JSON.stringify(payload) })
         );
+        if (data.task) acceptTrackingTask(data);
+        clearAdminRowDraft(id);
         state.editingShipmentShippingId = null;
-        toast("已保存。");
+        toast(data.message || (data.task || data.tracking_queued ? "已保存，物流信息将由后台更新，可继续操作。" : "已保存。"));
         render();
       } catch (error) {
         errorToast(error);
       }
     });
   });
-  document.querySelectorAll("[data-edit-admin-remark]").forEach((node) => {
+  dom.querySelectorAll("[data-edit-admin-remark]").forEach((node) => {
     node.addEventListener("click", (event) => {
       state.editingShipmentRemarkId = Number(event.currentTarget.dataset.editAdminRemark);
       render({ refreshData: false });
     });
   });
-  document.querySelectorAll("[data-cancel-admin-remark]").forEach((node) => {
+  dom.querySelectorAll("[data-cancel-admin-remark]").forEach((node) => {
     node.addEventListener("click", () => {
+      clearAdminRowDraft(node.closest("tr[data-shipment]")?.dataset.shipment);
       state.editingShipmentRemarkId = null;
       render({ refreshData: false });
     });
   });
-  document.querySelectorAll("[data-save-admin-remark]").forEach((node) => {
+  dom.querySelectorAll("[data-save-admin-remark]").forEach((node) => {
     node.addEventListener("click", async (event) => {
       const id = event.currentTarget.dataset.saveAdminRemark;
       const remark = event.currentTarget.closest(".admin-order-cell")?.querySelector("[data-admin-remark]")?.value || "";
@@ -2907,6 +3447,7 @@ function bindAdmin() {
             body: JSON.stringify({ remark }),
           })
         );
+        clearAdminRowDraft(id);
         state.editingShipmentRemarkId = null;
         toast("订单备注已更新。");
         render();
@@ -2915,7 +3456,7 @@ function bindAdmin() {
       }
     });
   });
-  document.querySelectorAll("[data-delete-shipment]").forEach((node) => {
+  dom.querySelectorAll("[data-delete-shipment]").forEach((node) => {
     node.addEventListener("click", async (event) => {
       const id = event.currentTarget.dataset.deleteShipment;
       const orderNo = event.currentTarget.dataset.orderNo || id;
@@ -2932,10 +3473,11 @@ function bindAdmin() {
       }
     });
   });
-  bindShipmentItemEditor(state.shipments);
+  bindShipmentItemEditor(state.shipments, root);
 }
 
 async function renderStores() {
+  const currentView = beginView();
   await loadStores(true);
   const content = `
     ${pageHead("门店与团队", "管理实体门店与合作团队。合作账号只能查看本团队寄送记录。")}
@@ -2971,12 +3513,14 @@ async function renderStores() {
       ${renderStoresTable()}
     </section>
   `;
+  currentView();
   document.getElementById("app").innerHTML = shell(content);
   bindCommon();
   bindStores();
 }
 
 async function renderShippingSettings() {
+  const currentView = beginView();
   await loadShippingSettings();
   const settings = state.shippingSettings || {};
   const config = state.shippingConfig || {};
@@ -3080,6 +3624,7 @@ async function renderShippingSettings() {
     </section>
     </form>
   `;
+  currentView();
   document.getElementById("app").innerHTML = shell(content);
   bindCommon();
   document.getElementById("shippingSettingsForm").addEventListener("submit", async (event) => {
@@ -3201,6 +3746,7 @@ function bindStores() {
 }
 
 async function renderProducts({ refreshData = true } = {}) {
+  const currentView = beginView();
   if (refreshData) await loadProductsAll();
   const categoriesAll = [...new Set(state.productsAll.map((product) => product.category))].sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
   const filtered = state.productsAll.filter((product) => {
@@ -3273,6 +3819,7 @@ async function renderProducts({ refreshData = true } = {}) {
       ${renderProductsTable(filtered)}
     </section>
   `;
+  currentView();
   document.getElementById("app").innerHTML = shell(content);
   bindCommon();
   bindProducts();
@@ -3382,6 +3929,8 @@ function bindProducts() {
 }
 
 function bindCommon() {
+  bindSubmissionRecovery();
+  restoreTrackingTasks(); updateTrackingTaskUi(); scheduleTrackingPoll();
   bindSpecialControls();
   bindTrackingCopyButtons();
   bindTrackingDetails();
@@ -3395,6 +3944,7 @@ function bindCommon() {
   const logout = document.getElementById("logoutBtn");
   if (logout) {
     logout.addEventListener("click", async () => {
+      invalidatePage({ clearIdentity: true });
       await api("/api/logout", { method: "POST" }).catch(() => null);
       state.user = null;
       navigate("/login");
@@ -3403,7 +3953,11 @@ function bindCommon() {
 }
 
 async function render({ refreshData = true } = {}) {
+  const renderId = ++renderSequence;
+  const route = `${location.pathname}${location.search}`;
+  if (route !== currentRoute) { invalidatePage(); currentRoute = route; }
   const path = location.pathname;
+  const epoch = pageEpoch;
   if (path !== "/admin") {
     stopTaskAlertPoll();
     state.taskAlertsOpen = false;
@@ -3418,6 +3972,10 @@ async function render({ refreshData = true } = {}) {
   }
   if (!state.user && path !== "/login") {
     await loadMe();
+  }
+  if (epoch !== pageEpoch) {
+    if (showsLoading) { activeDataLoads = Math.max(0, activeDataLoads - 1); if (!activeDataLoads) document.documentElement.classList.remove("app-loading"); }
+    return;
   }
   if (!state.user && path !== "/login") {
     history.replaceState({}, "", "/login");
@@ -3459,6 +4017,7 @@ async function render({ refreshData = true } = {}) {
       navigate(state.user.role === "admin" ? "/admin" : state.user.store_kind === "team" ? "/special/new" : "/submit");
     }
   } catch (error) {
+    if (error instanceof StaleViewError || renderId !== renderSequence || epoch !== pageEpoch) return;
     document.getElementById("app").innerHTML = shell(`<section class="panel panel-pad"><div class="empty">${escapeHtml(error.message)}</div></section>`);
     bindCommon();
   } finally {
@@ -3470,4 +4029,27 @@ async function render({ refreshData = true } = {}) {
 }
 
 window.addEventListener("popstate", render);
+document.addEventListener("input", event => {
+  const row = event.target.closest?.("tr[data-shipment]");
+  if (row) row.dataset.dirty = "1";
+});
+document.addEventListener("change", event => {
+  const row = event.target.closest?.("tr[data-shipment]");
+  if (row) row.dataset.dirty = "1";
+});
+document.addEventListener("visibilitychange", async () => {
+  if (document.visibilityState === "hidden") {
+    stopTaskAlertPoll(); clearTimeout(state.shippingBatchPollTimer); clearTimeout(state.trackingPollTimer);
+    state.shippingBatchPollTimer = state.trackingPollTimer = null;
+    return;
+  }
+  const epoch = pageEpoch;
+  if (location.pathname === "/admin" && state.user?.role === "admin") {
+    await Promise.all([loadTaskAlerts(), loadActiveShippingBatch()]);
+    if (epoch !== pageEpoch) return;
+    updateTaskAlertUi(); updateShippingBatchUi(); scheduleTaskAlertPoll(); scheduleShippingBatchPoll();
+  }
+  scheduleTrackingPoll(true);
+});
+window.addEventListener("pagehide", () => invalidatePage());
 render();

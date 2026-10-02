@@ -29,6 +29,8 @@ import daily_audit_probe_test
 import daily_audit_test
 import shipment_time_integrity_test
 import special_shipments_test
+import reliability_test
+import reliability_http_test
 from database import AppError, DEFAULT_PRODUCT_FILE, Database, now_text
 
 
@@ -648,11 +650,12 @@ def main() -> None:
                 },
             )
         batch_preview = legacy_db.preview_shipping_batch({"id": 99, "role": "admin"}, {"q": "BATCH-"})
-        assert len(batch_preview["eligible"]) == 51
+        assert len(batch_preview["eligible"]) == 50 and batch_preview["eligible_count"] == 51
         large_batch = legacy_db.create_shipping_batch(
             {"id": 1, "role": "admin"},
             [{"id": row["id"], "express_company": "圆通"} for row in batch_preview["eligible"]],
             {"q": "BATCH-"},
+            selection_mode="all_matching", preview_fingerprint=batch_preview["preview_fingerprint"],
         )
         assert large_batch["batch"]["total_count"] == 51
         failed_job = legacy_db.claim_next_shipping_job()
@@ -1159,6 +1162,8 @@ def main() -> None:
             assert server.process_next_shipping_job() is True
         finally:
             shipping.urllib.request.urlopen = original_shipping_urlopen
+        # The HTTP/label path now only persists a query intent; adapter behavior is checked separately.
+        server.refresh_tracking_for_shipment(server.DB.get_shipment(shipment_id, {"role":"admin"}))
         status, body = request(admin, base, "GET", f"/api/admin/shipping-batches/{batch_id}")
         assert status == 200, body
         assert body["counts"]["成功"] == 1
@@ -1478,7 +1483,8 @@ def main() -> None:
         assert body["shipment"]["status"] == "已发货"
         assert body["shipment"]["tracking_no"] == "SF123456"
         assert body["shipment"]["express_company"] == "顺丰"
-        assert body["shipment"]["tracking_status"] == "运输中"
+        assert body["shipment"]["tracking_status"] == "待查询" and body["tracking_queued"]
+        server.refresh_tracking_for_shipment(body["shipment"])
 
         status, body = request(
             staff,
@@ -1521,9 +1527,9 @@ def main() -> None:
                 (shipment_id,),
             )
         status, body = request(admin, base, "POST", "/api/admin/tracking/sync", {"force": True, "limit": 5})
-        assert status == 200, body
-        assert body["result"]["signed"] == 1, body
-        assert body["result"]["remaining"] == 0
+        assert status == 202 and body["task"]["id"], body
+        adapter_result=server.sync_tracking_batch(force=True,limit=5)
+        assert adapter_result["signed"] == 1 and adapter_result["remaining"] == 0
         status, body = request(admin, base, "GET", "/api/shipments?q=ORDER-SMOKE-001")
         assert status == 200, body
         assert body["shipments"][0]["status"] == "已签收"
@@ -1567,6 +1573,10 @@ def main() -> None:
         status, body = request(staff, base, "POST", "/api/returns", return_payload)
         assert status == 201, body
         return_id = body["return_order"]["id"]
+        assert body["tracking_queued"] and body["task"]["id"]
+        assert body["return_order"]["status"] == "待查询"
+        server.refresh_tracking_for_return(body["return_order"])
+        body={"return_order":server.DB.get_return_order(return_id,{"role":"admin"})}
         assert body["return_order"]["status"] == "运输中"
         assert body["return_order"]["express_company"] == "申通快递"
         assert body["return_order"]["express_company_code"] == "shentong"
@@ -1599,7 +1609,9 @@ def main() -> None:
         server.detect_tracking_company = fake_detect_return_company
         server.query_tracking = fake_query_tracking
         status, body = request(admin, base, "POST", f"/api/returns/{return_id}/tracking/refresh", {})
-        assert status == 200, body
+        assert status == 202 and body["task"]["id"], body
+        server.refresh_tracking_for_return(body["return_order"])
+        body={"return_order":server.DB.get_return_order(return_id,{"role":"admin"})}
         assert body["return_order"]["status"] == "已签收"
         assert body["return_order"]["tracking_status"] == "已签收"
         assert body["return_order"]["express_company"] == "申通快递"
@@ -1618,6 +1630,9 @@ def main() -> None:
         }
         status, body = request(staff, base, "POST", "/api/returns", failed_return_payload)
         assert status == 201, body
+        assert body["tracking_queued"]
+        server.refresh_tracking_for_return(body["return_order"])
+        body={"return_order":server.DB.get_return_order(body["return_order"]["id"],{"role":"admin"})}
         assert body["return_order"]["status"] == "异常"
         assert body["return_order"]["tracking_status"] == "查询失败"
         assert body["return_order"]["express_company"] == ""
@@ -1788,7 +1803,8 @@ def main() -> None:
         )
         assert status == 200, full_preview
         assert full_preview["preview"]["matched"] == 54
-        assert len(full_preview["preview"]["eligible"]) == 54
+        assert len(full_preview["preview"]["eligible"]) == 50
+        assert full_preview["preview"]["eligible_count"] == 54
         staff_preview = server.DB.preview_shipping_batch(test_staff_user, {"q": "PAGINATION-SMOKE", "status": "待处理"})
         assert staff_preview["matched"] == 53
 
@@ -1833,6 +1849,8 @@ def main() -> None:
         shipment_time_integrity_test.main()
         daily_audit_probe_test.main()
         special_shipments_test.main()
+        reliability_test.run()
+        reliability_http_test.run()
         print("smoke test passed")
 
 

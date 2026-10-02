@@ -12,6 +12,7 @@
 | [发货与签收时间完整性](shipment-time-integrity.md) | 写入约束、证据等级、历史聚合预览与受控修复 | `database.py`, `tracking.py`, `manage.py` |
 | 物流 | 快递100查询、自动/手动同步、签收更新 | `tracking.py`, `server.py` |
 | 电子面单 | 菜鸟授权、网点余额、批量下单、取消、复打 | `shipping.py`, `database.py`, `server.py` |
+| [操作体验与后台稳定性](experience-reliability.md) | 分阶段发布：局部更新、输入保护、持久查询、分页范围一致性、容量保护及证据完整性 | `tracking_queue.py`, `database.py`, `server.py`, `static/app.js` |
 | 打印 | 待打印选择、PDF 合并、打印状态、单张复打 | `label_pdf.py`, `server.py`, `static/app.js` |
 | [任务可靠性与失败提示](task-reliability.md) | 面单短暂故障重试、中断恢复、分类异常角标、60 秒刷新、人工确认与操作指引 | `database.py`, `shipping.py`, `server.py`, `static/app.js` |
 | [脱敏业务日报](daily-audit.md) | 独立 Bearer 鉴权、只读 SQLite 汇总、前向完整历史日末、脱敏失败分类、时间证据等级、连接双采样、脱敏打印相关性与 Render 延迟受控降级 | `database.py`, `server.py`, `tools/scentpool_daily_audit_probe.py`, `daily_audit_test.py`, `daily_audit_probe_test.py` |

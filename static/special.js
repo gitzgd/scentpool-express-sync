@@ -41,11 +41,12 @@ function classificationFilters(scope) {
 
 function clearShipmentSelections() {
   state.batchPreview = null; state.batchSelectedIds = []; state.batchPrintSelectedIds = [];
+  state.batchSelectAll = false; state.batchCompanyOverrides = {}; state.batchPreviewPage = 1;
   state.batchPrintOpen = false; state.batchPrintError = "";
 }
 
-function bindSpecialControls() {
-  document.querySelectorAll("[data-shipment-group], [data-shipment-subtype]").forEach(node => node.addEventListener(node.hasAttribute("data-shipment-group") ? "click" : "change", () => {
+function bindSpecialControls(root = document) {
+  root.querySelectorAll("[data-shipment-group], [data-shipment-subtype]").forEach(node => node.addEventListener(node.hasAttribute("data-shipment-group") ? "click" : "change", () => {
     const scope = node.dataset.scope;
     const filters = scope === "admin" ? state.adminFilters : state.storeFilters;
     if (node.hasAttribute("data-shipment-group")) { filters.shipment_group = node.dataset.shipmentGroup; filters.shipment_type = ""; }
@@ -53,7 +54,7 @@ function bindSpecialControls() {
     delete filters.id; delete filters.original_shipment_id; delete filters.related_return_id;
     clearShipmentSelections(); state.adminShipmentPage = 1; state.storeShipmentPage = 1; render();
   }));
-  document.querySelectorAll("[data-shipment-reference], [data-aftersales-for], [data-return-aftersales]").forEach(node => node.addEventListener("click", () => {
+  root.querySelectorAll("[data-shipment-reference], [data-aftersales-for], [data-return-aftersales]").forEach(node => node.addEventListener("click", () => {
     const key = node.hasAttribute("data-shipment-reference") ? "id" : node.hasAttribute("data-aftersales-for") ? "original_shipment_id" : "related_return_id";
     const value = node.dataset.shipmentReference || node.dataset.aftersalesFor || node.dataset.returnAftersales;
     const filters = { status: "", date_from: "", date_to: "", q: "", [key]: value };
@@ -61,12 +62,12 @@ function bindSpecialControls() {
     clearShipmentSelections(); state.adminShipmentPage = 1; state.storeShipmentPage = 1;
     navigate(state.user.role === "admin" ? "/admin" : "/shipments");
   }));
-  document.querySelectorAll("[data-return-reference]").forEach(node => node.addEventListener("click", () => {
+  root.querySelectorAll("[data-return-reference]").forEach(node => node.addEventListener("click", () => {
     const filters = { id: node.dataset.returnReference, status: "", q: "", date_from: "", date_to: "" };
     if (state.user.role === "admin") state.adminReturnFilters = filters; else state.storeReturnFilters = filters;
     navigate(state.user.role === "admin" ? "/admin/returns" : "/returns");
   }));
-  document.querySelectorAll("[data-edit-context]").forEach(node => node.addEventListener("click", () => {
+  root.querySelectorAll("[data-edit-context]").forEach(node => node.addEventListener("click", () => {
     const row = [...(state.shipments || []), ...(state.storeShipments || [])].find(item => item.id === Number(node.dataset.editContext));
     if (!row) return;
     const dialog = document.createElement("dialog"); dialog.className = "special-context-dialog";
@@ -87,6 +88,7 @@ function specialField(name, label, {required = true, area = false, limit = 1000,
 }
 
 async function renderSpecialShipment() {
+  const currentView = beginView();
   await Promise.all([ensureProductsGrouped(), loadStores()]);
   const context = `${state.user.id}:${location.search}`;
   if (specialDraftContext !== context || !specialDraft) {
@@ -113,6 +115,7 @@ async function renderSpecialShipment() {
   const types = state.user.role === "admin" ? ["resend", "exchange", "influencer", "sample"] : state.user.store_kind === "team" ? ["influencer", "sample"] : ["resend", "exchange"];
   const stores = state.stores.filter(row => row.kind === (cooperation ? "team" : "store"));
   const itemRows = specialDraft.items.map((item, index) => `<div class="special-item" data-special-item="${index}"><strong>${item.item_kind === "material" ? "临时物料" : "目录商品"} ${index + 1}</strong>${item.item_kind === "material" ? `<label>名称<input class="input" data-item-field="name" value="${escapeHtml(item.name || "")}" maxlength="100" required></label><label>规格<input class="input" data-item-field="material_spec" value="${escapeHtml(item.material_spec || "")}" maxlength="100" required></label>` : `<label>分类<select class="select" data-item-field="category" required>${categoryOptions(item.category || "")}</select></label><label>商品<select class="select" data-item-field="barcode" required>${productOptions(item.category || "", item.barcode || "")}</select></label>`}<label>数量<input class="input" type="number" min="1" max="999999" step="1" data-item-field="quantity" value="${escapeHtml(item.quantity)}" required></label><button class="btn danger small" data-remove-special="${index}" type="button">删除明细</button></div>`).join("");
+  currentView();
   document.getElementById("app").innerHTML = shell(`${pageHead(cooperation ? "合作寄送" : "售后发货", "独立编号 · 总部统一处理 · 与原订单、退货分别保留记录")}
     <form id="specialShipmentForm" class="panel panel-pad special-form"><fieldset><div class="form-grid">
     <label class="field">发货类型<select class="select" name="shipment_type" required>${types.map(key => `<option value="${key}" ${key === specialDraft.shipment_type ? "selected" : ""}>${SHIPMENT_TYPES[key][0]}</option>`).join("")}</select></label>
@@ -135,25 +138,27 @@ async function renderSpecialShipment() {
   form.addEventListener("input", capture);
   document.getElementById("resetSpecialDraft").onclick = () => {
     if (!confirm("请先在发货看板确认上一次是否已提交，避免重复寄送。确定放弃当前草稿，开始另一张新单？")) return;
-    sessionStorage.removeItem(`scentpool_special_request:${context}`); specialDraft = null; renderSpecialShipment();
+    sessionStorage.removeItem(`scentpool_special_request:${context}`); specialDraft = null; render();
   };
   form.querySelector('[name="shipment_type"]').onchange = () => {
     capture(); if (["influencer", "sample"].includes(specialDraft.shipment_type) !== cooperation) { specialDraft.store_id = state.user.store_id || ""; specialDraft.original_shipment_id = ""; specialDraft.related_return_id = ""; specialDraft.cooperation_subject = ""; }
-    renderSpecialShipment();
+    render();
   };
-  form.querySelectorAll('[data-item-field="category"]').forEach(input => input.onchange = () => { capture(); specialDraft.items[Number(input.closest("[data-special-item]").dataset.specialItem)].barcode = ""; renderSpecialShipment(); });
-  ["Product", "Material"].forEach(kind => document.getElementById(`addSpecial${kind}`).onclick = () => {capture(); specialDraft.items.push({item_kind: kind === "Material" ? "material" : "product", quantity: 1}); renderSpecialShipment();});
-  form.querySelectorAll("[data-remove-special]").forEach(node => node.onclick = () => {capture(); specialDraft.items.splice(Number(node.dataset.removeSpecial), 1); renderSpecialShipment();});
+  form.querySelectorAll('[data-item-field="category"]').forEach(input => input.onchange = () => { capture(); specialDraft.items[Number(input.closest("[data-special-item]").dataset.specialItem)].barcode = ""; render(); });
+  ["Product", "Material"].forEach(kind => document.getElementById(`addSpecial${kind}`).onclick = () => {capture(); specialDraft.items.push({item_kind: kind === "Material" ? "material" : "product", quantity: 1}); render();});
+  form.querySelectorAll("[data-remove-special]").forEach(node => node.onclick = () => {capture(); specialDraft.items.splice(Number(node.dataset.removeSpecial), 1); render();});
   form.onsubmit = async event => {
-    event.preventDefault(); capture();
+    event.preventDefault();
+    if (form.querySelector("fieldset").disabled) return;
+    capture();
     const payload = {...specialDraft, items: specialDraft.items.map(item => item.item_kind === "material" ? {item_kind: "material", name: item.name, material_spec: item.material_spec, quantity: Number(item.quantity)} : {barcode: item.barcode, quantity: Number(item.quantity)})};
     if (!payload.items.length) { document.getElementById("specialError").textContent = "请至少添加一项本次寄送明细。"; return; }
     const fieldset = form.querySelector("fieldset"); fieldset.disabled = true; event.submitter.textContent = "提交中，请勿重复操作…";
     try {
-      const data = await api("/api/shipments", {method: "POST", body: JSON.stringify(payload)});
+      const data = await createWithConfirmation("shipment", payload);
       sessionStorage.removeItem(`scentpool_special_request:${context}`); specialDraft = null;
       toast(`已提交总部：${data.shipment.business_id}`); navigate(state.user.role === "admin" ? "/admin" : "/shipments");
-    } catch (error) {document.getElementById("specialError").textContent = error.status && error.status < 500 ? `提交未成功：${error.message} 内容已保留，请确认后重试。` : `未确认提交成功：${error.message} 网络超时时请保留原内容重试，系统不会重复创建同一次提交。`;}
+    } catch (error) {if (!(error instanceof StaleViewError) && form.isConnected) document.getElementById("specialError").textContent = error.status && error.status < 500 ? `提交未成功：${error.message} 内容已保留，请确认后重试。` : error.message;}
     finally {fieldset.disabled = false; if (event.submitter.isConnected) event.submitter.textContent = "提交总部处理";}
   };
 }

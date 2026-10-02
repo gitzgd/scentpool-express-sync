@@ -816,7 +816,13 @@ def main() -> None:
                 response_bodies.append(connection_report)
                 assert status == 200, connection_report
                 assert set(connection_report) == {"sampled_at", "storage"}
-                assert set(connection_report["storage"]) == {"connections"}
+                assert set(connection_report["storage"]) == {"connections", "connection_limits"}
+                assert connection_report["storage"]["connection_limits"] == {
+                    "request_workers": server.MAX_REQUEST_THREADS,
+                    "background_connections": 2,
+                    "transient_background_connections": 2,
+                    "peak_active_upper_bound": server.MAX_REQUEST_THREADS + 4,
+                }
                 connection_counts = connection_report["storage"]["connections"]
                 assert set(connection_counts) == {
                     "opened_total", "closed_total", "active", "peak_active"
