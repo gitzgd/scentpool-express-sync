@@ -31,6 +31,8 @@ import shipment_time_integrity_test
 import special_shipments_test
 import reliability_test
 import reliability_http_test
+import bounded_exports_test
+import http_limits_test
 from database import AppError, DEFAULT_PRODUCT_FILE, Database, now_text
 
 
@@ -1851,6 +1853,8 @@ def main() -> None:
         special_shipments_test.main()
         reliability_test.run()
         reliability_http_test.run()
+        bounded_exports_test.run()
+        http_limits_test.main()
         print("smoke test passed")
 
 

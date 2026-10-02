@@ -39,6 +39,9 @@ from shipping import (
 )
 from tracking import detect_tracking_company, manual_refresh_stale_before, query_tracking, tracking_auto_enabled, tracking_config_public, tracking_interval_minutes, tracking_stale_before
 from tracking_queue import TrackingQueue
+from http_limits import HttpRequestError, RequestReadLimitsMixin, reject_overloaded_request
+from runtime_metrics import METRICS, request_category
+from bounded_exports import prepare_export
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -76,6 +79,7 @@ MAX_AUDIT_AUTHORIZATION_LENGTH = 512
 TRACKING_SYNC_LOCK = threading.Lock()
 RETURN_TRACKING_SYNC_LOCK = threading.Lock()
 LABEL_BATCH_PRINT_LOCK = threading.Lock()
+EXPORT_LOCK = threading.Lock()
 SHIPPING_QUEUE_EVENT = threading.Event()
 TRACKING_QUEUE_EVENT = threading.Event()
 SHIPPING_IDLE_DELAYS_SECONDS = (2, 5, 15, 60)
@@ -756,6 +760,8 @@ def process_next_tracking_job(connection) -> bool:
     except Exception:
         result = {"system_error": True, "error": "物流查询暂时未完成，系统将按规则重试。"}
     outcome = queue.finish(connection, job, result, (time.monotonic() - started) * 1000)
+    METRICS.observe("tracking_provider",(time.monotonic()-started)*1000, bool(result.get("system_error") or result.get("tracking_status")=="查询失败"))
+    METRICS.observe("tracking_wait",max(0,job["started_at"]-job["created_at"])*1000)
     if not outcome.get("discarded"):
         if result.get("system_error"):
             record_tracking_service_incident(result)
@@ -898,7 +904,9 @@ class FixedThreadPoolHTTPServer(HTTPServer):
         super().__init__(server_address, handler_class)
 
     def process_request(self, request: Any, client_address: Any) -> None:
-        self._request_slots.acquire()
+        if not self._request_slots.acquire(blocking=False):
+            reject_overloaded_request(request)
+            return
         try:
             self._executor.submit(self._process_request, request, client_address)
         except Exception:
@@ -939,7 +947,7 @@ def process_memory_diagnostics() -> Dict[str, Any]:
     return result
 
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
     server_version = "ScentpoolExpress/1.0"
 
     def do_GET(self) -> None:
@@ -980,6 +988,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
                 return
             self.error_json("页面不存在。", 404)
+        except HttpRequestError as exc:
+            self.close_connection = True
+            self.error_json(exc.message, exc.status)
         except AppError as exc:
             self.error_json(exc.message, exc.status, exc.details)
         except sqlite3.IntegrityError as exc:
@@ -988,9 +999,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.error_json("本次操作未保存，数据状态已变化，请刷新核对后重试。", 409)
         except Exception as exc:  # pragma: no cover - final safety net for local prototype
-            self.error_json(f"服务器错误：{exc}", 500)
+            print(f"[request-error] type={type(exc).__name__}",flush=True)
+            self.error_json("系统暂时未完成处理，请先核对操作结果再重试。", 500)
         finally:
             elapsed_ms = (time.perf_counter() - started_at) * 1000
+            if path.startswith("/api/") and path != "/api/health":
+                METRICS.observe(request_category(self.command,path),elapsed_ms,getattr(self,"_response_status",200)>=400)
             if path.startswith("/api/") and path != "/api/health" and elapsed_ms >= SLOW_REQUEST_MILLISECONDS:
                 print(f"[slow-request] {self.command} {path} {elapsed_ms:.0f}ms")
 
@@ -1017,8 +1031,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/integrations/kuaidi100/label-auth-callback" and self.command == "POST":
             state = str(query.get("state") or "")
-            DB.consume_label_auth_session(state)
             credentials = parse_auth_callback(str(self.read_form().get("param") or ""))
+            DB.consume_label_auth_session(state)
             DB.save_label_authorization(credentials)
             html = """<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><title>菜鸟授权成功</title>
             <style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:48px;background:#f5f5f7;color:#1d1d1f}main{max-width:520px;margin:auto;background:white;padding:32px;border-radius:12px}a{color:#06c}</style>
@@ -1190,6 +1204,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "time": now_text(),
                     "process": process_memory_diagnostics(),
+                    "runtime": {"requests":METRICS.summary(),"tracking_queue":TrackingQueue(DB).summary()},
                     "storage": DB.storage_diagnostics(),
                 }
             )
@@ -1500,14 +1515,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/export/shipments.csv" and self.command == "GET":
             self.require_admin(user)
-            shipments = DB.list_shipments(user, query)
-            self.send_csv(shipments, export_filename(query, shipments, "csv"))
+            self.send_bounded_export(user,query,"csv")
             return
 
         if path == "/api/export/shipments.xlsx" and self.command == "GET":
             self.require_admin(user)
-            shipments = DB.list_shipments(user, query)
-            self.send_xlsx(shipments, export_filename(query, shipments, "xlsx"))
+            self.send_bounded_export(user,query,"xlsx")
             return
 
         self.error_json("接口不存在。", 404)
@@ -1574,6 +1587,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def send_bounded_export(self,user,query,extension):
+        if not EXPORT_LOCK.acquire(blocking=False):
+            raise AppError("已有一个数据导出正在进行，请稍后重试。订单未被修改。",503)
+        try:
+            with tempfile.TemporaryDirectory(prefix="scentpool-export-") as directory:
+                path,hint,_count=prepare_export(DB,user,query,directory,extension,headers=EXPORT_HEADERS,
+                    widths=EXPORT_COLUMN_WIDTHS,row_builder=export_rows,template_builder=build_table_xlsx,cell_builder=xlsx_cell)
+                content_type="text/csv; charset=utf-8" if extension=="csv" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                self.send_file(path,content_type,attachment_header(export_filename(query,hint,extension),f"scentpool-shipments.{extension}"))
+        finally:
+            EXPORT_LOCK.release()
+
+    def send_response(self,code,message=None):
+        self._response_status=code
+        super().send_response(code,message)
+
     def send_xlsx(self, shipments: Any, filename: str) -> None:
         payload = build_shipments_xlsx(shipments)
         self.send_response(200)
@@ -1639,7 +1668,7 @@ class Handler(BaseHTTPRequestHandler):
         if length > MAX_UPLOAD_BYTES:
             raise AppError("上传文件不能超过 20MB。", 413)
 
-        raw = self.rfile.read(length)
+        raw = self.read_request_body(MAX_UPLOAD_BYTES)
         header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
         message = BytesParser(policy=email_policy).parsebytes(header + raw)
         for part in message.iter_parts():
@@ -1659,7 +1688,10 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         if length > MAX_JSON_BODY_BYTES:
             raise AppError("请求内容不能超过 1MB。", 413)
-        raw = self.rfile.read(length).decode("utf-8")
+        try:
+            raw = self.read_request_body(MAX_JSON_BODY_BYTES).decode("utf-8")
+        except UnicodeDecodeError:
+            raise AppError("请求内容编码不正确，请重新提交。") from None
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -1690,7 +1722,7 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         if length > MAX_FORM_BODY_BYTES:
             raise AppError("表单内容不能超过 1MB。", 413)
-        raw = self.rfile.read(length).decode("utf-8") if length > 0 else ""
+        raw = self.read_request_body(MAX_FORM_BODY_BYTES).decode("utf-8") if length > 0 else ""
         return {key: values[-1] for key, values in parse_qs(raw, keep_blank_values=True).items()}
 
     def cookie_attributes(self, max_age: int) -> str:

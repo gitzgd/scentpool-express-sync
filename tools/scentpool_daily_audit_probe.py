@@ -9,6 +9,7 @@ printed or persisted.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import socket
@@ -36,10 +37,43 @@ MAX_CURSOR_PAGES = 50
 MAX_LOG_PAGES = 200
 CONNECTION_SAMPLE_INTERVAL_SECONDS = 30
 EXPECTED_CONNECTION_PEAK_UPPER_BOUND = 9
+MAX_JSON_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_ERROR_RESPONSE_BYTES = 2048
 CORRELATION_WINDOW_MINUTES = 10
 LATENCY_QUANTILES = (0.5, 0.9, 0.99)
 AUDIT_DIAGNOSTICS_PATH = "/api/admin/system/audit-diagnostics"
 MACOS_SYSTEM_CA_FILE = "/etc/ssl/cert.pem"
+TIMESTAMP_PATTERN = re.compile(
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})"
+    r"(?:\.([0-9]{1,9}))?(Z|[+-][0-9]{2}:[0-9]{2})"
+)
+
+
+def latency_plan_restriction(url: str, code: int, raw: bytes) -> bool:
+    """Recognize only small, explicit provider messages; never return their text."""
+    if (
+        code not in (400, 403)
+        or urllib.parse.urlparse(url).path != "/v1/metrics/http-latency"
+        or len(raw) > MAX_ERROR_RESPONSE_BYTES
+    ):
+        return False
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(payload, dict) or set(payload) not in ({"message"}, {"error"}, {"detail"}):
+        return False
+    message = next(iter(payload.values()))
+    if not isinstance(message, str) or len(message) > 256:
+        return False
+    # Full-message patterns deliberately exclude interpolated URLs, resources,
+    # account identifiers and arbitrary keyword combinations.
+    return bool(re.fullmatch(
+        r"(?:query is not allowed for plan: Hobby"
+        r"|response latency metrics (?:are only available on|require) (?:the )?pro(?:\+| or higher)? plans?"
+        r"|(?:http |response )?latency metrics (?:are )?not available (?:on|for) (?:the )?hobby plan)[.!]?",
+        message, re.IGNORECASE,
+    ))
 
 RENDER_QUERY_WHITELIST = {
     f"/services/{RENDER_SERVICE_ID}": set(),
@@ -67,7 +101,7 @@ LOG_PATTERNS = {
 }
 AUDIT_PRINT_PATTERN = re.compile(
     r"^\[audit-print\] kind=(batch_print|merge) outcome=(success|failure) "
-    r"duration_ms=([0-9]+) slow=([01])$"
+    r"duration_ms=([0-9]{1,9}) slow=([01])$"
 )
 LEGACY_MERGE_PATTERN = re.compile(
     r"^\[labels\] merged orders=[0-9]+ pages=[0-9]+ source_bytes=[0-9]+ output_bytes=[0-9]+$"
@@ -219,7 +253,13 @@ class JsonClient:
                     timeout=self.timeout_seconds,
                     context=https_context(),
                 ) as response:
-                    raw = response.read()
+                    raw = response.read(MAX_JSON_RESPONSE_BYTES + 1)
+                    if len(raw) > MAX_JSON_RESPONSE_BYTES:
+                        return status_result(
+                            "schema_changed", message="接口响应超过采集器安全大小上限。",
+                            http_status=int(response.status),
+                            error_type="response_too_large",
+                        )
                     try:
                         data = json.loads(raw)
                     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -237,6 +277,23 @@ class JsonClient:
                         data=data,
                     )
             except urllib.error.HTTPError as exc:
+                restricted_by_plan = False
+                try:
+                    raw_error = exc.read(MAX_ERROR_RESPONSE_BYTES + 1)
+                    restricted_by_plan = latency_plan_restriction(url, exc.code, raw_error)
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    exc.close()
+                if restricted_by_plan:
+                    return status_result(
+                        "permission_denied",
+                        message="Render 明确表示当前套餐不提供响应延迟指标；这不代表网站故障。",
+                        http_status=int(exc.code),
+                        availability="unavailable",
+                        reason="plan_restricted",
+                        elapsed_ms=round((time.monotonic() - started) * 1000),
+                    )
                 status = "permission_denied" if exc.code in (401, 403) else "http_error"
                 return status_result(
                     status,
@@ -336,6 +393,16 @@ def metric_series_payload(payload: Any) -> Optional[list[Any]]:
     return None
 
 
+def nonnegative_finite_number(value: Any) -> Optional[float]:
+    if type(value) not in (int, float):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
 def metric_summary(result: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
     if result.get("status") != "ok":
         return without_data(result)
@@ -350,32 +417,76 @@ def metric_summary(result: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
         unit = item.get("unit", "")
         if not isinstance(values, list) or not isinstance(unit, str):
             return schema_error(result, "指标时间序列数值结构发生变化。")
-        points: list[tuple[str, float]] = []
+        if mode == "resource":
+            multiplier = unit_multiplier(unit)
+            if multiplier is None:
+                return schema_error(result, "资源指标单位无法识别，未对不同或未知单位求和。")
+            safe_unit = "bytes"
+        elif mode == "requests":
+            multiplier, safe_unit = 1.0, "count"
+        else:
+            multiplier = 1.0
+            safe_unit = {
+                "s": "seconds", "second": "seconds", "seconds": "seconds",
+                "ms": "milliseconds", "millisecond": "milliseconds", "milliseconds": "milliseconds",
+                "us": "microseconds", "microsecond": "microseconds", "microseconds": "microseconds",
+                "ns": "nanoseconds", "nanosecond": "nanoseconds", "nanoseconds": "nanoseconds",
+            }.get(unit.strip().lower())
+            if safe_unit is None:
+                return schema_error(result, "延迟指标单位无法识别。")
+        points: list[tuple[datetime, float]] = []
+        seen_times: set[datetime] = set()
         for point in values:
             if not isinstance(point, dict) or not isinstance(point.get("timestamp"), str):
                 return schema_error(result, "指标数据点结构发生变化。")
-            value = point.get("value")
-            if not isinstance(value, (int, float)):
-                return schema_error(result, "指标数据点不是数值。")
-            points.append((str(point["timestamp"]), float(value)))
+            value = nonnegative_finite_number(point.get("value"))
+            timestamp = parsed_timestamp(point["timestamp"])
+            if value is None:
+                return schema_error(result, "指标数据点不是有限非负数值。")
+            if timestamp is None or timestamp in seen_times:
+                return schema_error(result, "指标数据点时间无效或同一序列时间重复。")
+            seen_times.add(timestamp)
+            scaled_value = float(value) * multiplier
+            if not math.isfinite(scaled_value):
+                return schema_error(result, "指标数据点超过有限数值范围。")
+            points.append((timestamp, scaled_value))
+        points.sort(key=lambda point: point[0])
         if points:
+            total = sum(value for _timestamp, value in points)
+            if not math.isfinite(total):
+                return schema_error(result, "指标汇总超过有限数值范围。")
             normalized.append(
                 {
                     "labels": label_map(item["labels"]),
-                    "unit": unit,
+                    "unit": safe_unit,
                     "latest": points[-1][1],
                     "maximum": max(value for _timestamp, value in points),
-                    "sum": sum(value for _timestamp, value in points),
+                    "sum": total,
                     "points": len(points),
+                    "timed_points": points,
                 }
             )
     if not normalized:
         return no_data(result, "指标接口成功，但目标时间段没有数据。", series=[])
     if mode == "resource":
-        maximum = max(item["maximum"] for item in normalized)
-        latest = sum(item["latest"] for item in normalized)
-        units = sorted({item["unit"] for item in normalized})
-        return {**without_data(result), "latest": latest, "maximum": maximum, "units": units}
+        # Never carry an old instance's last observed value forward to the new
+        # instance. Only exactly aligned timestamps represent simultaneous load.
+        totals: Dict[datetime, float] = {}
+        counts: Dict[datetime, int] = {}
+        for item in normalized:
+            for timestamp, value in item["timed_points"]:
+                totals[timestamp] = totals.get(timestamp, 0.0) + value
+                counts[timestamp] = counts.get(timestamp, 0) + 1
+        if not all(math.isfinite(value) for value in totals.values()):
+            return schema_error(result, "跨序列资源汇总超过有限数值范围。")
+        latest_time = max(totals)
+        return {
+            **without_data(result), "latest": totals[latest_time], "maximum": max(totals.values()),
+            "units": ["bytes"], "latest_timestamp": safe_timestamp(latest_time.isoformat()),
+            "latest_series_count": counts[latest_time],
+            "stale_series_excluded": sum(item["timed_points"][-1][0] < latest_time for item in normalized),
+            "aggregation_basis": "sum_at_identical_utc_timestamps_no_carry_forward",
+        }
     if mode == "requests":
         by_status: Dict[str, float] = {}
         for item in normalized:
@@ -383,6 +494,8 @@ def metric_summary(result: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
             if status_code != "all" and not re.fullmatch(r"[1-5][0-9]{2}", status_code):
                 status_code = "unknown"
             by_status[status_code] = by_status.get(status_code, 0.0) + float(item["sum"])
+        if not all(math.isfinite(value) for value in by_status.values()) or not math.isfinite(sum(by_status.values())):
+            return schema_error(result, "请求指标汇总超过有限数值范围。")
         return {
             **without_data(result),
             "total": sum(by_status.values()),
@@ -391,6 +504,12 @@ def metric_summary(result: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
             ),
             "by_status_code": dict(sorted(by_status.items())),
         }
+    for item in normalized:
+        quantile = item["labels"].get("quantile")
+        if quantile is not None:
+            if not isinstance(quantile, str) or not re.fullmatch(r"0\.[0-9]{1,8}", quantile) or float(quantile) not in LATENCY_QUANTILES:
+                return schema_error(result, "延迟指标分位标签不在请求的固定范围。")
+            item["labels"]["quantile"] = str(float(quantile))
     return {
         **without_data(result),
         "series": [
@@ -447,6 +566,8 @@ def collect_http_latency(
                     "quantile": quantile,
                     "status": status,
                     **({"http_status": summary["http_status"]} if "http_status" in summary else {}),
+                    **({"reason": "plan_restricted", "availability": "unavailable"}
+                       if summary.get("reason") == "plan_restricted" else {}),
                 }
             )
 
@@ -480,6 +601,8 @@ def collect_http_latency(
         message="延迟指标的多分位与单分位请求均不可用。",
         query_mode="single_quantile_fallback",
         **({"http_status": representative["http_status"]} if "http_status" in representative else {}),
+        **({"reason": "plan_restricted", "availability": "unavailable"}
+           if failures and all(item.get("reason") == "plan_restricted" for item in failures) else {}),
         failed_quantiles=failures,
         no_data_quantiles=no_data_quantiles,
     )
@@ -522,20 +645,27 @@ def collect_cursor_pages(
 
 
 def parsed_timestamp(value: Any) -> Optional[datetime]:
-    if not isinstance(value, str) or len(value) > 64:
+    if not isinstance(value, str) or len(value) > 35:
         return None
+    match = TIMESTAMP_PATTERN.fullmatch(value)
+    if match is None:
+        return None
+    main, fraction, offset = match.groups()
+    if offset != "Z" and (int(offset[1:3]) > 23 or int(offset[4:6]) > 59):
+        return None
+    # Python 3.10 rejects 8/9 decimal digits. Truncate (never round across a
+    # day/window boundary) to microseconds, padding 1..5 digits for 3.10 too.
+    normalized = main + (("." + fraction[:6].ljust(6, "0")) if fraction else "")
+    normalized += "+00:00" if offset == "Z" else offset
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        return datetime.fromisoformat(normalized).astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.astimezone(timezone.utc)
 
 
 def safe_timestamp(value: Any) -> Optional[str]:
     parsed = parsed_timestamp(value)
-    return parsed.isoformat(timespec="seconds").replace("+00:00", "Z") if parsed else None
+    return parsed.isoformat().replace("+00:00", "Z") if parsed else None
 
 
 def fixed_print_request_path(labels: Dict[str, str]) -> bool:
@@ -700,12 +830,15 @@ def memory_spike_evidence(result: Dict[str, Any]) -> Dict[str, Any]:
             continue
         points: list[tuple[datetime, float]] = []
         for point in item["values"]:
-            if not isinstance(point, dict) or not isinstance(point.get("value"), (int, float)):
+            if not isinstance(point, dict) or nonnegative_finite_number(point.get("value")) is None:
                 return schema_error(result, "内存相关性数据点不是数值。")
             timestamp = parsed_timestamp(point.get("timestamp"))
             if timestamp is None:
                 return schema_error(result, "内存相关性数据点时间无法识别。")
-            points.append((timestamp, float(point["value"]) * multiplier))
+            value = float(point["value"]) * multiplier
+            if not math.isfinite(value):
+                return schema_error(result, "内存相关性数据点超过有限数值范围。")
+            points.append((timestamp, value))
         points.sort(key=lambda item: item[0])
         if points:
             usable_series += 1
@@ -718,11 +851,13 @@ def memory_spike_evidence(result: Dict[str, Any]) -> Dict[str, Any]:
         return status_result(
             "no_data",
             message="内存指标没有可用于突升判定的数据或可识别单位。",
+            evidence_complete=False,
             timestamps=[],
         )
     return status_result(
         "ok" if spike_times else "no_data",
         message=("已识别内存突升时间。" if spike_times else "目标时间段未识别到内存突升。"),
+        evidence_complete=True,
         timestamps=sorted(set(spike_times)),
     )
 
@@ -782,7 +917,7 @@ def correlate_print_activity(
                 "print_events": nearby,
             }
         )
-    memory_evidence_complete = memory_spikes.get("status") in {"ok", "no_data"}
+    memory_evidence_complete = bool(memory_spikes.get("evidence_complete", False))
     evidence_complete = (
         bool(print_activity.get("evidence_complete", False))
         and not missing_restart_times
@@ -804,7 +939,7 @@ def correlate_print_activity(
         evidence_complete=evidence_complete,
         memory_spike_status=memory_spikes.get("status"),
         memory_evidence_complete=memory_evidence_complete,
-        memory_spike_count=len(memory_spikes.get("timestamps", [])),
+        memory_spike_count=len(memory_spikes.get("timestamps", [])) if memory_evidence_complete else None,
         abnormal_restart_count=len(restart_times),
         missing_restart_timestamps=missing_restart_times,
         correlated_window_count=sum(window["print_event_count"] > 0 for window in windows),
@@ -915,9 +1050,9 @@ def app_summary(result: Dict[str, Any], *, daily: bool = False) -> Dict[str, Any
     if not isinstance(data, dict):
         return schema_error(result, "应用接口响应结构发生变化。")
     if not daily:
-        if "ok" not in data or "database" not in data:
+        if type(data.get("ok")) is not bool or type(data.get("database")) is not bool:
             return schema_error(result, "健康检查响应缺少固定字段。")
-        return {**without_data(result), "result": {"ok": bool(data["ok"]), "database": bool(data["database"])}}
+        return {**without_data(result), "result": {"ok": data["ok"], "database": data["database"]}}
     if audit_payload_is_private(data):
         return schema_error(result, "日报响应出现不允许的敏感字段，已停止转发。")
     allowed = (
@@ -939,18 +1074,35 @@ def connection_sample(result: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]],
     storage = data.get("storage")
     connections = storage.get("connections") if isinstance(storage, dict) else None
     expected = {"opened_total", "closed_total", "active", "peak_active"}
+    normalized_time = safe_timestamp(sampled_at)
     if (
-        not isinstance(sampled_at, str)
+        normalized_time is None
         or not isinstance(connections, dict)
         or set(connections) != expected
-        or not all(isinstance(connections[key], int) and connections[key] >= 0 for key in expected)
+        or not all(type(connections[key]) is int and 0 <= connections[key] <= 2**63 - 1 for key in expected)
+        or connections.get("peak_active", 0) < connections.get("active", 0)
     ):
         return None, schema_error(result, "连接诊断响应缺少固定计数或时间字段。")
-    try:
-        datetime.fromisoformat(sampled_at.replace("Z", "+00:00"))
-    except ValueError:
-        return None, schema_error(result, "连接诊断采样时间无法识别。")
-    sample = {"sampled_at": sampled_at, **{key: int(connections[key]) for key in sorted(expected)}}
+    sample = {"sampled_at": normalized_time, **{key: int(connections[key]) for key in sorted(expected)}}
+    limits = storage.get("connection_limits")
+    if limits is not None:
+        if (
+            not isinstance(limits, dict)
+            or set(limits) not in (
+                {"request_workers", "background_connections", "peak_active_upper_bound"},
+                {"request_workers", "background_connections", "transient_background_connections", "peak_active_upper_bound"},
+            )
+            or not all(type(value) is int for value in limits.values())
+            or not 2 <= limits["request_workers"] <= 16
+            or not 0 <= limits["background_connections"] <= 2
+            or not 0 <= limits.get("transient_background_connections", 0) <= 2
+            or limits["peak_active_upper_bound"] != (
+                limits["request_workers"] + limits["background_connections"]
+                + limits.get("transient_background_connections", 0)
+            )
+        ):
+            return None, schema_error(result, "连接诊断容量基线不符合已审查的服务端范围。")
+        sample["connection_limits"] = dict(limits)
     sample["conserved"] = sample["opened_total"] - sample["closed_total"] == sample["active"]
     return sample, without_data(result)
 
@@ -1000,6 +1152,11 @@ def collect_connection_samples(
         )
 
     first_sample, second_sample = samples
+    limits_changed = first_sample.get("connection_limits") != second_sample.get("connection_limits")
+    peak_bounds = [
+        sample.get("connection_limits", {}).get("peak_active_upper_bound", EXPECTED_CONNECTION_PEAK_UPPER_BOUND)
+        for sample in samples
+    ]
     counter_reset = any(
         second_sample[key] < first_sample[key]
         for key in ("opened_total", "closed_total", "peak_active")
@@ -1007,13 +1164,16 @@ def collect_connection_samples(
     peak_change = second_sample["peak_active"] - first_sample["peak_active"]
     peak_abnormal = (
         counter_reset
-        or max(first_sample["peak_active"], second_sample["peak_active"])
-        > EXPECTED_CONNECTION_PEAK_UPPER_BOUND
+        or any(sample["peak_active"] > bound for sample, bound in zip(samples, peak_bounds))
     )
     return status_result(
         "ok",
-        message="连接诊断已完成至少 30 秒间隔的双采样。",
-        completeness="complete",
+        message=(
+            "连接诊断已完成至少 30 秒间隔的双采样。"
+            if not counter_reset and not limits_changed
+            else "连接双采样期间累计计数或容量基线变化，不能判定连接是否回落。"
+        ),
+        completeness="partial" if counter_reset or limits_changed else "complete",
         sample_count=2,
         required_interval_seconds=CONNECTION_SAMPLE_INTERVAL_SECONDS,
         measured_interval_seconds=round(measured_interval, 3),
@@ -1021,16 +1181,104 @@ def collect_connection_samples(
         samples=samples,
         all_samples_conserved=all(bool(sample["conserved"]) for sample in samples),
         active_recovered=(
-            None if counter_reset else second_sample["active"] <= first_sample["active"]
+            None if counter_reset or limits_changed else second_sample["active"] <= first_sample["active"]
         ),
         active_change=(
-            None if counter_reset else second_sample["active"] - first_sample["active"]
+            None if counter_reset or limits_changed else second_sample["active"] - first_sample["active"]
         ),
         counter_reset_between_samples=counter_reset,
         peak_active_change=peak_change,
         peak_active_abnormal=peak_abnormal,
-        expected_peak_active_upper_bound=EXPECTED_CONNECTION_PEAK_UPPER_BOUND,
+        expected_peak_active_upper_bound=None if limits_changed else peak_bounds[1],
+        connection_limits_changed_between_samples=limits_changed,
+        connection_limit_source=(
+            "server_reviewed_bounds" if second_sample.get("connection_limits") else "legacy_fixed_baseline"
+        ),
     )
+
+
+def report_assessments(sections: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Keep availability, observed incidents and collection completeness independent."""
+    health = sections.get("health", {})
+    healthy_result = health.get("result", {})
+    availability = "unknown"
+    if health.get("status") == "ok":
+        availability = (
+            "available" if healthy_result.get("ok") is True and healthy_result.get("database") is True
+            else "unavailable"
+        )
+    observations: list[str] = []
+    limitations: list[str] = []
+    if availability == "unavailable":
+        observations.append("health_check_failed")
+    logs = sections.get("render_logs", {})
+    # A bounded but incomplete page set may already contain positive evidence.
+    # Missing coverage must not erase observed OOM/5xx events.
+    if isinstance(logs.get("categories"), dict):
+        for category in ("oom", "exception_stack", "database_locked", "timeout"):
+            if logs.get("categories", {}).get(category, 0) > 0:
+                observations.append(f"log_{category}_observed")
+    requests = sections.get("http_requests", {})
+    if requests.get("http_5xx", 0) > 0:
+        observations.append("http_5xx_observed")
+    events = sections.get("render_events", {})
+    if events.get("restarts", 0) > 0:
+        observations.append("restart_or_service_failure_observed")
+    connections = sections.get("connection_diagnostics", {})
+    if connections.get("all_samples_conserved") is False:
+        observations.append("connection_counts_not_conserved")
+    if connections.get("active_recovered") is False:
+        observations.append("connection_active_not_recovered_in_sample_window")
+    if connections.get("peak_active_abnormal") and not connections.get("counter_reset_between_samples"):
+        if connections.get("connection_limit_source") == "server_reviewed_bounds":
+            observations.append("connection_peak_above_reviewed_bound")
+        else:
+            limitations.append("legacy_connection_capacity_requires_verification")
+
+    gaps: list[Dict[str, str]] = []
+    available_channels: list[str] = []
+    valid_empty_channels = {"render_deploys", "render_events", "render_logs", "print_risk_correlation"}
+    for name, section in sections.items():
+        status = section.get("status", "process_error")
+        if status not in {"ok", "no_data"}:
+            gap = {"channel": name, "status": status, "reason": "collection_failed"}
+            if section.get("reason") == "plan_restricted":
+                gap["reason"] = "plan_restricted"
+        elif (
+            section.get("coverage") == "partial"
+            or section.get("completeness") in {"partial", "unavailable"}
+            or section.get("evidence_complete") is False
+            or section.get("pagination_complete") is False
+        ):
+            gap = {"channel": name, "status": status, "reason": "partial_evidence"}
+        elif name == "connection_diagnostics" and limitations:
+            gap = {"channel": name, "status": status, "reason": "legacy_connection_capacity_requires_verification"}
+        elif status == "no_data" and name not in valid_empty_channels:
+            gap = {"channel": name, "status": status, "reason": "no_metric_data"}
+        else:
+            available_channels.append(name)
+            continue
+        gaps.append(gap)
+    assessment = (
+        "issues_observed" if observations else
+        "no_issues_observed_in_available_evidence" if availability == "available" else "unknown"
+    )
+    return {
+        "website_health": {
+            "availability": availability,
+            "availability_scope": "collection_time_health_check_only",
+            "assessment": assessment,
+            "observations": observations,
+            "limitations": limitations,
+            "message": "网站可访问性、已观察到的问题与采集完整性分别判断；未采到的证据不能证明正常。",
+        },
+        "evidence_completeness": {
+            "status": "complete" if not gaps else "partial" if available_channels else "unavailable",
+            "available_channels": available_channels,
+            "gaps": gaps,
+            "message": "采集失败或套餐限制不等同于网站故障；缺失指标没有补零。",
+        },
+    }
 
 
 def collect_report(
@@ -1272,14 +1520,17 @@ def collect_report(
         http_latency = dict(blocked)
         print_correlation = dict(blocked)
 
-    sections = [
-        health, daily, connection_diagnostics, render_service, deploys, events, logs, memory, memory_limit,
-        disk_usage, disk_capacity, http_requests, http_latency, print_correlation,
-    ]
+    sections = {
+        "health": health, "daily_audit": daily, "connection_diagnostics": connection_diagnostics,
+        "render_service": render_service, "render_deploys": deploys, "render_events": events,
+        "render_logs": logs, "memory_usage": memory, "memory_limit": memory_limit,
+        "disk_usage": disk_usage, "disk_capacity": disk_capacity, "http_requests": http_requests,
+        "http_latency": http_latency, "print_risk_correlation": print_correlation,
+    }
     hard_failures = {"http_error", "permission_denied", "schema_changed", "process_error", "network_restricted", "target_mismatch"}
-    if any(section.get("status") in hard_failures for section in sections):
+    if any(section.get("status") in hard_failures for section in sections.values()):
         overall_status = "error"
-    elif any(section.get("status") == "no_data" for section in sections):
+    elif any(section.get("status") == "no_data" for section in sections.values()):
         overall_status = "partial"
     else:
         overall_status = "ok"
@@ -1288,6 +1539,7 @@ def collect_report(
         "target_date": date_text,
         "target": {"service_id": RENDER_SERVICE_ID, "service_name": RENDER_SERVICE_NAME},
         "overall_status": overall_status,
+        **report_assessments(sections),
         "health": health,
         "daily_audit": daily,
         "connection_diagnostics": connection_diagnostics,
@@ -1342,6 +1594,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 error_type=type(exc).__name__,
             ),
         }
+    if "website_health" not in report:
+        report.update(report_assessments({"collector": report["collector"]}))
     print(json.dumps(report, ensure_ascii=False, separators=(",", ":")), flush=True)
     return 0 if report.get("overall_status") in {"ok", "partial"} else 2
 

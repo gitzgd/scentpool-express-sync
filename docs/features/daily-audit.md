@@ -5,6 +5,8 @@
 - 最小诊断接口：`GET /api/admin/system/audit-diagnostics`
 - 时区：`Asia/Shanghai`
 
+2026-10-02 开发扩展：高精度时间、套餐限制分类、网站可访问性与证据完整性分离，以及受控连接容量基线已补充合成测试。此处描述仓库能力，不代表已部署或已更新本机固定副本。
+
 ## 目标
 
 为“每日盘点｜业务数据与网站运维”任务提供稳定、最小化、只读的业务汇总。调用方不需要总部 Cookie，也不能借日报凭据查看个人信息、订单详情、数据库诊断或执行写操作。
@@ -54,15 +56,18 @@
 
 ## 连接双采样
 
-最小诊断接口复用日报 Bearer 鉴权，但不复用普通总部管理员接口。它不接受查询参数，也不打开 SQLite，只读取 `Database` 已有的进程内连接计数，响应固定为：
+最小诊断接口复用日报 Bearer 鉴权，但不复用普通总部管理员接口。它不接受查询参数，也不打开 SQLite，只读取进程内连接计数与固定容量配置，响应包含：
 
 - `sampled_at`：服务端采样时间。
 - `storage.connections.opened_total`：进程启动后累计打开数。
 - `storage.connections.closed_total`：进程启动后累计关闭数。
 - `storage.connections.active`：当前活动数。
 - `storage.connections.peak_active`：进程内峰值活动数。
+- `storage.connection_limits`：可选受控容量基线，包含 `request_workers`、`background_connections`、`transient_background_connections` 与 `peak_active_upper_bound`。其中后台持久连接与瞬时连接分别计数，峰值必须等于三者之和。新版本默认是 8 个请求线程、2 条后台持久连接、至多 2 条后台瞬时连接，允许峰值 12；空闲时的后台持久连接为 2，不代表泄漏。
 
-固定采集器两次调用间隔至少 30 秒。每次独立判断 `opened_total - closed_total == active`；两次都有效时再判断 `active` 是否回落、峰值变化、固定生产基线 9 是否被突破，以及累计计数是否因实例重启而重置。一次失败/超时只返回部分证据，两次失败返回不可用；不会用缺失样本补 0，也不会访问 `/api/admin/system/diagnostics`。
+固定采集器两次调用间隔至少 30 秒。每次独立判断 `opened_total - closed_total == active`；两次都有效时再判断 `active` 是否回落、峰值变化、受控容量基线是否被突破，以及累计计数是否因实例重启而重置。连接计数必须是非负整数，不能使用布尔值，峰值不能小于活动数。容量只接受已审查范围：请求线程 2–16、持久后台 0–2、瞬时后台 0–2，并检查合计；不接受任意上限。旧版缺少瞬时字段时按 0，完全缺少容量字段时保留基线 9 并标为 `legacy_fixed_baseline`；仅超过旧基线不能直接推断泄漏，而是要求核实容量。
+
+一次失败/超时只返回部分证据，两次失败返回不可用；采样之间发生计数重置或容量基线变化时也明确返回部分证据，`active_recovered` 为 `null`。不会用缺失样本补 0，不会放宽守恒检查，也不会访问 `/api/admin/system/diagnostics`。总部运行指标不因此向日报令牌扩权。
 
 ## 打印时间证据与相关性
 
@@ -72,11 +77,28 @@
 
 相关性是时间接近证据，不表示打印导致内存或重启。没有打印、没有风险信号、内存单位未知、日志时间缺失或边界通道失败时，结果保留 `no_data`、`schema_changed` 或 `evidence_complete=false`，不能表述为“打印无影响”。
 
+时间解析接受严格的、带时区的日期时间格式：`YYYY-MM-DDTHH:MM:SS[.1到9位小数](Z|±HH:MM)`。小数秒截断到微秒而不是四舍五入，因此 `23:59:59.999999999` 不会被移到次日；先按原偏移解析再统一到 UTC。该处理兼容本机 Python 3.10，不依赖新版 Python 自动接纳纳秒。无时区、非法日期/时分秒/偏移、超长值和非时间内容都拒绝。内存证据缺失时突升数量为 `null`，不是 0。
+
 ## Render HTTP latency 兼容
 
 2026-08-29 核对 Render 官方 API Reference 与 OpenAPI：`GET /v1/metrics/http-latency` 接受重复的浮点 `quantile`，响应正式契约为时间序列数组。官方 API 没有把 `0.90` 列为非法，因此既有 HTTP 400 不能归因于某个分位值；套餐能力、组合参数或服务端校验仍需由通道状态表达，不能猜测。
 
 采集器现在先请求 `0.50`、`0.90`、`0.99` 多分位；仅在 HTTP 400 时逐个请求三个分位。成功的单分位不会被其他分位失败覆盖，而是返回 `status=ok`、`coverage=partial` 与失败分位列表。全部无数据返回 `no_data`，全部 HTTP 失败返回 `http_error`，无法识别的结构返回 `schema_changed`。解析仅接受官方数组以及受控的 `data`、`series` 或 `data.series` 包装；标签仍只转发 `quantile`，从不把缺失延迟写成 0。
+
+明确的套餐限制是以上降级规则的例外：仅对固定 Render `http-latency` 路径的 HTTP 400/403，读取最多 2049 字节并只接受不超过 2048 字节的小型 JSON。仅单个 `message`、`error` 或 `detail` 字段中的完整固定句式，例如 `query is not allowed for plan: Hobby`，或明确声明响应延迟仅限 Pro 套餐的固定句式，才能映射成 `status=permission_denied`、`availability=unavailable`、`reason=plan_restricted`，保留真实 `http_status`。不输出错误原文，不仅凭 `plan`/`Hobby` 关键词猜测，不把其他 400 分类成套餐限制。已确认套餐不提供该指标时不重复请求三个分位，也不自动升级套餐。官方能力说明见 [Render response latency](https://render.com/docs/service-metrics#response-latency)；参数说明见 [HTTP latency API](https://api-docs.render.com/reference/get-http-latency)。
+
+所有成功 JSON 响应最多读取 8 MiB 加 1 字节，超限返回固定 `response_too_large` 错误，不解析或转发响应正文；错误正文同样只在内存中分类。
+
+资源时间序列（内存、内存上限、磁盘使用与容量）先严格解析 UTC 时间、将明确的 bytes/KB/KiB/MB/MiB/GB/GiB 等单位换算成字节，再按**相同时间戳**求和。`latest` 只合计最后采样时刻实际有点的序列，不把旧实例较早的最后值带到新实例；`maximum` 是各对齐时刻的总量最大值，不再是单序列最大值。另返回 `latest_timestamp`、`latest_series_count`、`stale_series_excluded` 和固定 `aggregation_basis`，不返回实例标签。该口径与旧版不能直接横比。未知单位、同序列重复时间、布尔值、NaN/Infinity、负数、数值溢出都返回明确结构错误，不作零值或容量推断。
+
+## 网站状态与采集完整性分别报告
+
+为保持旧调用方兼容，顶层 `overall_status` 及退出码语义不变：套餐限制仍使总采集结果为 `error`，不会改为 `ok`。新增两项独立说明：
+
+- `website_health`：`availability` 只描述采集当时健康端点的可访问/健康结果（`available`、`unavailable`、`unknown`），不是目标日全天可用性；`assessment` 与固定 `observations` 列表另外报告已经观察到的 OOM、异常、锁、超时、5xx、重启或连接异常。采集失败时不推断网站宕机；证据不完整时也不能抹去已经采到的正向故障证据。
+- `evidence_completeness`：列出可用通道、缺失通道及固定原因（例如 `plan_restricted`、`partial_evidence`、`no_metric_data`）。失败、缺失、部分分位和采样重置保持可见，不能补零或声称“延迟正常”。
+
+健康字段必须为 JSON 布尔值；字符串 `"false"` 等异常结构不能被当作健康。本机休眠时采集器仍无法运行；此更新不迁移云端、不承诺休眠期间已经完成巡检，也不改变自动化的运行位置。
 
 ## 指标口径与历史限制
 
@@ -159,6 +181,8 @@
 - 最小连接端点的令牌/总部会话双向隔离、非 GET、额外参数、字段白名单和递归隐私扫描。
 
 采集器专项测试 `python3 daily_audit_probe_test.py` 另覆盖：连接守恒与不守恒、30 秒间隔、一次失败/超时、活动不回落、峰值异常、计数重置/诊断不可用；打印成功/失败/慢请求、无打印、时间不足、内存突升与异常重启 ±10 分钟、跨上海午夜、恶意日志和长字段；latency 多分位、单分位降级、HTTP 400、部分成功、套餐无数据、多个受控 Schema 和未知 Schema；分页游标缺失/不前进及单通道失败。
+
+2026-10-02 新增系统 Python 3.10 与工作区运行时双版本回归：1–9 位小数秒、正负时区、上海午夜不进位、非法/超长时间、超长数字日志；已确认套餐限制不重复降级、未知错误不猜测、HTTP 状态保留、错误原文不泄漏、响应大小上限；部分证据不掩盖已观察故障，采集失败不等于网站不可用；旧容量基线兼容、新后台持久/瞬时容量校验、超额峰值、容量变更与计数重置；新旧实例不同时刻不叠加、同刻实例汇总、乱序时间、混合已知单位、有限数值与标签脱敏。
 
 仍需同时运行项目规定的 Python 编译、前端语法检查和完整 `smoke_test.py`。
 
