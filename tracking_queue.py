@@ -11,6 +11,7 @@ MAX_ACTIVE = 5000
 COOLDOWN = 30 * 60
 LEASE_SECONDS = 180
 MAX_ATTEMPTS = 3
+MANUAL_BURST = 3
 TABLES = {"shipment": "shipments", "return": "return_orders"}
 
 
@@ -90,6 +91,13 @@ def migrate(conn):
             PRIMARY KEY(store_id,request_key)
         );
     """)
+    # Persist fairness across worker/process restarts without rewriting any
+    # business rows, queued work, cooldowns or the provider circuit.
+    gate_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tracking_provider_gate)")}
+    for kind in TABLES:
+        column = f"manual_streak_{kind}"
+        if column not in gate_columns:
+            conn.execute(f"ALTER TABLE tracking_provider_gate ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
     # Created only after legacy migrations. Installation does not queue/change historical business rows.
     for kind, table in TABLES.items():
         identity = ["tracking_no", "phone", "express_company", "booking_request_id", "status"] if kind == "shipment" else ["tracking_no", "sender_phone", "status"]
@@ -134,6 +142,8 @@ class TrackingQueue:
     def enqueue(self, conn, kind, row, origin, now):
         previous = conn.execute("SELECT * FROM tracking_jobs WHERE kind=? AND record_id=? AND revision=? AND state IN ('queued','running')", (kind,row["id"],row["tracking_revision"])).fetchone()
         if previous:
+            if origin == "manual" and previous["state"] == "queued":
+                conn.execute("UPDATE tracking_jobs SET origin='manual' WHERE id=?", (previous["id"],))
             return int(previous["id"])
         if conn.execute("SELECT COUNT(*) FROM tracking_jobs WHERE state IN ('queued','running')").fetchone()[0] >= MAX_ACTIVE:
             from database import AppError
@@ -145,6 +155,14 @@ class TrackingQueue:
         due = max(due, float(checked or 0)+COOLDOWN)
         cur = conn.execute("INSERT INTO tracking_jobs(kind,record_id,revision,origin,created_at,due_at) VALUES(?,?,?,?,?,?)", (kind,row["id"],row["tracking_revision"],origin,now,due))
         return int(cur.lastrowid)
+
+    @staticmethod
+    def promote_task(conn, task_id):
+        # Only queued jobs change priority. Identity, due time, attempts and
+        # provider leases remain untouched, including after a lost response.
+        conn.execute("""UPDATE tracking_jobs SET origin='manual'
+            WHERE state='queued' AND id IN (
+                SELECT job_id FROM tracking_task_jobs WHERE task_id=?)""", (task_id,))
 
     def request(self, user, kind, record_id=None, request_key="", *, subscribe=False):
         from database import AppError
@@ -163,10 +181,14 @@ class TrackingQueue:
                 if old:
                     if old["payload_hash"] != fingerprint:
                         raise AppError("提交内容与上次不同，请先确认原任务结果。",409)
+                    if not subscribe:
+                        self.promote_task(conn, old["id"])
                     return self.task_with_connection(conn,old["id"],user)
             # Repeated clicks without a client key reuse the active same-scope task.
             old=conn.execute("SELECT t.id FROM tracking_tasks t WHERE created_by=? AND payload_hash=? AND EXISTS(SELECT 1 FROM tracking_task_jobs x JOIN tracking_jobs j ON j.id=x.job_id WHERE x.task_id=t.id AND j.state IN ('queued','running')) ORDER BY created_at DESC LIMIT 1",(user["id"],fingerprint)).fetchone()
             if old:
+                if not subscribe:
+                    self.promote_task(conn, old["id"])
                 return self.task_with_connection(conn,old["id"],user)
             params=[]
             where=self.eligible(kind)
@@ -244,7 +266,15 @@ class TrackingQueue:
             if max(gate["next_allowed_at"],gate["pause_until"],gate["lease_until"])>now:
                 conn.commit(); return None
             preferred="return" if gate["last_kind"]=="shipment" else "shipment"
-            job=conn.execute("SELECT * FROM tracking_jobs WHERE state='queued' AND due_at<=? ORDER BY CASE WHEN kind=? THEN 0 ELSE 1 END,created_at,id LIMIT 1",(now,preferred)).fetchone()
+            # Alternate business kinds first. Within each kind, admit at most
+            # MANUAL_BURST manual jobs before an already-due background job.
+            # When the preferred class is empty, the other class stays live.
+            job=conn.execute("""SELECT * FROM tracking_jobs WHERE state='queued' AND due_at<=?
+                ORDER BY CASE WHEN kind=? THEN 0 ELSE 1 END,
+                    CASE WHEN (origin='manual') = (CASE kind WHEN 'shipment' THEN ? ELSE ? END < ?)
+                        THEN 0 ELSE 1 END,
+                    created_at,id LIMIT 1""",
+                (now,preferred,gate["manual_streak_shipment"],gate["manual_streak_return"],MANUAL_BURST)).fetchone()
             if not job:
                 conn.commit(); return None
             row=conn.execute(f"SELECT * FROM {TABLES[job['kind']]} WHERE id=? AND tracking_revision=? AND {self.eligible(job['kind'])}",(job["record_id"],job["revision"])).fetchone()
@@ -260,7 +290,9 @@ class TrackingQueue:
                 conn.commit(); return None
             token=secrets.token_hex(16)
             conn.execute("UPDATE tracking_jobs SET state='running',attempt_count=attempt_count+1,started_at=?,lease_until=?,lease_token=? WHERE id=?",(now,now+LEASE_SECONDS,token,job["id"]))
-            conn.execute("UPDATE tracking_provider_gate SET next_allowed_at=?,lease_until=?,lease_token=?,last_kind=? WHERE id=1",(now+1,now+LEASE_SECONDS,token,job["kind"]))
+            streak_column = f"manual_streak_{job['kind']}"
+            streak = min(MANUAL_BURST, gate[streak_column] + 1) if job["origin"] == "manual" else 0
+            conn.execute(f"UPDATE tracking_provider_gate SET next_allowed_at=?,lease_until=?,lease_token=?,last_kind=?,{streak_column}=? WHERE id=1",(now+1,now+LEASE_SECONDS,token,job["kind"],streak))
             conn.commit()
             return {**dict(job),"lease_token":token,"attempt_count":job["attempt_count"]+1,"started_at":now,"row":dict(row)}
         except Exception:

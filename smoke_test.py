@@ -30,6 +30,7 @@ import daily_audit_test
 import shipment_time_integrity_test
 import special_shipments_test
 import reliability_test
+import tracking_priority_test
 import reliability_http_test
 import bounded_exports_test
 import http_limits_test
@@ -1852,6 +1853,7 @@ def main() -> None:
         daily_audit_probe_test.main()
         special_shipments_test.main()
         reliability_test.run()
+        tracking_priority_test.run()
         reliability_http_test.run()
         bounded_exports_test.run()
         http_limits_test.main()
