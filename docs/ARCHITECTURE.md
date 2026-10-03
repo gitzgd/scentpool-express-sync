@@ -80,6 +80,12 @@ server.py
 - 电子面单货品摘要、备注和自定义区生成。
 - 回调签名校验与公开配置状态。
 
+### `fulfillment_profiles.py`
+
+- 两套发货方案独立于订单门店归属；固定中台中通、版纳圆通配对，复用菜鸟授权。
+- 方案版本、授权账号绑定、网点验证及私有配置快照；创建批次事务锁定寄件/网点/模板/授权，Worker 与重试不再读可变的当前设置。
+- 旧版活动任务缺少快照时禁止配置切换；历史失败项缺少证据时拒绝盲目重新取号。见 [发货方案](features/fulfillment-profiles.md)。
+
 ### `label_pdf.py`
 
 - 验证可信面单地址。
@@ -117,6 +123,7 @@ server.py
 - `shipments` / `shipment_items`：发货单和商品快照。
 - `return_orders` / `return_items`：退货单和商品快照。
 - `shipping_settings`：寄件信息、授权和承运商配置。
+- `fulfillment_profiles`：版本化发货方案；批次项 `settings_snapshot_json` 为不公开的不可变配置快照。
 - `shipping_batches` / `shipping_batch_items`：批量下单队列和结果。
 - `shipping_callback_events`：打印等回调事件审计。
 - `label_auth_sessions`：电子面单授权会话。

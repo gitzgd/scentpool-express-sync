@@ -22,7 +22,7 @@ from shipment_types import SHIPMENT_TYPES, SPECIAL_TYPES, GROUP_LABELS, type_inf
 DEFAULT_PRODUCT_FILE = "/Users/zgd/Downloads/万物香铺 商品资料 .xlsx"
 STATUSES = ("待处理", "已发货", "已签收", "异常", "已取消")
 RETURN_STATUSES = ("待查询", "运输中", "已签收", "异常", "已取消")
-EXPRESS_COMPANIES = ("圆通", "京东", "顺丰")
+EXPRESS_COMPANIES = ("圆通", "京东", "顺丰", "中通")
 DEFAULT_EXPRESS_COMPANY = "圆通"
 DEFAULT_CAINIAO_TEMPLATE_URLS = {
     "圆通": "https://cloudprint.cainiao.com/template/standard/850338",
@@ -553,6 +553,8 @@ class Database:
         from tracking_queue import migrate as migrate_tracking_queue
         with self.connect() as conn:
             migrate_tracking_queue(conn)
+            from fulfillment_profiles import migrate
+            migrate(conn)
 
         if self.count_products() == 0 and os.path.exists(product_file):
             self.import_products(product_file)
@@ -3563,9 +3565,12 @@ class Database:
             },
         }
 
-    def get_shipping_settings(self, *, public: bool = False) -> Dict[str, Any]:
-        with self.connect() as conn:
+    def get_shipping_settings(self, *, public: bool = False, connection=None) -> Dict[str, Any]:
+        from contextlib import nullcontext
+        from fulfillment_profiles import profiles, public_profile
+        with (nullcontext(connection) if connection is not None else self.connect()) as conn:
             row = conn.execute("SELECT * FROM shipping_settings WHERE id = 1").fetchone()
+            profile_list = [public_profile(p) for p in profiles(conn)]
         settings = dict(row) if row else {
             "id": 1,
             "sender_name": "",
@@ -3599,6 +3604,7 @@ class Database:
         except json.JSONDecodeError:
             settings["branch_options"] = []
         settings["partner_authorized"] = bool(settings.get("partner_id") and settings.get("partner_key"))
+        settings["fulfillment_profiles"] = profile_list
         if public:
             settings["partner_id_masked"] = self._mask_value(settings.get("partner_id"))
             settings["partner_key_masked"] = self._mask_value(settings.get("partner_key"))
@@ -3668,6 +3674,9 @@ class Database:
             }
         now = now_text()
         with self.connect() as conn:
+            from fulfillment_profiles import guard_legacy_jobs
+            conn.execute("BEGIN IMMEDIATE")
+            guard_legacy_jobs(conn)
             conn.execute(
                 """
                 INSERT INTO shipping_settings (
@@ -3701,6 +3710,16 @@ class Database:
                     json.dumps(normalized_carriers, ensure_ascii=False), now,
                 ),
             )
+        return self.get_shipping_settings(public=True)
+
+    def save_fulfillment_profile(self, user, payload):
+        from fulfillment_profiles import save, guard_legacy_jobs
+        if user.get("role") != "admin":
+            raise AppError("只有总部可以修改发货方案。", 403)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            guard_legacy_jobs(conn)
+            save(conn, self.get_shipping_settings(connection=conn), payload)
         return self.get_shipping_settings(public=True)
 
     def shipping_settings_for_company(self, company: str) -> Dict[str, Any]:
@@ -3751,6 +3770,9 @@ class Database:
     def save_label_authorization(self, credentials: Dict[str, Any]) -> Dict[str, Any]:
         now = now_text()
         with self.connect() as conn:
+            from fulfillment_profiles import guard_legacy_jobs
+            conn.execute("BEGIN IMMEDIATE")
+            guard_legacy_jobs(conn)
             conn.execute(
                 """
                 UPDATE shipping_settings
@@ -3768,10 +3790,8 @@ class Database:
         return self.get_shipping_settings(public=True)
 
     def save_label_branches(self, branches: List[Dict[str, Any]]) -> Dict[str, Any]:
-        settings = self.get_shipping_settings()
-        carriers = settings.get("carrier_settings", {})
         options: List[Dict[str, Any]] = []
-        code_to_company = {"yuantong": "圆通", "jd": "京东", "shunfeng": "顺丰"}
+        code_to_company = {"yuantong": "圆通", "jd": "京东", "shunfeng": "顺丰", "zhongtong": "中通"}
         for entry in branches:
             company = code_to_company.get(str(entry.get("kuaidicom") or ""))
             if not company:
@@ -3782,16 +3802,23 @@ class Database:
                     "company": company,
                     "tbNet": str(branch.get("tbNet") or ""),
                     "branchName": str(branch.get("branchName") or ""),
+                    "branchCode": str(branch.get("branchCode") or ""),
                     "quantity": int(branch.get("quantity") or 0),
                 }
                 options.append(option)
                 company_options.append(option)
-            current = carriers.get(company) if isinstance(carriers.get(company), dict) else {}
-            if company_options and not current.get("tbNet"):
-                current["tbNet"] = company_options[0]["tbNet"]
-            current.setdefault("expType", "顺丰标快" if company == "顺丰" else "标准快递")
-            carriers[company] = current
         with self.connect() as conn:
+            from fulfillment_profiles import guard_legacy_jobs
+            conn.execute("BEGIN IMMEDIATE")
+            guard_legacy_jobs(conn)
+            carriers = self.get_shipping_settings(connection=conn).get("carrier_settings", {})
+            for company in EXPRESS_COMPANIES:
+                company_options = [o for o in options if o["company"] == company]
+                current = carriers.get(company) if isinstance(carriers.get(company), dict) else {}
+                if company_options and not current.get("tbNet"):
+                    current["tbNet"] = company_options[0]["tbNet"]
+                current.setdefault("expType", "顺丰标快" if company == "顺丰" else "标准快递")
+                carriers[company] = current
             conn.execute(
                 "UPDATE shipping_settings SET carrier_settings_json = ?, branch_options_json = ?, updated_at = ? WHERE id = 1",
                 (json.dumps(carriers, ensure_ascii=False), json.dumps(options, ensure_ascii=False), now_text()),
@@ -3816,30 +3843,47 @@ class Database:
             FROM shipments LEFT JOIN return_orders r ON r.id=shipments.related_return_id AND r.store_id=shipments.store_id""" +
             (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY shipments.created_at DESC,shipments.id DESC", params)
 
-    def _preview_fingerprint(self, conn, user, filters):
+    def _preview_seed(self, conn, profile_id):
+        from fulfillment_profiles import encoded, profiles
+        settings = dict(conn.execute("SELECT * FROM shipping_settings WHERE id=1").fetchone())
+        return encoded([settings, profiles(conn), profile_id]).encode()
+
+    def _preview_fingerprint(self, conn, user, filters, profile_id=None):
         digest=hashlib.sha256()
-        default=conn.execute("SELECT default_company FROM shipping_settings WHERE id=1").fetchone()
-        digest.update(str(default[0] if default else DEFAULT_EXPRESS_COMPANY).encode())
+        digest.update(self._preview_seed(conn, profile_id))
         for row in self._preview_rows(conn,user,filters):
             digest.update(json.dumps(list(row),ensure_ascii=False,separators=(",", ":")).encode())
         return digest.hexdigest()
 
-    def preview_shipping_batch(self, user: Dict[str, Any], filters: Dict[str, Any], *, page=1, page_size=50) -> Dict[str, Any]:
-        settings = self.get_shipping_settings()
-        default_company = settings.get("default_company") or DEFAULT_EXPRESS_COMPANY
+    def preview_shipping_batch(self, user: Dict[str, Any], filters: Dict[str, Any], *, page=1, page_size=50, profile_id=None) -> Dict[str, Any]:
+        from fulfillment_profiles import selected, public_profile, ensure_branch
+        if user.get("role") != "admin":
+            raise AppError("只有总部可以预览打单。", 403)
         eligible = []
         excluded = []
         company_counts = {company: 0 for company in EXPRESS_COMPANIES}
         counts = category_counts([])
         eligible_count = excluded_count = matched = 0
         digest=hashlib.sha256(); offset=(page-1)*page_size
-        digest.update(str(settings.get("default_company") or DEFAULT_EXPRESS_COMPANY).encode())
         with self.connect() as conn:
+            conn.execute("BEGIN")
+            settings = self.get_shipping_settings(connection=conn)
+            profile = selected(conn, settings, profile_id)
+            profile_error = ""
+            if profile:
+                try:
+                    option = ensure_branch(settings, profile)
+                    if int(option.get("quantity") or 0) <= 0:
+                        profile_error = "所选网点的已知面单余额为零，请刷新余额或充值后再下单。"
+                except AppError as exc:
+                    profile_error = exc.message
+            default_company = settings.get("default_company") or DEFAULT_EXPRESS_COMPANY
+            digest.update(self._preview_seed(conn, profile_id))
             for raw in self._preview_rows(conn,user,filters):
                 digest.update(json.dumps(list(raw),ensure_ascii=False,separators=(",", ":")).encode())
                 shipment=dict(raw); matched+=1
                 if self.shipment_booking_eligible(shipment):
-                    company=shipment["express_company"] if shipment["express_company"] in EXPRESS_COMPANIES else default_company
+                    company=profile["express_company"] if profile else (shipment["express_company"] if shipment["express_company"] in EXPRESS_COMPANIES else default_company)
                     company_counts[company]+=1; counts[shipment["shipment_type"]]+=1
                     if offset<=eligible_count<offset+page_size:
                         eligible.append({**shipment,**type_info(shipment["shipment_type"]),"express_company":company})
@@ -3859,7 +3903,9 @@ class Database:
                 "total_pages":max(1,(max(eligible_count,excluded_count)+page_size-1)//page_size),
                 "eligible_pages":max(1,(eligible_count+page_size-1)//page_size),
                 "excluded_pages":max(1,(excluded_count+page_size-1)//page_size)},
-            "settings_ready": bool(settings.get("sender_name") and settings.get("sender_mobile") and settings.get("sender_address")),
+            "profile": public_profile(profile) if profile else None,
+            "profile_error": profile_error,
+            "settings_ready": not profile_error and bool((profile or settings).get("sender_name") and (profile or settings).get("sender_mobile") and (profile or settings).get("sender_address")),
             "label_ready": bool(settings.get("partner_id") and settings.get("partner_key")),
         }
 
@@ -3868,7 +3914,7 @@ class Database:
         user: Dict[str, Any],
         shipment_choices: List[Dict[str, Any]],
         filters: Optional[Dict[str, Any]] = None,
-        *, selection_mode="selected", preview_fingerprint="", express_company="",
+        *, selection_mode="selected", preview_fingerprint="", express_company="", profile_id=None,
     ) -> Dict[str, Any]:
         if not shipment_choices and selection_mode != "all_matching":
             raise AppError("没有可下单的发货单。")
@@ -3896,16 +3942,28 @@ class Database:
 
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            from fulfillment_profiles import selected, snapshot, ensure_branch, encoded
+            settings = self.get_shipping_settings(connection=conn)
+            profile = selected(conn, settings, profile_id)
+            if profile:
+                if not preview_fingerprint:
+                    raise AppError("使用发货方案必须先预览并确认。", 409)
+                option = ensure_branch(settings, profile)
+                if int(option.get("quantity") or 0) <= 0:
+                    raise AppError("所选网点面单余额为零，请刷新余额或充值后重试。", 409)
+                if any(company and company != profile["express_company"] for _, company in normalized) or (express_company and express_company != profile["express_company"]):
+                    raise AppError("快递公司与发货方案不一致，请重新预览。", 409)
+                express_company = profile["express_company"]
             configured=conn.execute("SELECT default_company FROM shipping_settings WHERE id=1").fetchone()
             default_company=str(configured[0] if configured else DEFAULT_EXPRESS_COMPANY)
             if default_company not in EXPRESS_COMPANIES:
                 default_company=DEFAULT_EXPRESS_COMPANY
             if selection_mode not in {"selected","all_matching"}:
                 raise AppError("选择方式无效。")
-            if preview_fingerprint and self._preview_fingerprint(conn,user,filters or {}) != preview_fingerprint:
-                raise AppError("预览后的订单范围或内容已变化，请重新预览确认。",409)
+            if preview_fingerprint and self._preview_fingerprint(conn,user,filters or {},profile_id) != preview_fingerprint:
+                raise AppError("预览后的订单或发货配置已变化，请重新预览确认。",409)
             if selection_mode == "all_matching":
-                if not preview_fingerprint or self._preview_fingerprint(conn,user,filters or {}) != preview_fingerprint:
+                if not preview_fingerprint or self._preview_fingerprint(conn,user,filters or {},profile_id) != preview_fingerprint:
                     raise AppError("预览后的订单范围或内容已变化，请重新预览确认。",409)
                 if express_company and express_company not in EXPRESS_COMPANIES:
                     raise AppError("请选择有效快递公司。")
@@ -3935,6 +3993,19 @@ class Database:
                     valid.append((row, company))
             if not valid:
                 raise AppError("所选订单已被处理，请刷新后重试。", 409)
+            snapshots = {}
+            for shipment, company in valid:
+                candidate = snapshot(settings, company, profile)
+                # Reusing a provider order ID with a different origin/carrier may
+                # return an OLD label. Never silently change an attempted order.
+                if shipment["booking_request_id"]:
+                    previous = conn.execute("""SELECT settings_snapshot_json,express_company
+                        FROM shipping_batch_items WHERE shipment_id=? AND request_id=? ORDER BY id DESC LIMIT 1""",
+                        (shipment["id"],shipment["booking_request_id"])).fetchone()
+                    old_snapshot = json.loads(previous["settings_snapshot_json"] or "{}") if previous else {}
+                    if not old_snapshot or encoded(old_snapshot) != encoded(candidate):
+                        raise AppError("所选订单包含已经尝试下单的记录，不能直接更换发货方案。请先核对原面单结果；有配置快照的原批次重试会保留原配置。",409)
+                snapshots[shipment["id"]] = candidate
             cursor = conn.execute(
                 """
                 INSERT INTO shipping_batches (
@@ -3945,6 +4016,8 @@ class Database:
                 (user["id"], json.dumps(filters or {}, ensure_ascii=False), "", "", "", len(valid), now, now),
             )
             batch_id = int(cursor.lastrowid)
+            conn.execute("UPDATE shipping_batches SET fulfillment_name=? WHERE id=?",
+                         (profile["name"] if profile else "原总部配置", batch_id))
             for shipment, company in valid:
                 request_id = str(
                     shipment["booking_request_id"]
@@ -3958,19 +4031,19 @@ class Database:
                     UPDATE shipments
                     SET express_company = ?, booking_status = '排队中', booking_request_id = ?,
                         booking_salt = ?, booking_error = '', booking_requested_at = ?, booking_updated_at = ?,
-                        pickup_day = '', pickup_start_time = '', pickup_end_time = '', updated_at = ?
+                        pickup_day = '', pickup_start_time = '', pickup_end_time = '', updated_at = ?, fulfillment_name = ?
                     WHERE id = ?
                     """,
-                    (company, request_id, salt, now, now, now, shipment["id"]),
+                    (company, request_id, salt, now, now, now, snapshots[shipment["id"]]["fulfillment_name"], shipment["id"]),
                 )
                 conn.execute(
                     """
                     INSERT INTO shipping_batch_items (
                         batch_id, shipment_id, express_company, request_id, callback_salt,
-                        status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, '排队中', ?, ?)
+                        status, created_at, updated_at, settings_snapshot_json
+                    ) VALUES (?, ?, ?, ?, ?, '排队中', ?, ?, ?)
                     """,
-                    (batch_id, shipment["id"], company, request_id, salt, now, now),
+                    (batch_id, shipment["id"], company, request_id, salt, now, now, encoded(snapshots[shipment["id"]])),
                 )
         return self.get_shipping_batch(batch_id)
 
@@ -4001,6 +4074,13 @@ class Database:
             if not job:
                 conn.rollback()
                 return None
+            from fulfillment_profiles import snapshot, encoded
+            config = json.loads(job["settings_snapshot_json"] or "{}")
+            if not config:
+                # Legacy jobs may drain using the unchanged old configuration.
+                # Configuration writes are blocked until these jobs have drained.
+                config = snapshot(self.get_shipping_settings(connection=conn), job["express_company"])
+                conn.execute("UPDATE shipping_batch_items SET settings_snapshot_json=? WHERE id=?", (encoded(config), job["id"]))
             conn.execute(
                 """
                 UPDATE shipping_batch_items
@@ -4030,6 +4110,10 @@ class Database:
         payload["items"] = [dict(item) for item in items]
         payload["batch_item_id"] = job["id"]
         payload["batch_id"] = job["batch_id"]
+        payload["shipping_settings_snapshot"] = config
+        payload["express_company"] = job["express_company"]
+        payload["booking_request_id"] = job["request_id"] or payload["booking_request_id"]
+        payload["booking_salt"] = job["callback_salt"] or payload["booking_salt"]
         return payload
 
     def _resolved_shipment_times(
@@ -4228,19 +4312,27 @@ class Database:
         for item in item_list:
             item.update(type_info(item["shipment_type"]))
         total=counts.get(status,0) if status else sum(counts.values())
-        return {"batch": {k:batch[k] for k in ("id","status","total_count","created_at","updated_at","finished_at")},
+        return {"batch": {k:batch[k] for k in ("id","status","total_count","created_at","updated_at","finished_at","fulfillment_name")},
                 "items": item_list, "counts": counts,
                 "pagination":{"page":page,"page_size":page_size,"total":total,"total_pages":max(1,(total+page_size-1)//page_size)}}
 
     def retry_shipping_batch(self, batch_id: int) -> Dict[str, Any]:
         now = now_text()
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             failed = conn.execute(
-                "SELECT shipment_id FROM shipping_batch_items WHERE batch_id = ? AND status = '失败'",
+                "SELECT shipment_id,request_id,settings_snapshot_json FROM shipping_batch_items WHERE batch_id = ? AND status = '失败'",
                 (batch_id,),
             ).fetchall()
             if not failed:
                 raise AppError("这个批次没有可重试的失败订单。", 409)
+            for row in failed:
+                current = conn.execute("SELECT booking_request_id,status,tracking_no,booking_status FROM shipments WHERE id=?", (row["shipment_id"],)).fetchone()
+                newest = conn.execute("SELECT batch_id FROM shipping_batch_items WHERE shipment_id=? ORDER BY id DESC LIMIT 1", (row["shipment_id"],)).fetchone()
+                if not current or not self.shipment_booking_eligible(dict(current)) or current["booking_request_id"] != row["request_id"] or newest[0] != batch_id:
+                    raise AppError("原批次订单已变化或已进入其他批次，不能再次提交。",409)
+                if row["settings_snapshot_json"] == '{}':
+                    raise AppError("历史失败任务缺少原寄件配置快照，请先核对供应商结果，不能直接重试。",409)
             conn.execute(
                 "UPDATE shipping_batch_items SET status = '排队中', error = '', updated_at = ? WHERE batch_id = ? AND status = '失败'",
                 (now, batch_id),

@@ -195,3 +195,7 @@ node --check static/app.js
 python3 shipment_time_integrity_test.py
 python3 smoke_test.py
 ```
+
+## 双发货方案
+
+总部在“面单设置”保存中台中通和版纳圆通两套方案，在“批量打单”取号前选择。默认方案仅影响新批次；已排队、重试、已有面单保留原配置。继续使用原菜鸟授权，首版下载 PDF 后本地打印。详见 [发货方案与上线检查](docs/features/fulfillment-profiles.md)。

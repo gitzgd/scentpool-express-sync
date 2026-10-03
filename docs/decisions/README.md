@@ -12,6 +12,8 @@
 
 当前记录：
 
+- [`ADR-0009-immutable-fulfillment-profiles.md`](ADR-0009-immutable-fulfillment-profiles.md)：发货方案独立于门店，提交时锁定配置，历史面单和重试不随默认地址变化。
+
 - [`ADR-0007-shipment-purpose-and-owner-kind.md`](ADR-0007-shipment-purpose-and-owner-kind.md)：分类和归属区分售后/合作，复用履约流程，内部用途与面单分离。
 
 - [`ADR-0001-sqlite-single-instance.md`](ADR-0001-sqlite-single-instance.md)：单实例阶段继续使用 SQLite。

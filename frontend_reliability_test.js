@@ -160,7 +160,26 @@ async function main() {
     assert.match(overlay.innerHTML,/role="dialog"/); assert.match(overlay.innerHTML,/顺丰 2/);
     h.run('invalidatePage()'); assert.equal(await decision,false); assert.equal(overlay.removed,true);
   }
-  console.log("frontend reliability tests passed: latest response, identity isolation, double click, lost/deleted submission, hidden/navigation lifecycle, local progress, independent alerts, opaque task recovery, partial failures, drafts, full-scope pagination");
+  {
+    const h = harness(), handlers = {}, select = h.element(), submit = h.element();
+    select.value = "banna";
+    select.addEventListener = (name, fn) => { handlers[name] = fn; };
+    h.document.getElementById = id => id === "batchProfile" ? select : id === "createShippingBatch" ? submit : null;
+    let resolve;
+    h.context.fetch = (_url, options) => {
+      assert.equal(JSON.parse(options.body).profile_id, "banna");
+      return new Promise(done => { resolve = done; });
+    };
+    h.run('state.batchSelectAll=true; state.batchSelectedIds=[1]; state.batchCompanyOverrides={1:"中通"}; updateBatchPreviewUi=()=>{}; bindAdmin()');
+    const change = handlers.change({currentTarget:select});
+    assert.equal(select.disabled,true); assert.equal(submit.disabled,true);
+    resolve(response({preview:{eligible:[],profile:{id:"banna"}}}));
+    await change;
+    assert.equal(h.run('state.batchSelectAll'),false);
+    assert.equal(h.run('state.batchSelectedIds.length'),0);
+    assert.equal(h.run('Object.keys(state.batchCompanyOverrides).length'),0);
+  }
+  console.log("frontend reliability tests passed: latest response, identity isolation, double click, lost/deleted submission, hidden/navigation lifecycle, local progress, independent alerts, opaque task recovery, partial failures, drafts, full-scope pagination, fulfillment switching");
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1; });

@@ -33,6 +33,7 @@ import reliability_test
 import reliability_http_test
 import bounded_exports_test
 import http_limits_test
+import fulfillment_profiles_test
 from database import AppError, DEFAULT_PRODUCT_FILE, Database, now_text
 
 
@@ -948,6 +949,11 @@ def main() -> None:
         assert status == 200, body
         assert body["user"]["role"] == "staff"
 
+        status, body = request(staff, base, "PUT", "/api/admin/fulfillment-profiles", {"id": "kunming"})
+        assert status == 403, body
+        status, body = request(staff, base, "POST", "/api/admin/shipping-batches/preview", {"profile_id": "kunming"})
+        assert status == 403, body
+
         status, body = request(staff, base, "GET", "/api/admin/tracking/config")
         assert status == 403, body
         status, body = request(staff, base, "GET", "/api/admin/task-alerts")
@@ -1807,8 +1813,15 @@ def main() -> None:
         assert full_preview["preview"]["matched"] == 54
         assert len(full_preview["preview"]["eligible"]) == 50
         assert full_preview["preview"]["eligible_count"] == 54
-        staff_preview = server.DB.preview_shipping_batch(test_staff_user, {"q": "PAGINATION-SMOKE", "status": "待处理"})
-        assert staff_preview["matched"] == 53
+        # Booking previews now include private dispatch-origin details, so only HQ
+        # may access them. Store-scoped ordinary lists remain unchanged.
+        try:
+            server.DB.preview_shipping_batch(test_staff_user, {"q": "PAGINATION-SMOKE", "status": "待处理"})
+        except AppError as exc:
+            assert exc.status == 403
+        else:
+            raise AssertionError("store accessed HQ dispatch profile")
+        assert len(server.DB.list_shipments(test_staff_user, {"q": "PAGINATION-SMOKE", "status": "待处理"})) == 53
 
         status, pagination_csv, _headers = request_full(
             admin,
@@ -1851,6 +1864,7 @@ def main() -> None:
         shipment_time_integrity_test.main()
         daily_audit_probe_test.main()
         special_shipments_test.main()
+        fulfillment_profiles_test.main()
         reliability_test.run()
         reliability_http_test.run()
         bounded_exports_test.run()

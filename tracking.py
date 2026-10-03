@@ -24,6 +24,7 @@ EXPRESS_COMPANY_CODES = {
     "圆通": "yuantong",
     "顺丰": "shunfeng",
     "京东": "jd",
+    "中通": "zhongtong",
 }
 EXPRESS_CODE_COMPANIES = {code: company for company, code in EXPRESS_COMPANY_CODES.items()}
 COMPANY_CODE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")

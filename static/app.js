@@ -60,12 +60,13 @@ const state = {
   batchKnownTypes: {},
   batchKnownCompanies: {},
   batchBulkCompany: "",
+  batchProfileId: null,
   adminRowDrafts: new Map(),
   batchProgressPage: 1,
   batchProgressFailedOnly: false,
 };
 
-const EXPRESS_COMPANIES = ["圆通", "京东", "顺丰"];
+const EXPRESS_COMPANIES = ["圆通", "京东", "顺丰", "中通"];
 const DEFAULT_EXPRESS_COMPANY = "圆通";
 const CATEGORY_COLOR_COUNT = 10;
 const SHIPMENT_PAGE_SIZE = 50;
@@ -726,7 +727,7 @@ async function loadShippingBatchPreview(filters, { reset = true } = {}) {
   }
   const data = await api("/api/admin/shipping-batches/preview", {
     method: "POST",
-    body: JSON.stringify({ filters, page: state.batchPreviewPage, page_size: 50 }),
+    body: JSON.stringify({ filters, page: state.batchPreviewPage, page_size: 50, profile_id: state.batchProfileId }),
   });
   current();
   state.batchPreview = data.preview || null;
@@ -2286,19 +2287,29 @@ function renderShippingBatchPreview() {
       </div>
       ${!preview.settings_ready ? `<div class="notice danger-notice">总部寄件信息未完成，请先进入“面单设置”。</div>` : ""}
       ${!preview.label_ready ? `<div class="notice danger-notice">菜鸟电子面单账号尚未授权。</div>` : ""}
+      ${preview.profile_error ? `<div class="notice danger-notice" role="alert">${escapeHtml(preview.profile_error)}</div>` : ""}
       ${!config.enabled ? `<div class="notice danger-notice">电子面单服务开关未开启：请在 Render 将 <strong>SCENTPOOL_KUAIDI100_LABEL_ENABLED</strong> 设置为 <strong>1</strong>。</div>` : ""}
       ${missingConfig.length ? `<div class="notice danger-notice">Render 还缺少：<strong>${missingConfig.map(escapeHtml).join("、")}</strong>。补齐并重新部署后即可正式提交。</div>` : ""}
       <div class="batch-controls label-batch-controls">
+        <div class="field fulfillment-choice">
+          <label for="batchProfile">本批次从哪里发货</label>
+          <select class="select" id="batchProfile">
+            ${!state.shippingSettings?.default_profile_id ? `<option value="" ${!preview.profile ? "selected" : ""}>原总部配置（尚未切换）</option>` : ""}
+            ${(state.shippingSettings?.fulfillment_profiles || []).map(p => `<option value="${escapeHtml(p.id)}" ${preview.profile?.id === p.id ? "selected" : ""}>${escapeHtml(p.name)} · ${escapeHtml(p.express_company)}${p.id === state.shippingSettings?.default_profile_id ? "（默认）" : ""}</option>`).join("")}
+          </select>
+        </div>
+        ${!preview.profile ? `
         <div class="field">
           <label>已选订单统一改为</label>
           <select class="select" id="batchBulkCompany"><option value="" ${state.batchBulkCompany ? "" : "selected"}>保持各单原快递</option>${EXPRESS_COMPANIES.map(company => `<option value="${company}" ${company === state.batchBulkCompany ? "selected" : ""}>${company}</option>`).join("")}</select>
-        </div>
+        </div>` : ""}
         <div class="inline-actions batch-selection-actions">
           <button class="btn secondary small" id="selectAllBatchOrders" type="button">全选筛选结果</button>
           <button class="btn ghost small" id="clearBatchOrders" type="button">取消全选</button>
         </div>
         <button class="btn primary" id="createShippingBatch" data-ready="${preview.settings_ready && preview.label_ready && configReady ? "1" : "0"}" type="button" ${selectedCount && preview.settings_ready && preview.label_ready && configReady ? "" : "disabled"}>确认提交 ${selectedCount} 单</button>
       </div>
+      ${preview.profile ? `<div class="notice fulfillment-summary"><strong>${escapeHtml(preview.profile.name)} · ${escapeHtml(preview.profile.express_company)}</strong><br>授权网点：${escapeHtml(preview.profile.tbNet)}<br>寄件：${escapeHtml(preview.profile.sender_name)} · ${escapeHtml(preview.profile.sender_mobile)}<br>${escapeHtml(preview.profile.sender_address)}<br><span class="muted">本批次统一使用此方案；提交后锁定地址、网点与授权。已有面单下载或复打不会换方案。</span></div>` : ""}
       <div class="notice" id="batchTypeCounts">${Object.entries(preview.type_counts || {}).filter(([, count]) => count).map(([key, count]) => `${SHIPMENT_TYPES[key]?.[0] || key} ${count} 单`).join(" · ")}（预览总量，确认时按实际勾选复核）</div>
       <div class="notice">提交后将立即获取快递单号并生成电子面单，不再创建上门取件预约。</div>
       <div class="batch-order-list">
@@ -2306,7 +2317,7 @@ function renderShippingBatchPreview() {
           <div class="batch-order-row" data-batch-shipment="${row.id}">
             <input class="batch-order-checkbox" type="checkbox" data-batch-select value="${row.id}" aria-label="选择订单 ${escapeHtml(row.business_id)}" ${selectedIds.has(Number(row.id)) ? "checked" : ""} />
             <div>${shipmentTypeBadge(row)}<strong>${escapeHtml(row.business_id)}</strong><div class="muted mini">${escapeHtml(row.store_name_snapshot)} · ${escapeHtml(row.recipient_name)} · ${escapeHtml(row.address)}</div>${row.return_unsigned_warning ? `<p class="notice">退货尚未签收，请总部核对后决定发货</p>` : ""}</div>
-            <select class="select" data-batch-company>${expressCompanyOptions(state.batchCompanyOverrides[row.id] || state.batchBulkCompany || row.express_company)}</select>
+            ${preview.profile ? `<span class="status shipped">${escapeHtml(preview.profile.express_company)}</span>` : `<select class="select" data-batch-company>${expressCompanyOptions(state.batchCompanyOverrides[row.id] || state.batchBulkCompany || row.express_company)}</select>`}
           </div>
         `).join("") || `<div class="empty">当前筛选没有可下单订单</div>`}
       </div>
@@ -2628,7 +2639,7 @@ function renderShippingBatchProgress() {
   return `
     <section class="panel panel-pad shipping-batch-panel">
       <div class="section-title">
-        <div><h2>电子面单批次 #${batch.id}</h2><div class="muted mini">后台按顺序取号并生成面单</div></div>
+        <div><h2>电子面单批次 #${batch.id}</h2><div class="muted mini">${escapeHtml(batch.fulfillment_name || "历史批次")} · 后台按顺序取号并生成面单</div></div>
         <span class="status ${failed ? "exception" : batch.status === "已完成" ? "shipped" : "pending"}">${escapeHtml(batch.status)}</span>
       </div>
       <div class="status-overview">
@@ -2793,12 +2804,14 @@ function renderAdminShipmentStatusCell(row) {
 }
 
 function renderAdminShipmentShippingCell(row) {
+  const origin = row.fulfillment_name ? `<div class="mini"><strong>${escapeHtml(row.fulfillment_name)}</strong></div>` : "";
   if (!shipmentShippingEditing(row)) {
-    if (!row.tracking_no) return `<span class="muted">快递平台正在分配单号</span>`;
-    return renderTrackingDetailBlock(row, { showCopy: true });
+    if (!row.tracking_no) return `${origin}<span class="muted">快递平台正在分配单号</span>`;
+    return origin + renderTrackingDetailBlock(row, { showCopy: true });
   }
   return `
     <div class="shipping-editor">
+      ${origin}
       ${row.booking_status === "下单失败" ? `<div class="inline-failure"><strong>电子面单未成功。</strong><div>${escapeHtml(row.booking_error || "没有取得快递单号。")}</div><div>${escapeHtml(taskAlertAdvice("面单下单失败", row.booking_error))}</div></div>` : ""}
       <label>
         <span>快递公司</span>
@@ -2968,6 +2981,7 @@ function shippingBatchConfirmationSummary(shipments, total) {
     scope: state.batchSelectAll ? "整个筛选范围（包含其他预览页）" : "仅手动勾选的订单（包含跨页勾选）",
     typeSummary: Object.entries(typeCounts).filter(([, count]) => count > 0).map(([type, count]) => `${SHIPMENT_TYPES[type]?.[0] || "历史未分类"} ${count} 单`).join("、"),
     companySummary: Object.entries(companyCounts).filter(([, count]) => count > 0).map(([company, count]) => `${company} ${count} 单`).join("、"),
+    profile: state.batchPreview.profile || null,
   };
 }
 
@@ -2980,6 +2994,7 @@ function confirmShippingBatch(summary) {
       <h2 id="batchConfirmTitle">核对本批次电子面单</h2>
       <div id="batchConfirmDescription"><p>本次将提交 <strong>${Number(summary.total)} 单</strong>，快递公司接单成功后将生成快递单号。</p>
       <dl><dt>提交范围</dt><dd>${escapeHtml(summary.scope)}</dd><dt>发货类别</dt><dd>${escapeHtml(summary.typeSummary)}</dd><dt>快递公司</dt><dd>${escapeHtml(summary.companySummary)}</dd></dl>
+      ${summary.profile ? `<dl><dt>发货方案</dt><dd>${escapeHtml(summary.profile.name)}</dd><dt>授权网点</dt><dd>${escapeHtml(summary.profile.tbNet)}</dd><dt>寄件信息</dt><dd>${escapeHtml(summary.profile.sender_name)} · ${escapeHtml(summary.profile.sender_mobile)}<br>${escapeHtml(summary.profile.sender_address)}</dd></dl>` : ""}
       <p class="muted">请再次核对范围和快递公司。返回修改不会创建任务。</p></div>
       <div class="batch-confirm-actions"><button type="button" class="btn secondary" data-batch-confirm-cancel>返回修改</button><button type="button" class="btn primary" data-batch-confirm-accept>确认创建 ${Number(summary.total)} 单任务</button></div>
     </section>`;
@@ -3125,6 +3140,7 @@ function bindAdmin(root = document) {
   if (previewButton) {
     previewButton.addEventListener("click", async (event) => {
       try {
+        state.batchProfileId = null; // Each new preview starts from the configured default.
         state.batchFilters = {
           ...state.adminFilters,
           store_id: state.adminFilters.store_id,
@@ -3202,6 +3218,24 @@ function bindAdmin(root = document) {
       errorToast(error);
     }
   });
+  dom.getElementById("batchProfile")?.addEventListener("change", async (event) => {
+    const select = event.currentTarget;
+    const oldId = state.batchProfileId;
+    state.batchProfileId = select.value;
+    select.disabled = true;
+    state.batchSelectAll = false; state.batchSelectedIds = [];
+    dom.getElementById("createShippingBatch").disabled = true;
+    try {
+      await loadShippingBatchPreview(state.batchFilters);
+      state.batchSelectAll = false; state.batchSelectedIds = [];
+      updateBatchPreviewUi();
+      toast("发货方案已切换，请重新勾选订单并核对地址。");
+    } catch (error) {
+      state.batchProfileId = oldId;
+      state.batchPreview = null; updateBatchPreviewUi();
+      errorToast(error, "方案切换失败，请重新打开批量打单。");
+    }
+  });
   dom.getElementById("batchBulkCompany")?.addEventListener("change", (event) => {
     state.batchBulkCompany = event.currentTarget.value;
     state.batchCompanyOverrides = {};
@@ -3233,6 +3267,7 @@ function bindAdmin(root = document) {
       selection_mode: state.batchSelectAll ? "all_matching" : "selected",
       preview_fingerprint: state.batchPreview.preview_fingerprint || state.batchPreview.fingerprint,
       express_company: state.batchBulkCompany,
+      profile_id: state.batchProfileId,
     };
     const epoch = pageEpoch;
     try {
@@ -3519,6 +3554,64 @@ async function renderStores() {
   bindStores();
 }
 
+function renderFulfillmentSettings(settings) {
+  const saved = settings.fulfillment_profiles || [];
+  return `<section class="panel panel-pad fulfillment-settings"><div class="section-title"><div><h2>发货方案</h2><p class="muted">地址可随时编辑，仅影响新提交的批次。已排队、失败重试和已生成面单保留原信息。门店归属不变。</p></div></div>
+    <div class="notice">先保存原版纳方案，再配置昆明中台并设为默认。菜鸟账号中的地址不会自动覆盖这里；修改地址后请同时核对网点承接范围。当前仅下载 PDF 后本地打印。</div>
+    <div class="fulfillment-profile-grid">${[["banna", "版纳门店发货", "圆通"], ["kunming", "昆明中台发货", "中通"]].map(([id, name, company]) => {
+      const existing = saved.find(p => p.id === id);
+      const carrier = settings.carrier_settings?.[company] || {};
+      const p = existing || {id, name, express_company: company,
+        sender_name: id === "banna" ? settings.sender_name : "", sender_mobile: id === "banna" ? settings.sender_mobile : "",
+        sender_address: id === "banna" ? settings.sender_address : "", sender_company: settings.sender_company || "",
+        tbNet: carrier.tbNet || "", exp_type: carrier.expType || "标准快递", pay_type: settings.pay_type || "MONTHLY",
+        third_template_url: carrier.thirdTemplateURL || "", third_custom_template_url: carrier.thirdCustomTemplateUrl || ""};
+      const branches = (settings.branch_options || []).filter(b => b.company === company);
+      return `<form class="fulfillment-profile-form" data-profile-form="${id}"><h3>${escapeHtml(name)} · ${company}${settings.default_profile_id === id ? "（默认）" : ""}</h3>
+        <p class="muted mini" data-profile-saved>${existing ? "已保存" : "尚未启用；保存不会创建面单"}</p><div class="form-grid">
+        <div class="field full"><label>方案名称<input class="input" name="name" maxlength="100" required value="${escapeHtml(p.name)}"></label></div>
+        <div class="field"><label>寄件联系人<input class="input" name="sender_name" maxlength="100" required value="${escapeHtml(p.sender_name || "")}"></label></div>
+        <div class="field"><label>联系电话<input class="input" name="sender_mobile" type="tel" maxlength="100" required value="${escapeHtml(p.sender_mobile || "")}"></label></div>
+        <div class="field full"><label>寄件公司<input class="input" name="sender_company" maxlength="100" value="${escapeHtml(p.sender_company || "")}"></label></div>
+        <div class="field full"><label>完整寄件地址<textarea class="textarea" name="sender_address" maxlength="500" required>${escapeHtml(p.sender_address || "")}</textarea></label></div>
+        <div class="field full"><label>菜鸟授权网点<select class="select" name="tbNet" required><option value="">请先刷新授权网点</option>${p.tbNet && !branches.some(b => b.tbNet === p.tbNet) ? `<option value="${escapeHtml(p.tbNet)}" selected>${escapeHtml(p.tbNet)}（需重新核验）</option>` : ""}${branches.map(b => `<option value="${escapeHtml(b.tbNet)}" ${b.tbNet === p.tbNet ? "selected" : ""}>${escapeHtml(b.branchName || b.tbNet)} · ${escapeHtml(b.branchCode || "")} · 余 ${Number(b.quantity) || 0}</option>`).join("")}</select></label></div>
+        <div class="field"><label>产品类型<input class="input" name="exp_type" maxlength="100" required value="${escapeHtml(p.exp_type)}"></label></div>
+        <div class="field"><label>付款方式<select class="select" name="pay_type"><option value="MONTHLY" ${p.pay_type === "MONTHLY" ? "selected" : ""}>月结</option><option value="SHIPPER" ${p.pay_type === "SHIPPER" ? "selected" : ""}>寄方付</option></select></label></div>
+        <div class="field full"><label>菜鸟基础模板（可留空使用平台默认）<input class="input" name="third_template_url" type="url" maxlength="500" value="${escapeHtml(p.third_template_url)}"></label></div>
+        <div class="field full"><label>货品自定义区模板（选填）<input class="input" name="third_custom_template_url" type="url" maxlength="500" value="${escapeHtml(p.third_custom_template_url)}"></label></div>
+        </div><p class="muted mini">中通不能沿用圆通专用模板。默认模板的商品明细展示需在正式启用前核对。</p>
+        <label class="check-row"><input type="checkbox" name="make_default" ${settings.default_profile_id === id ? "checked" : ""}>设为新批次默认方案</label>
+        <div class="inline-actions"><button class="btn primary" type="submit">保存${id === "kunming" ? "中台" : "版纳"}方案</button></div><p class="profile-save-result" role="status" aria-live="polite"></p>
+      </form>`;
+    }).join("")}</div></section>`;
+}
+
+function bindFulfillmentSettings() {
+  document.querySelectorAll("[data-profile-form]").forEach(form => form.addEventListener("submit", async event => {
+    event.preventDefault();
+    const button = form.querySelector('button[type="submit"]');
+    const result = form.querySelector(".profile-save-result");
+    const values = new FormData(form), id = form.dataset.profileForm;
+    const existing = state.shippingSettings.fulfillment_profiles?.find(p => p.id === id);
+    const payload = {...Object.fromEntries(values.entries()), id, revision: existing?.revision || 0, make_default: values.has("make_default")};
+    try {
+      const response = await withButtonBusy(button, "保存中…", () => api("/api/admin/fulfillment-profiles", {method: "PUT", body: JSON.stringify(payload)}));
+      state.shippingSettings = response.settings;
+      document.querySelectorAll("[data-profile-form]").forEach(other => {
+        other.querySelector('[name="make_default"]').checked = other.dataset.profileForm === response.settings.default_profile_id;
+        const saved = response.settings.fulfillment_profiles.find(p => p.id === other.dataset.profileForm);
+        if (saved) {
+          other.querySelector("h3").textContent = `${saved.name} · ${saved.express_company}${saved.id === response.settings.default_profile_id ? "（默认）" : ""}`;
+          other.querySelector("[data-profile-saved]").textContent = "已保存";
+        }
+      });
+      result.textContent = "已保存。仅新提交的批次使用本次设置；原面单和已排队任务未改变。";
+      // Do not rerender the other form: it may contain unsaved changes.
+      toast("发货方案已保存；重新打开批量打单可使用。");
+    } catch (error) { result.textContent = `保存失败：${error.message || "请稍后重试"}。填写内容已保留。`; errorToast(error); }
+  }));
+}
+
 async function renderShippingSettings() {
   const currentView = beginView();
   await loadShippingSettings();
@@ -3542,10 +3635,11 @@ async function renderShippingSettings() {
   };
   const content = `
     ${pageHead("电子面单设置", "在系统内完成菜鸟授权、快递取号、面单生成与打印。")}
+    ${renderFulfillmentSettings(settings)}
     <form id="shippingSettingsForm">
     <div class="grid-2 shipping-settings-grid">
       <section class="panel panel-pad">
-        <div class="section-title"><h2>总部寄件信息</h2></div>
+        <div class="section-title"><h2>原总部寄件配置</h2></div><p class="muted mini">启用发货方案后，批量打单使用上方方案地址。此处保留原配置及其他承运商设置，不覆盖已保存方案。</p>
         <div class="form-grid">
           <div class="field">
             <label for="senderName">寄件人姓名</label>
@@ -3627,6 +3721,7 @@ async function renderShippingSettings() {
   currentView();
   document.getElementById("app").innerHTML = shell(content);
   bindCommon();
+  bindFulfillmentSettings();
   document.getElementById("shippingSettingsForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);

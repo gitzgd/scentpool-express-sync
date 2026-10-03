@@ -56,7 +56,7 @@ def run():
                 assert request("store",f"/api/returns/{return_id}/tracking")[0]==200
                 assert request("other",f"/api/returns/{return_id}/tracking")[0]==404
                 assert request("store","/api/returns?page_size=51")[0]==400
-                with patch.object(db,"claim_next_shipping_job",side_effect=[{"batch_item_id":1,"express_company":"圆通"},{"batch_item_id":2,"express_company":"圆通"}]),patch.object(db,"shipping_settings_for_company",return_value={}),patch.object(db,"complete_shipping_job",return_value={"tracking_no":"LOCAL-ONLY"}),patch.object(server.Kuaidi100LabelClient,"from_env") as factory:
+                with patch.object(db,"claim_next_shipping_job",side_effect=[{"batch_item_id":1,"express_company":"圆通","shipping_settings_snapshot":{}},{"batch_item_id":2,"express_company":"圆通","shipping_settings_snapshot":{}}]),patch.object(db,"complete_shipping_job",return_value={"tracking_no":"LOCAL-ONLY"}),patch.object(server.Kuaidi100LabelClient,"from_env") as factory:
                     factory.return_value.create_label.return_value={"success":True,"tracking_no":"LOCAL-ONLY"}
                     assert server.process_next_shipping_job() and server.process_next_shipping_job()
                     assert factory.return_value.create_label.call_count==2

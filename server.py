@@ -814,7 +814,7 @@ def process_next_shipping_job(connection: Optional[sqlite3.Connection] = None) -
     if not job:
         return False
     client = Kuaidi100LabelClient.from_env()
-    settings = DB.shipping_settings_for_company(str(job.get("express_company") or ""))
+    settings = job["shipping_settings_snapshot"]
     result: Dict[str, Any] = {"success": False, "error": "电子面单下单失败。", "raw": ""}
     max_attempts = SHIPPING_TRANSIENT_RETRIES + 1
     for attempt in range(max_attempts):
@@ -1247,6 +1247,11 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
             self.send_json({"settings": DB.update_shipping_settings(self.read_json()), "shipping": label_config_public()})
             return
 
+        if path == "/api/admin/fulfillment-profiles" and self.command == "PUT":
+            self.require_admin(user)
+            self.send_json({"settings": DB.save_fulfillment_profile(user, self.read_json())})
+            return
+
         if path == "/api/admin/label-auth/cainiao" and self.command == "POST":
             self.require_admin(user)
             state = DB.create_label_auth_session()
@@ -1281,7 +1286,7 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
             body = self.read_json()
             filters = body.get("filters") if isinstance(body.get("filters"), dict) else {}
             page,page_size=self.pagination_parameters(body)
-            self.send_json({"preview": DB.preview_shipping_batch(user, filters,page=page,page_size=page_size)})
+            self.send_json({"preview": DB.preview_shipping_batch(user, filters,page=page,page_size=page_size,profile_id=body.get("profile_id"))})
             return
 
         if path == "/api/admin/shipping-batches" and self.command == "POST":
@@ -1293,11 +1298,11 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
                 missing = "、".join(shipping_config.get("missing") or [])
                 raise AppError(f"电子面单配置不完整，Render 缺少：{missing or '必要环境变量'}。", 503)
             settings = DB.get_shipping_settings()
-            if not settings.get("sender_name") or not settings.get("sender_mobile") or not settings.get("sender_address"):
+            body = self.read_json()
+            if not body.get("profile_id") and not settings.get("default_profile_id") and (not settings.get("sender_name") or not settings.get("sender_mobile") or not settings.get("sender_address")):
                 raise AppError("请先完成总部发货设置。", 409)
             if not settings.get("partner_id") or not settings.get("partner_key"):
                 raise AppError("请先在电子面单设置中完成菜鸟账号授权。", 409)
-            body = self.read_json()
             choices = body.get("shipments") if isinstance(body.get("shipments"), list) else []
             batch = DB.create_shipping_batch(
                 user,
@@ -1306,6 +1311,7 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
                 selection_mode=str(body.get("selection_mode") or "selected"),
                 preview_fingerprint=str(body.get("preview_fingerprint") or ""),
                 express_company=str(body.get("express_company") or ""),
+                profile_id=body.get("profile_id"),
             )
             notify_shipping_worker()
             self.send_json(batch, status=202)
