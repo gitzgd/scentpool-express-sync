@@ -3837,11 +3837,26 @@ class Database:
         where, params = self._shipment_filter_sql(user, filters)
         return conn.execute("""SELECT shipments.id,shipments.business_id,shipments.store_name_snapshot,
             shipments.store_order_no,shipments.recipient_name,shipments.address,shipments.express_company,
-            shipments.shipment_type,shipments.status,shipments.tracking_no,shipments.booking_status,
+            shipments.shipment_type,shipments.status,shipments.tracking_no,shipments.booking_status,shipments.booking_request_id,
             shipments.tracking_revision,shipments.content_revision,shipments.updated_at,
             (shipments.related_return_id IS NOT NULL AND COALESCE(r.status,'')<>'已签收') return_unsigned_warning
             FROM shipments LEFT JOIN return_orders r ON r.id=shipments.related_return_id AND r.store_id=shipments.store_id""" +
             (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY shipments.created_at DESC,shipments.id DESC", params)
+
+    def _booking_configuration_block(self, conn, shipment, settings, company, profile):
+        """Exclude unsafe historical retries before the user selects a batch."""
+        if not shipment.get("booking_request_id"):
+            return ""
+        from fulfillment_profiles import snapshot, encoded
+        previous = conn.execute("""SELECT settings_snapshot_json FROM shipping_batch_items
+            WHERE shipment_id=? AND request_id=? ORDER BY id DESC LIMIT 1""",
+            (shipment["id"], shipment["booking_request_id"])).fetchone()
+        old = json.loads(previous["settings_snapshot_json"] or "{}") if previous else {}
+        if not old:
+            return "历史取号任务缺少原配置，请先核对供应商结果，不能直接重新下单"
+        if encoded(old) != encoded(snapshot(settings, company, profile)):
+            return "已尝试取号，原发货配置与本批次不同；请核对原结果或在原批次重试"
+        return ""
 
     def _preview_seed(self, conn, profile_id):
         from fulfillment_profiles import encoded, profiles
@@ -3882,15 +3897,15 @@ class Database:
             for raw in self._preview_rows(conn,user,filters):
                 digest.update(json.dumps(list(raw),ensure_ascii=False,separators=(",", ":")).encode())
                 shipment=dict(raw); matched+=1
-                if self.shipment_booking_eligible(shipment):
-                    company=profile["express_company"] if profile else (shipment["express_company"] if shipment["express_company"] in EXPRESS_COMPANIES else default_company)
+                company=profile["express_company"] if profile else (shipment["express_company"] if shipment["express_company"] in EXPRESS_COMPANIES else default_company)
+                reason = self._booking_configuration_block(conn, shipment, settings, company, profile) if self.shipment_booking_eligible(shipment) else ("已有快递单号" if shipment["tracking_no"] else "状态不可下单")
+                if not reason:
                     company_counts[company]+=1; counts[shipment["shipment_type"]]+=1
                     if offset<=eligible_count<offset+page_size:
                         eligible.append({**shipment,**type_info(shipment["shipment_type"]),"express_company":company})
                     eligible_count+=1
                 else:
                     if offset<=excluded_count<offset+page_size:
-                        reason="已有快递单号" if shipment["tracking_no"] else "状态不可下单"
                         excluded.append({"id":shipment["id"],"business_id":shipment["business_id"],"reason":reason})
                     excluded_count+=1
         return {
@@ -3975,6 +3990,8 @@ class Database:
                         company=overrides.pop(row["id"],None) or express_company or row["express_company"] or default_company
                         if company not in EXPRESS_COMPANIES:
                             company=default_company
+                        if self._booking_configuration_block(conn, row, settings, company, profile):
+                            continue
                         normalized.append((row["id"],company))
                         if len(normalized)>5000:
                             raise AppError("当前范围超过单批下单 5000 单的安全上限，请缩小筛选范围。",413)

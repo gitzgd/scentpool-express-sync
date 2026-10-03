@@ -162,8 +162,12 @@ def main():
         configure(db, users)
         for number in range(53):
             order(db, users, f"MULTIPAGE-{number}")
+        orphan = order(db, users, "HISTORICAL-UNKNOWN")
+        with db.connect() as conn:
+            conn.execute("UPDATE shipments SET booking_request_id='HISTORICAL-UNKNOWN' WHERE id=?", (orphan["id"],))
         preview = db.preview_shipping_batch(users["admin"], {}, profile_id="kunming")
         assert len(preview["eligible"]) == 50 and preview["eligible_count"] == 53
+        assert preview["excluded_count"] == 1 and "缺少原配置" in preview["excluded"][0]["reason"]
         assert preview["company_counts"]["中通"] == 53
         db.create_shipping_batch(users["admin"], [], {}, selection_mode="all_matching",
             preview_fingerprint=preview["preview_fingerprint"], profile_id="kunming")
@@ -171,6 +175,7 @@ def main():
             rows = conn.execute("SELECT express_company,settings_snapshot_json FROM shipping_batch_items").fetchall()
             assert len(rows) == 53
             assert all(r["express_company"] == "中通" and json.loads(r["settings_snapshot_json"])["profile_id"] == "kunming" for r in rows)
+        assert db.get_shipment(orphan["id"], users["admin"])["booking_status"] == "未下单"
     print("fulfillment profile safety tests passed")
 
 
