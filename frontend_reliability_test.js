@@ -21,6 +21,7 @@ function harness() {
     setTimeout: (fn, ms) => { const id = ++serial; timers.set(id, { fn, ms }); return id; }, clearTimeout: id => timers.delete(id),
     fetch: async () => { throw Error("Unexpected network call"); }, confirm: () => true, messages });
   vm.runInContext(fs.readFileSync(path.join(__dirname, "static/special.js"), "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "static/reports.js"), "utf8"), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, "static/app.js"), "utf8").replace(/\nrender\(\);\s*$/, "\n"), context);
   vm.runInContext('state.user = {id: 1, role: "admin"}; toast = (message) => messages.push(message);', context);
   const run = code => vm.runInContext(code, context);

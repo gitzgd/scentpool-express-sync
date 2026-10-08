@@ -984,7 +984,7 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
             if path.startswith("/static/"):
                 self.serve_static(path)
                 return
-            if path in {"/", "/login", "/submit", "/special/new", "/shipments", "/returns/new", "/returns", "/admin", "/admin/returns", "/admin/stores", "/admin/products", "/admin/shipping"}:
+            if path in {"/", "/login", "/submit", "/special/new", "/shipments", "/returns/new", "/returns", "/admin", "/admin/returns", "/admin/stores", "/admin/products", "/admin/shipping", "/reports/fulfillment"}:
                 self.serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
                 return
             self.error_json("页面不存在。", 404)
@@ -1351,6 +1351,26 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
         if path == "/api/shipments" and self.command == "POST":
             shipment = DB.create_shipment(user, self.read_json())
             self.send_json({"shipment": shipment}, status=201)
+            return
+
+        if path == "/api/reports/fulfillment-items" and self.command == "GET":
+            from fulfillment_reports import read_report
+            self.send_json(read_report(DB, user, query))
+            return
+
+        if path == "/api/reports/fulfillment-items.xlsx" and self.command == "GET":
+            from fulfillment_reports import export_report
+            if not EXPORT_LOCK.acquire(blocking=False):
+                raise AppError("已有一个数据导出正在进行，请稍后重试。订单未被修改。", 503)
+            try:
+                with tempfile.TemporaryDirectory(prefix="scentpool-report-") as directory:
+                    output, filters = export_report(DB, user, query, directory,
+                        workbook_template=build_table_xlsx([], [], [], "template"))
+                    filename = f"发货统计-{filters['channel']}-{filters['date_from']}-{filters['date_to']}.xlsx"
+                    self.send_file(output, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   attachment_header(filename, "fulfillment-report.xlsx"))
+            finally:
+                EXPORT_LOCK.release()
             return
 
         if path == "/api/shipments/summary" and self.command == "GET":

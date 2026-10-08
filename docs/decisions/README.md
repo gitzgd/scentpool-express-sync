@@ -12,6 +12,8 @@
 
 当前记录：
 
+- [`ADR-0010-current-effective-fulfillment-reports.md`](ADR-0010-current-effective-fulfillment-reports.md)：渠道与归属独立，以当前有效面单只读聚合，取消联动、不建设库存账。
+
 - [`ADR-0009-immutable-fulfillment-profiles.md`](ADR-0009-immutable-fulfillment-profiles.md)：发货方案独立于门店，提交时锁定配置，历史面单和重试不随默认地址变化。
 
 - [`ADR-0007-shipment-purpose-and-owner-kind.md`](ADR-0007-shipment-purpose-and-owner-kind.md)：分类和归属区分售后/合作，复用履约流程，内部用途与面单分离。
