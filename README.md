@@ -18,6 +18,8 @@ python3 server.py
 
 打开 `http://127.0.0.1:8765`。
 
+“发货统计”入口为 `/reports/fulfillment`：同时统计版纳和昆明，可筛选日期、归属、类型、商品并导出四表 Excel；取消成功自动退出当前有效统计，不扣库存。详见 [双渠道统计口径](docs/features/fulfillment-reports.md)。仅本地合成演示：`python3 fulfillment_reports_demo.py --port 8879`，打开 `http://127.0.0.1:8879/demo`。
+
 局域网试用：
 
 ```bash

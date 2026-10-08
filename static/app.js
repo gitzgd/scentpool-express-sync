@@ -102,6 +102,7 @@ function beginView() {
 }
 
 function invalidatePage({ clearIdentity = false } = {}) {
+  if (typeof stopFulfillmentReport === "function") stopFulfillmentReport(clearIdentity);
   pageEpoch += 1;
   viewRevision += 1;
   activeConfirmations.forEach(cancel => cancel());
@@ -548,6 +549,7 @@ async function apiRequest(path, options = {}) {
     const message = typeof data === "object" && data ? data.error : data;
     throw new ApiError(message || "请求失败", response.status, data?.details || {});
   }
+  if (method !== "GET" && /\/api\/(shipments|admin\/shipping-batches)/.test(path)) notifyFulfillmentReport();
   return data;
 }
 
@@ -648,7 +650,7 @@ function shell(content) {
           <span class="mark">万</span>
           <span>万物香铺</span>
         </a>
-        <nav class="nav">${submitLink}${storeLinks}${adminLinks}</nav>
+        <nav class="nav">${submitLink}${storeLinks}${adminLinks}<a class="${isActive("/reports/fulfillment")}" href="/reports/fulfillment" data-route>发货统计</a></nav>
         <div class="user-strip">
           <span>${escapeHtml(roleName(state.user))} · ${escapeHtml(state.user?.store_name || state.user?.username || "")}</span>
           <button class="btn ghost small" id="logoutBtn">退出</button>
@@ -780,7 +782,9 @@ async function loadActiveShippingBatch() {
   try {
     const data = await api(`/api/admin/shipping-batches/${batchId}?page=${state.batchProgressPage}&page_size=50${state.batchProgressFailedOnly ? "&status=" + encodeURIComponent("失败") : ""}`);
     current();
+    const previousProgress = JSON.stringify(state.activeShippingBatch?.counts || {});
     state.activeShippingBatch = data;
+    if (previousProgress !== JSON.stringify(data.counts || {})) notifyFulfillmentReport();
     state.shippingBatchPollError = "";
   } catch (error) {
     if (error instanceof StaleViewError) return;
@@ -4088,6 +4092,8 @@ async function render({ refreshData = true } = {}) {
   try {
     if (location.pathname === "/login") {
       renderLogin();
+    } else if (location.pathname === "/reports/fulfillment") {
+      await renderFulfillmentReport();
     } else if (location.pathname === "/special/new" || (location.pathname === "/submit" && state.user.store_kind === "team")) {
       await renderSpecialShipment();
     } else if (location.pathname === "/submit") {

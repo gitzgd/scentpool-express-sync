@@ -13,6 +13,7 @@
 | 物流 | 快递100查询、自动/手动同步、签收更新 | `tracking.py`, `server.py` |
 | [电子面单与发货方案](fulfillment-profiles.md) | 中台中通/版纳圆通选择、菜鸟授权、网点余额、不可变批次配置、取消、复打 | `fulfillment_profiles.py`, `shipping.py`, `database.py`, `server.py` |
 | 打印 | 待打印选择、PDF 合并、打印状态、单张复打 | `label_pdf.py`, `server.py`, `static/app.js` |
+| [双渠道发货统计](fulfillment-reports.md) | 版纳/昆明、门店商品/每日汇总、有效面单取消联动、只读权限与四表 Excel | `fulfillment_reports.py`, `static/reports.js`, `server.py` |
 | [任务可靠性与失败提示](task-reliability.md) | 面单短暂故障重试、中断恢复、分类异常角标、60 秒刷新、人工确认与操作指引 | `database.py`, `shipping.py`, `server.py`, `static/app.js` |
 | [操作体验与后台稳定性](experience-reliability.md) | 分阶段开发：局部更新、输入保护、持久查询、分页范围一致性、容量保护及证据完整性 | `tracking_queue.py`, `database.py`, `server.py`, `static/app.js` |
 | [脱敏业务日报](daily-audit.md) | 独立 Bearer 鉴权、只读汇总、历史日末、脱敏失败与时间证据、连接双采样/容量基线、高精度打印时间、延迟套餐限制分类及网站状态/采集完整性分离 | `database.py`, `server.py`, `tools/scentpool_daily_audit_probe.py`, `daily_audit_test.py`, `daily_audit_probe_test.py` |

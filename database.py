@@ -555,6 +555,8 @@ class Database:
             migrate_tracking_queue(conn)
             from fulfillment_profiles import migrate
             migrate(conn)
+            from fulfillment_reports import migrate as migrate_reports
+            migrate_reports(conn)
 
         if self.count_products() == 0 and os.path.exists(product_file):
             self.import_products(product_file)
