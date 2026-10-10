@@ -20,6 +20,7 @@ from special_shipments_test import seed
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8878)
+    parser.add_argument("--selection-demo", action="store_true", help="Add synthetic cross-page orders for selection regression")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="scentpool-fulfillment-demo-") as directory:
         db = Database(str(Path(directory) / "synthetic.db")); users = seed(db); configure(db, users)
@@ -29,6 +30,9 @@ def main():
                 "third_template_url": "" if profile["id"] == "kunming_sf" else profile["third_template_url"]})
         for code in ("CASE1-必须手动选择", "CASE2-顺丰模板待补充", "CASE3-长内容与配置锁定-" + "合成" * 30):
             order(db, users, code)
+        if args.selection_demo:
+            for number in range(50):
+                order(db, users, f"CROSSPAGE-合成跨页-{number + 1:02}")
         server.DB = db
         def blocked(*_args, **_kwargs):
             raise RuntimeError("Local synthetic demo blocks all external requests")
@@ -42,9 +46,9 @@ def main():
                     self.send_bytes("""<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>昆明顺丰与手动选择 · 仅本地测试</title>
                     <style>body{font:16px system-ui;line-height:1.7;max-width:820px;margin:40px auto;padding:20px}section{border:1px solid #ddd;border-radius:16px;margin:16px 0;padding:18px}a{display:inline-block;background:#066cff;color:white;padding:10px 16px;border-radius:9px;text-decoration:none}</style>
                     <h1>昆明顺丰与手动选择：三个合成案例</h1><p>没有真实联系人、地址、订单或网点。本机专用，已封锁所有真实快递调用。创建的批次只保存在临时演示库。</p>
-                    <section><h2>1. 每批手动选择</h2><p>进入后台点“批量打单”，初始没有任何默认方案，不能提交。选择昆明中通或版纳圆通后重新勾选；关闭再打开仍为空。</p><a href="/demo/admin">进入演示后台</a></section>
+                    <section><h2>1. 先选订单，再选物流</h2><p>进入后台点“批量打单”，初始没有默认方案。点击“取消全选”，勾选两单，再选择昆明中通或版纳圆通，两单保持选中；不再重新勾选。</p><a href="/demo/admin">进入演示后台</a></section>
                     <section><h2>2. 顺丰模板待补充</h2><p>选择昆明顺丰，提示先配置基础模板，不能误用中通模板下单。可在设置页填写测试 URL：https://cloudprint.cainiao.com/template/standard/SYNTHETIC-SF 。此地址仅作本地测试，不是真实模板。</p><a href="/demo/settings">填写合成模板</a></section>
-                    <section><h2>3. 三方案切换与锁定</h2><p>模板保存后可选择顺丰。方案切换清空旧勾选，确认弹窗显示网点、地址、快递；提交的合成批次保留原配置。此演示不启动真实取号或打印。</p><a href="/demo/admin">体验长内容与切换</a></section>
+                    <section><h2>3. 跨页勾选／全选不丢失</h2><p>跨页测试模式提供 53 条合成记录：分别在两页勾选，再切换物流，已选数量和当前页不变。“全选筛选结果”后切换仍保留全部范围。确认弹窗按新方案统一显示快递，不沿用旧页面的快递。此演示不启动真实取号或打印。</p><a href="/demo/admin">体验长内容与切换</a></section>
                     <p>演示库退出时删除；正式环境不安装这些案例。测试账号仅本地：admin / local-demo-only-2026。</p></html>""".encode(), "text/html; charset=utf-8")
                     return
                 if path in {"/demo/admin", "/demo/settings"}:
