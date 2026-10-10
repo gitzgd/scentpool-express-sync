@@ -150,7 +150,9 @@ def main():
         # Editing cannot change the original submission identity or its retry outcome.
         assert db.create_shipment(users["store"], resend_payload)["id"] == resend["id"]
         db.update_shipment_items(resend["id"], users["store"], {"items": payload()["items"]})
-        db.create_shipping_batch(users["admin"], [{"id": resend["id"], "express_company": "圆通"}], {"shipment_group": "aftersales"})
+        from fulfillment_profiles_test import configure, book
+        configure(db, users)
+        book(db, users, resend, "banna")
         expect_error(lambda: db.update_shipment_items(resend["id"], users["store"], {"items": payload()["items"]}), 409)
         expect_error(lambda: db.update_shipment_context(resend["id"], users["store"], {"internal_note": "locked"}), 409)
         for row in (resend, exchange, cooperation):

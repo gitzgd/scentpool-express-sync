@@ -140,23 +140,25 @@ def run():
         print("durable queue: atomic save, dedupe, isolation, ABA, cooldown, bounded retries, restart recovery PASS")
     with tempfile.TemporaryDirectory(prefix="scentpool-capacity-") as tmp:
         db=Database(str(Path(tmp)/"test.db")); users=seed(db); q=TrackingQueue(db)
+        from fulfillment_profiles_test import configure
+        configure(db, users)
         rows=[shipment(db,users,str(i)) for i in range(1,322)]
         with db.connect() as c:
             c.execute("UPDATE shipping_settings SET default_company='京东' WHERE id=1")
             c.execute("UPDATE shipments SET express_company='顺丰' WHERE id=?",(rows[0]["id"],))
-        preview=db.preview_shipping_batch(users["admin"],{})
+        preview=db.preview_shipping_batch(users["admin"],{},profile_id="kunming_sf")
         assert preview["eligible_count"]==321 and len(preview["eligible"])==50
         assert len(db.preview_shipping_batch(users["admin"],{},page=7)["eligible"])==21
         # Item changes within the same second still invalidate the preview.
         db.update_shipment_items(rows[1]["id"],users["store"],{"items":[{"barcode":"DEMO-PRODUCT","quantity":2}]})
-        fails(lambda:db.create_shipping_batch(users["admin"],[],{},selection_mode="all_matching",preview_fingerprint=preview["preview_fingerprint"]),409)
-        preview=db.preview_shipping_batch(users["admin"],{})
-        batch=db.create_shipping_batch(users["admin"],[],{},selection_mode="all_matching",preview_fingerprint=preview["preview_fingerprint"])
+        fails(lambda:db.create_shipping_batch(users["admin"],[],{},profile_id="kunming_sf",selection_mode="all_matching",preview_fingerprint=preview["preview_fingerprint"]),409)
+        preview=db.preview_shipping_batch(users["admin"],{},profile_id="kunming_sf")
+        batch=db.create_shipping_batch(users["admin"],[],{},profile_id="kunming_sf",selection_mode="all_matching",preview_fingerprint=preview["preview_fingerprint"])
         assert batch["batch"]["total_count"]==321 and len(batch["items"])==50
         assert db.get_shipping_batch(batch["batch"]["id"],status="失败")["items"]==[]
         all_items=[item for p in range(1,8) for item in db.get_shipping_batch(batch["batch"]["id"],page=p)["items"]]
         assert next(i for i in all_items if i["shipment_id"]==rows[0]["id"])["express_company"]=="顺丰"
-        assert all(i["express_company"]=="京东" for i in all_items if i["shipment_id"]!=rows[0]["id"])
+        assert all(i["express_company"]=="顺丰" for i in all_items)  # explicit profile beats row/global defaults
         assert not {"response_raw","callback_salt","cancel_param_json","request_id"}.intersection(batch["items"][0])
         # Provider success is never rejected when the scheduling admission capacity is reached.
         with patch("tracking_queue.MAX_ACTIVE",0):

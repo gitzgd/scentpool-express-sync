@@ -2289,24 +2289,20 @@ function renderShippingBatchPreview() {
         <button class="btn primary" id="applyBatchFilters" type="button">筛选</button>
         <button class="btn secondary" id="resetBatchFilters" type="button">清空</button>
       </div>
-      ${!preview.settings_ready ? `<div class="notice danger-notice">总部寄件信息未完成，请先进入“面单设置”。</div>` : ""}
+      ${!preview.settings_ready && !preview.profile_error ? `<div class="notice danger-notice">总部寄件信息未完成，请先进入“面单设置”。</div>` : ""}
       ${!preview.label_ready ? `<div class="notice danger-notice">菜鸟电子面单账号尚未授权。</div>` : ""}
       ${preview.profile_error ? `<div class="notice danger-notice" role="alert">${escapeHtml(preview.profile_error)}</div>` : ""}
+      ${preview.profile_warning ? `<div class="notice" role="status">${escapeHtml(preview.profile_warning)}</div>` : ""}
       ${!config.enabled ? `<div class="notice danger-notice">电子面单服务开关未开启：请在 Render 将 <strong>SCENTPOOL_KUAIDI100_LABEL_ENABLED</strong> 设置为 <strong>1</strong>。</div>` : ""}
       ${missingConfig.length ? `<div class="notice danger-notice">Render 还缺少：<strong>${missingConfig.map(escapeHtml).join("、")}</strong>。补齐并重新部署后即可正式提交。</div>` : ""}
       <div class="batch-controls label-batch-controls">
         <div class="field fulfillment-choice">
           <label for="batchProfile">本批次从哪里发货</label>
           <select class="select" id="batchProfile">
-            ${!state.shippingSettings?.default_profile_id ? `<option value="" ${!preview.profile ? "selected" : ""}>原总部配置（尚未切换）</option>` : ""}
-            ${(state.shippingSettings?.fulfillment_profiles || []).map(p => `<option value="${escapeHtml(p.id)}" ${preview.profile?.id === p.id ? "selected" : ""}>${escapeHtml(p.name)} · ${escapeHtml(p.express_company)}${p.id === state.shippingSettings?.default_profile_id ? "（默认）" : ""}</option>`).join("")}
+            <option value="" ${!preview.profile ? "selected" : ""}>请选择发货方案（必选）</option>
+            ${(state.shippingSettings?.fulfillment_profiles || []).map(p => `<option value="${escapeHtml(p.id)}" ${preview.profile?.id === p.id ? "selected" : ""}>${escapeHtml(p.name)} · ${escapeHtml(p.express_company)}${p.id === "kunming_sf" && !p.third_template_url ? "（待配置模板）" : ""}</option>`).join("")}
           </select>
         </div>
-        ${!preview.profile ? `
-        <div class="field">
-          <label>已选订单统一改为</label>
-          <select class="select" id="batchBulkCompany"><option value="" ${state.batchBulkCompany ? "" : "selected"}>保持各单原快递</option>${EXPRESS_COMPANIES.map(company => `<option value="${company}" ${company === state.batchBulkCompany ? "selected" : ""}>${company}</option>`).join("")}</select>
-        </div>` : ""}
         <div class="inline-actions batch-selection-actions">
           <button class="btn secondary small" id="selectAllBatchOrders" type="button">全选筛选结果</button>
           <button class="btn ghost small" id="clearBatchOrders" type="button">取消全选</button>
@@ -2321,7 +2317,7 @@ function renderShippingBatchPreview() {
           <div class="batch-order-row" data-batch-shipment="${row.id}">
             <input class="batch-order-checkbox" type="checkbox" data-batch-select value="${row.id}" aria-label="选择订单 ${escapeHtml(row.business_id)}" ${selectedIds.has(Number(row.id)) ? "checked" : ""} />
             <div>${shipmentTypeBadge(row)}<strong>${escapeHtml(row.business_id)}</strong><div class="muted mini">${escapeHtml(row.store_name_snapshot)} · ${escapeHtml(row.recipient_name)} · ${escapeHtml(row.address)}</div>${row.return_unsigned_warning ? `<p class="notice">退货尚未签收，请总部核对后决定发货</p>` : ""}</div>
-            ${preview.profile ? `<span class="status shipped">${escapeHtml(preview.profile.express_company)}</span>` : `<select class="select" data-batch-company>${expressCompanyOptions(state.batchCompanyOverrides[row.id] || state.batchBulkCompany || row.express_company)}</select>`}
+            ${preview.profile ? `<span class="status shipped">${escapeHtml(preview.profile.express_company)}</span>` : `<span class="muted">待选择发货方案</span>`}
           </div>
         `).join("") || `<div class="empty">当前筛选没有可下单订单</div>`}
       </div>
@@ -3144,7 +3140,7 @@ function bindAdmin(root = document) {
   if (previewButton) {
     previewButton.addEventListener("click", async (event) => {
       try {
-        state.batchProfileId = null; // Each new preview starts from the configured default.
+        state.batchProfileId = ""; // Never reuse a default or the previous batch's selection.
         state.batchFilters = {
           ...state.adminFilters,
           store_id: state.adminFilters.store_id,
@@ -3258,6 +3254,10 @@ function bindAdmin(root = document) {
   dom.getElementById("createShippingBatch")?.addEventListener("click", async (event) => {
     const button = event.currentTarget;
     if (busyOperations.has(button)) return;
+    if (!state.batchProfileId || !state.batchPreview?.settings_ready) {
+      toast(state.batchPreview?.profile_error || "请先手动选择并核对发货方案。");
+      return;
+    }
     const shipments = (state.batchSelectAll ? Object.keys(state.batchCompanyOverrides).map(Number) : state.batchSelectedIds)
       .map(id => ({ id, ...(state.batchCompanyOverrides[id] || state.batchBulkCompany ? { express_company: state.batchCompanyOverrides[id] || state.batchBulkCompany } : {}) }));
     const total = state.batchSelectAll ? Number(state.batchPreview.eligible_count || 0) : shipments.length;
@@ -3558,34 +3558,40 @@ async function renderStores() {
   bindStores();
 }
 
+function branchBalanceLabel(branch) {
+  if (branch.company === "顺丰" && branch.tbNet === "SF" && !branch.branchCode && Number(branch.quantity || 0) <= 0) return "直营授权 · 额度需由顺丰确认";
+  return `余 ${Number(branch.quantity) || 0}`;
+}
+
 function renderFulfillmentSettings(settings) {
   const saved = settings.fulfillment_profiles || [];
   return `<section class="panel panel-pad fulfillment-settings"><div class="section-title"><div><h2>发货方案</h2><p class="muted">地址可随时编辑，仅影响新提交的批次。已排队、失败重试和已生成面单保留原信息。门店归属不变。</p></div></div>
-    <div class="notice">先保存原版纳方案，再配置昆明中台并设为默认。菜鸟账号中的地址不会自动覆盖这里；修改地址后请同时核对网点承接范围。当前仅下载 PDF 后本地打印。</div>
-    <div class="fulfillment-profile-grid">${[["banna", "版纳门店发货", "圆通"], ["kunming", "昆明中台发货", "中通"]].map(([id, name, company]) => {
+    <div class="notice">每次打单必须手动选择方案，不设默认。三个方案共用现有菜鸟授权，地址、网点和模板独立保存；菜鸟地址不会自动覆盖这里。当前仅下载 PDF 后本地打印。</div>
+    <div class="fulfillment-profile-grid">${[["banna", "版纳门店发货", "圆通"], ["kunming", "昆明中台发货", "中通"], ["kunming_sf", "昆明中台顺丰", "顺丰"]].map(([id, name, company]) => {
       const existing = saved.find(p => p.id === id);
       const carrier = settings.carrier_settings?.[company] || {};
+      const origin = id === "kunming_sf" ? (saved.find(p => p.id === "kunming") || {}) : id === "banna" ? settings : {};
       const p = existing || {id, name, express_company: company,
-        sender_name: id === "banna" ? settings.sender_name : "", sender_mobile: id === "banna" ? settings.sender_mobile : "",
-        sender_address: id === "banna" ? settings.sender_address : "", sender_company: settings.sender_company || "",
-        tbNet: carrier.tbNet || "", exp_type: carrier.expType || "标准快递", pay_type: settings.pay_type || "MONTHLY",
-        third_template_url: carrier.thirdTemplateURL || "", third_custom_template_url: carrier.thirdCustomTemplateUrl || ""};
+        sender_name: origin.sender_name || "", sender_mobile: origin.sender_mobile || "",
+        sender_address: origin.sender_address || "", sender_company: origin.sender_company || settings.sender_company || "",
+        tbNet: id === "kunming_sf" ? "" : carrier.tbNet || "", exp_type: carrier.expType || (company === "顺丰" ? "顺丰标快" : "标准快递"), pay_type: settings.pay_type || "MONTHLY",
+        third_template_url: id === "kunming_sf" ? "" : carrier.thirdTemplateURL || "", third_custom_template_url: id === "kunming_sf" ? "" : carrier.thirdCustomTemplateUrl || ""};
       const branches = (settings.branch_options || []).filter(b => b.company === company);
-      return `<form class="fulfillment-profile-form" data-profile-form="${id}"><h3>${escapeHtml(name)} · ${company}${settings.default_profile_id === id ? "（默认）" : ""}</h3>
-        <p class="muted mini" data-profile-saved>${existing ? "已保存" : "尚未启用；保存不会创建面单"}</p><div class="form-grid">
+      return `<form class="fulfillment-profile-form" data-profile-form="${id}"><h3>${escapeHtml(name)} · ${company}</h3>
+        <p class="muted mini" data-profile-saved>${existing ? (id === "kunming_sf" && !p.third_template_url ? "已保存 · 待配置顺丰基础模板，暂不能下单" : "已保存") : "尚未启用；保存不会创建面单"}</p><div class="form-grid">
         <div class="field full"><label>方案名称<input class="input" name="name" maxlength="100" required value="${escapeHtml(p.name)}"></label></div>
         <div class="field"><label>寄件联系人<input class="input" name="sender_name" maxlength="100" required value="${escapeHtml(p.sender_name || "")}"></label></div>
         <div class="field"><label>联系电话<input class="input" name="sender_mobile" type="tel" maxlength="100" required value="${escapeHtml(p.sender_mobile || "")}"></label></div>
         <div class="field full"><label>寄件公司<input class="input" name="sender_company" maxlength="100" value="${escapeHtml(p.sender_company || "")}"></label></div>
         <div class="field full"><label>完整寄件地址<textarea class="textarea" name="sender_address" maxlength="500" required>${escapeHtml(p.sender_address || "")}</textarea></label></div>
-        <div class="field full"><label>菜鸟授权网点<select class="select" name="tbNet" required><option value="">请先刷新授权网点</option>${p.tbNet && !branches.some(b => b.tbNet === p.tbNet) ? `<option value="${escapeHtml(p.tbNet)}" selected>${escapeHtml(p.tbNet)}（需重新核验）</option>` : ""}${branches.map(b => `<option value="${escapeHtml(b.tbNet)}" ${b.tbNet === p.tbNet ? "selected" : ""}>${escapeHtml(b.branchName || b.tbNet)} · ${escapeHtml(b.branchCode || "")} · 余 ${Number(b.quantity) || 0}</option>`).join("")}</select></label></div>
+        <div class="field full"><label>菜鸟授权网点<select class="select" name="tbNet" required><option value="">请先刷新授权网点</option>${p.tbNet && !branches.some(b => b.tbNet === p.tbNet) ? `<option value="${escapeHtml(p.tbNet)}" selected>${escapeHtml(p.tbNet)}（需重新核验）</option>` : ""}${branches.map(b => `<option value="${escapeHtml(b.tbNet)}" ${b.tbNet === p.tbNet ? "selected" : ""}>${escapeHtml(b.branchName || b.tbNet)} · ${escapeHtml(b.branchCode || "")} · ${branchBalanceLabel(b)}</option>`).join("")}</select></label></div>
         <div class="field"><label>产品类型<input class="input" name="exp_type" maxlength="100" required value="${escapeHtml(p.exp_type)}"></label></div>
+        ${id === "kunming_sf" ? `<div class="field"><label>顺丰月结账号（按结算约定填写，非密钥）<input class="input" name="monthly_account" inputmode="numeric" maxlength="100" value="${escapeHtml(p.monthly_account || "")}"></label><p class="muted mini">菜鸟网点接口不返回月结账号；如使用月结，请核对菜鸟绑定的顺丰月结号。寄方付无需填写。</p></div>` : ""}
         <div class="field"><label>付款方式<select class="select" name="pay_type"><option value="MONTHLY" ${p.pay_type === "MONTHLY" ? "selected" : ""}>月结</option><option value="SHIPPER" ${p.pay_type === "SHIPPER" ? "selected" : ""}>寄方付</option></select></label></div>
-        <div class="field full"><label>菜鸟基础模板（可留空使用平台默认）<input class="input" name="third_template_url" type="url" maxlength="500" value="${escapeHtml(p.third_template_url)}"></label></div>
+        <div class="field full"><label>菜鸟基础模板（${id === "kunming_sf" ? "可稍后填写，填好前不能顺丰下单" : "可留空使用平台默认"}）<input class="input" name="third_template_url" type="url" maxlength="500" value="${escapeHtml(p.third_template_url)}"></label></div>
         <div class="field full"><label>货品自定义区模板（选填）<input class="input" name="third_custom_template_url" type="url" maxlength="500" value="${escapeHtml(p.third_custom_template_url)}"></label></div>
-        </div><p class="muted mini">中通不能沿用圆通专用模板。默认模板的商品明细展示需在正式启用前核对。</p>
-        <label class="check-row"><input type="checkbox" name="make_default" ${settings.default_profile_id === id ? "checked" : ""}>设为新批次默认方案</label>
-        <div class="inline-actions"><button class="btn primary" type="submit">保存${id === "kunming" ? "中台" : "版纳"}方案</button></div><p class="profile-save-result" role="status" aria-live="polite"></p>
+        </div><p class="muted mini">不同快递不能混用专用模板。顺丰请选择菜鸟顺丰速运模板，并核对授权支持的产品类型；不需要另外填写顺丰直连密钥。</p>
+        <div class="inline-actions"><button class="btn primary" type="submit">保存${company}方案</button></div><p class="profile-save-result" role="status" aria-live="polite"></p>
       </form>`;
     }).join("")}</div></section>`;
 }
@@ -3597,16 +3603,15 @@ function bindFulfillmentSettings() {
     const result = form.querySelector(".profile-save-result");
     const values = new FormData(form), id = form.dataset.profileForm;
     const existing = state.shippingSettings.fulfillment_profiles?.find(p => p.id === id);
-    const payload = {...Object.fromEntries(values.entries()), id, revision: existing?.revision || 0, make_default: values.has("make_default")};
+    const payload = {...Object.fromEntries(values.entries()), id, revision: existing?.revision || 0};
     try {
       const response = await withButtonBusy(button, "保存中…", () => api("/api/admin/fulfillment-profiles", {method: "PUT", body: JSON.stringify(payload)}));
       state.shippingSettings = response.settings;
       document.querySelectorAll("[data-profile-form]").forEach(other => {
-        other.querySelector('[name="make_default"]').checked = other.dataset.profileForm === response.settings.default_profile_id;
         const saved = response.settings.fulfillment_profiles.find(p => p.id === other.dataset.profileForm);
         if (saved) {
-          other.querySelector("h3").textContent = `${saved.name} · ${saved.express_company}${saved.id === response.settings.default_profile_id ? "（默认）" : ""}`;
-          other.querySelector("[data-profile-saved]").textContent = "已保存";
+          other.querySelector("h3").textContent = `${saved.name} · ${saved.express_company}`;
+          other.querySelector("[data-profile-saved]").textContent = saved.id === "kunming_sf" && !saved.third_template_url ? "已保存 · 待配置顺丰基础模板，暂不能下单" : "已保存";
         }
       });
       result.textContent = "已保存。仅新提交的批次使用本次设置；原面单和已排队任务未改变。";
@@ -3634,7 +3639,7 @@ async function renderShippingSettings() {
     const options = branchOptions.filter((item) => item.company === company);
     return `<select class="select" data-carrier-branch="${company}">
       <option value="">${options.length ? "选择授权网点" : "授权后刷新网点"}</option>
-      ${options.map((item) => `<option value="${escapeHtml(item.tbNet)}" ${item.tbNet === current ? "selected" : ""}>${escapeHtml(item.branchName || item.tbNet)} · 余 ${item.quantity}</option>`).join("")}
+      ${options.map((item) => `<option value="${escapeHtml(item.tbNet)}" ${item.tbNet === current ? "selected" : ""}>${escapeHtml(item.branchName || item.tbNet)} · ${branchBalanceLabel(item)}</option>`).join("")}
     </select>`;
   };
   const content = `

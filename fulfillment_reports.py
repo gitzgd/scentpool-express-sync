@@ -109,9 +109,11 @@ class Report:
                 COUNT(DISTINCT CASE WHEN json_valid(b.settings_snapshot_json)
                     THEN json_extract(b.settings_snapshot_json,'$.profile_id') END) AS origins,
                 MIN(CASE WHEN json_valid(b.settings_snapshot_json)
-                    THEN json_extract(b.settings_snapshot_json,'$.profile_id') END) AS channel,
+                    THEN CASE json_extract(b.settings_snapshot_json,'$.profile_id')
+                        WHEN 'kunming_sf' THEN 'kunming'
+                        ELSE json_extract(b.settings_snapshot_json,'$.profile_id') END END) AS channel,
                 SUM(CASE WHEN json_valid(b.settings_snapshot_json) THEN
-                    CASE WHEN json_extract(b.settings_snapshot_json,'$.profile_id') IN ('banna','kunming')
+                    CASE WHEN json_extract(b.settings_snapshot_json,'$.profile_id') IN ('banna','kunming','kunming_sf')
                         THEN 0 ELSE 1 END ELSE 1 END) AS bad
             FROM scoped s LEFT JOIN shipping_batch_items b
                 ON b.shipment_id=s.id AND b.request_id=s.booking_request_id
