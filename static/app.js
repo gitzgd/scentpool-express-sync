@@ -61,6 +61,7 @@ const state = {
   batchKnownCompanies: {},
   batchBulkCompany: "",
   batchProfileId: null,
+  batchPreviewLoading: false,
   adminRowDrafts: new Map(),
   batchProgressPage: 1,
   batchProgressFailedOnly: false,
@@ -114,6 +115,7 @@ function invalidatePage({ clearIdentity = false } = {}) {
   clearTimeout(state.trackingPollTimer);
   state.shippingBatchPollTimer = state.trackingPollTimer = null;
   state.adminRowDrafts.clear();
+  state.batchPreviewLoading = false;
   if (clearIdentity) {
     state.stores = []; state.productsGrouped = null; state.productsAll = [];
     state.shipments = []; state.storeShipments = []; state.returnOrders = []; state.storeReturnOrders = [];
@@ -721,21 +723,54 @@ async function loadShippingSettings() {
   state.shippingConfig = data.shipping || {};
 }
 
-async function loadShippingBatchPreview(filters, { reset = true } = {}) {
-  const current = beginLoad("batchPreview");
-  if (reset) {
-    state.batchPreviewPage = 1; state.batchSelectAll = true; state.batchSelectedIds = [];
-    state.batchCompanyOverrides = {}; state.batchKnownTypes = {}; state.batchKnownCompanies = {}; state.batchBulkCompany = "";
-  }
-  const data = await api("/api/admin/shipping-batches/preview", {
-    method: "POST",
-    body: JSON.stringify({ filters, page: state.batchPreviewPage, page_size: 50, profile_id: state.batchProfileId }),
+function setBatchPreviewBusy(busy) {
+  document.querySelectorAll("#shippingBatchPreviewHost input, #shippingBatchPreviewHost select, #shippingBatchPreviewHost button").forEach(node => {
+    if (node.id === "closeBatchPreview") return;
+    if (busy) {
+      if (node.dataset.previewDisabled === undefined) node.dataset.previewDisabled = node.disabled ? "1" : "0";
+      node.disabled = true;
+    } else if (node.dataset.previewDisabled !== undefined) {
+      node.disabled = node.dataset.previewDisabled === "1";
+      delete node.dataset.previewDisabled;
+    }
   });
-  current();
-  state.batchPreview = data.preview || null;
-  for (const row of state.batchPreview?.eligible || []) {
-    state.batchKnownTypes[row.id] = row.shipment_type || "legacy";
-    state.batchKnownCompanies[row.id] = row.express_company || DEFAULT_EXPRESS_COMPANY;
+  const progress = document.getElementById("batchPreviewLoading");
+  if (progress) progress.textContent = busy ? "正在核对发货方案和订单，请稍候；已选订单会保留。" : "";
+}
+
+async function loadShippingBatchPreview(filters, { reset = true, profileId = state.batchProfileId, page = reset ? 1 : state.batchPreviewPage } = {}) {
+  const current = beginLoad("batchPreview");
+  state.batchPreviewLoading = true;
+  setBatchPreviewBusy(true);
+  try {
+    const data = await api("/api/admin/shipping-batches/preview", {
+      method: "POST",
+      body: JSON.stringify({ filters, page, page_size: 50, profile_id: profileId }),
+    });
+    current();
+    if (!data.preview) throw new Error("订单预览未返回，请重试；原选择已保留。");
+    // Commit the scope, profile and fingerprint together, only after a successful read.
+    if (reset) {
+      state.batchSelectAll = true; state.batchSelectedIds = [];
+      state.batchKnownTypes = {}; state.batchKnownCompanies = {};
+    }
+    if (reset || profileId !== state.batchProfileId) {
+      state.batchCompanyOverrides = {}; state.batchBulkCompany = "";
+    }
+    state.batchProfileId = profileId;
+    state.batchFilters = { ...filters };
+    state.batchPreviewPage = data.preview.pagination?.page || page;
+    state.batchPreview = data.preview;
+    for (const row of state.batchPreview.eligible || []) {
+      state.batchKnownTypes[row.id] = row.shipment_type || "legacy";
+      state.batchKnownCompanies[row.id] = row.express_company || DEFAULT_EXPRESS_COMPANY;
+    }
+  } catch (error) {
+    current(); // A late failure must not roll back a newer successful choice.
+    throw error;
+  } finally {
+    try { current(); state.batchPreviewLoading = false; setBatchPreviewBusy(false); }
+    catch { /* Closed, navigated away, or superseded: do not touch the new view. */ }
   }
 }
 
@@ -2309,6 +2344,8 @@ function renderShippingBatchPreview() {
         </div>
         <button class="btn primary" id="createShippingBatch" data-ready="${preview.settings_ready && preview.label_ready && configReady ? "1" : "0"}" type="button" ${selectedCount && preview.settings_ready && preview.label_ready && configReady ? "" : "disabled"}>确认提交 ${selectedCount} 单</button>
       </div>
+      <div class="muted mini" id="batchPreviewLoading" role="status" aria-live="polite"></div>
+      <div class="muted mini">可先筛选并勾选订单，再选择发货方案；切换方案保留勾选和当前预览页，不会自动增加手动选择的订单。</div>
       ${preview.profile ? `<div class="notice fulfillment-summary"><strong>${escapeHtml(preview.profile.name)} · ${escapeHtml(preview.profile.express_company)}</strong><br>授权网点：${escapeHtml(preview.profile.tbNet)}<br>寄件：${escapeHtml(preview.profile.sender_name)} · ${escapeHtml(preview.profile.sender_mobile)}<br>${escapeHtml(preview.profile.sender_address)}<br><span class="muted">本批次统一使用此方案；提交后锁定地址、网点与授权。已有面单下载或复打不会换方案。</span></div>` : ""}
       <div class="notice" id="batchTypeCounts">${Object.entries(preview.type_counts || {}).filter(([, count]) => count).map(([key, count]) => `${SHIPMENT_TYPES[key]?.[0] || key} ${count} 单`).join(" · ")}（预览总量，确认时按实际勾选复核）</div>
       <div class="notice">提交后将立即获取快递单号并生成电子面单，不再创建上门取件预约。</div>
@@ -2976,11 +3013,13 @@ function shippingBatchConfirmationSummary(shipments, total) {
     }
     companyCounts[company] = (companyCounts[company] || 0) + 1;
   }
+  // Every selected page uses this profile, not cached carriers from previous previews.
+  const profileCompany = state.batchPreview.profile?.express_company;
   return {
     total,
     scope: state.batchSelectAll ? "整个筛选范围（包含其他预览页）" : "仅手动勾选的订单（包含跨页勾选）",
     typeSummary: Object.entries(typeCounts).filter(([, count]) => count > 0).map(([type, count]) => `${SHIPMENT_TYPES[type]?.[0] || "历史未分类"} ${count} 单`).join("、"),
-    companySummary: Object.entries(companyCounts).filter(([, count]) => count > 0).map(([company, count]) => `${company} ${count} 单`).join("、"),
+    companySummary: profileCompany ? `${profileCompany} ${total} 单` : Object.entries(companyCounts).filter(([, count]) => count > 0).map(([company, count]) => `${company} ${count} 单`).join("、"),
     profile: state.batchPreview.profile || null,
   };
 }
@@ -3139,9 +3178,9 @@ function bindAdmin(root = document) {
   const previewButton = dom.getElementById("previewShippingBatch");
   if (previewButton) {
     previewButton.addEventListener("click", async (event) => {
+      if (state.batchPreviewLoading) return;
       try {
-        state.batchProfileId = ""; // Never reuse a default or the previous batch's selection.
-        state.batchFilters = {
+        const filters = {
           ...state.adminFilters,
           store_id: state.adminFilters.store_id,
           status: "待处理",
@@ -3149,7 +3188,8 @@ function bindAdmin(root = document) {
           date_to: state.adminFilters.date_to,
           q: state.adminFilters.q,
         };
-        await withButtonBusy(event.currentTarget, "正在加载…", () => loadShippingBatchPreview(state.batchFilters));
+        // Never reuse a default or the previous batch's profile.
+        await withButtonBusy(event.currentTarget, "正在加载…", () => loadShippingBatchPreview(filters, { profileId: "" }));
         updateBatchPreviewUi(); updateShippingBatchUi(); scheduleShippingBatchPoll();
       } catch (error) {
         errorToast(error);
@@ -3157,6 +3197,8 @@ function bindAdmin(root = document) {
     });
   }
   dom.getElementById("closeBatchPreview")?.addEventListener("click", () => {
+    beginLoad("batchPreview"); // Invalidate in-flight reads, including late failures.
+    state.batchPreviewLoading = false;
     state.batchPreview = null;
     state.batchSelectedIds = [];
     updateBatchPreviewUi(); updateShippingBatchUi(); scheduleShippingBatchPoll();
@@ -3194,7 +3236,7 @@ function bindAdmin(root = document) {
     updateBatchSelection();
   });
   dom.getElementById("applyBatchFilters")?.addEventListener("click", async () => {
-    state.batchFilters = {
+    const filters = {
       ...state.batchFilters,
       store_id: dom.getElementById("batchFilterStore").value,
       status: "待处理",
@@ -3203,37 +3245,32 @@ function bindAdmin(root = document) {
       q: dom.getElementById("batchFilterQ").value.trim(),
     };
     try {
-      await loadShippingBatchPreview(state.batchFilters);
+      await loadShippingBatchPreview(filters);
       updateBatchPreviewUi(); updateShippingBatchUi(); scheduleShippingBatchPoll();
     } catch (error) {
       errorToast(error);
     }
   });
   dom.getElementById("resetBatchFilters")?.addEventListener("click", async () => {
-    state.batchFilters = { ...state.batchFilters, store_id: "", status: "待处理", date_from: "", date_to: "", q: "" };
+    const filters = { ...state.batchFilters, store_id: "", status: "待处理", date_from: "", date_to: "", q: "" };
     try {
-      await loadShippingBatchPreview(state.batchFilters);
+      await loadShippingBatchPreview(filters);
       updateBatchPreviewUi(); updateShippingBatchUi(); scheduleShippingBatchPoll();
     } catch (error) {
       errorToast(error);
     }
   });
   dom.getElementById("batchProfile")?.addEventListener("change", async (event) => {
-    const select = event.currentTarget;
-    const oldId = state.batchProfileId;
-    state.batchProfileId = select.value;
-    select.disabled = true;
-    state.batchSelectAll = false; state.batchSelectedIds = [];
-    dom.getElementById("createShippingBatch").disabled = true;
+    if (state.batchPreviewLoading) return;
+    const profileId = event.currentTarget.value;
     try {
-      await loadShippingBatchPreview(state.batchFilters);
-      state.batchSelectAll = false; state.batchSelectedIds = [];
+      await loadShippingBatchPreview(state.batchFilters, { reset: false, profileId });
       updateBatchPreviewUi();
-      toast("发货方案已切换，请重新勾选订单并核对地址。");
+      toast("已保留订单选择，请核对本批次快递和寄件地址。");
     } catch (error) {
-      state.batchProfileId = oldId;
-      state.batchPreview = null; updateBatchPreviewUi();
-      errorToast(error, "方案切换失败，请重新打开批量打单。");
+      if (error instanceof StaleViewError) return;
+      updateBatchPreviewUi();
+      toast(`方案未切换，原方案和订单选择已保留，请重试。${error.message || ""}`);
     }
   });
   dom.getElementById("batchBulkCompany")?.addEventListener("change", (event) => {
@@ -3247,13 +3284,14 @@ function bindAdmin(root = document) {
     state.batchCompanyOverrides[node.closest("[data-batch-shipment]").dataset.batchShipment] = node.value;
   }));
   dom.querySelectorAll("[data-batch-preview-page]").forEach(node => node.addEventListener("click", async () => {
-    state.batchPreviewPage = Number(node.dataset.batchPreviewPage);
-    try { await withButtonBusy(node, "读取中…", () => loadShippingBatchPreview(state.batchFilters, { reset: false })); updateBatchPreviewUi(); }
+    const page = Number(node.dataset.batchPreviewPage);
+    try { await withButtonBusy(node, "读取中…", () => loadShippingBatchPreview(state.batchFilters, { reset: false, page })); updateBatchPreviewUi(); }
     catch (error) { errorToast(error); }
   }));
   dom.getElementById("createShippingBatch")?.addEventListener("click", async (event) => {
     const button = event.currentTarget;
     if (busyOperations.has(button)) return;
+    if (state.batchPreviewLoading) { toast("正在核对发货方案，请稍候再提交；已选订单已保留。"); return; }
     if (!state.batchProfileId || !state.batchPreview?.settings_ready) {
       toast(state.batchPreview?.profile_error || "请先手动选择并核对发货方案。");
       return;
@@ -3266,6 +3304,7 @@ function bindAdmin(root = document) {
       return;
     }
     const summary = shippingBatchConfirmationSummary(shipments, total);
+    const preview = state.batchPreview;
     const payload = {
       filters: { ...state.batchFilters }, shipments,
       selection_mode: state.batchSelectAll ? "all_matching" : "selected",
@@ -3277,6 +3316,10 @@ function bindAdmin(root = document) {
     try {
       const data = await withButtonBusy(button, "等待核对…", async () => {
         if (!await confirmShippingBatch(summary) || epoch !== pageEpoch) return null;
+        if (state.batchPreviewLoading || state.batchPreview !== preview) {
+          toast("订单预览或发货方案已变化，请核对后重新提交。");
+          return null;
+        }
         button.textContent = "正在创建任务…";
         return api("/api/admin/shipping-batches", { method: "POST", body: JSON.stringify(payload) });
       });

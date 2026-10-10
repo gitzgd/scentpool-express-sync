@@ -190,16 +190,123 @@ async function main() {
       assert.equal(JSON.parse(options.body).profile_id, "banna");
       return new Promise(done => { resolve = done; });
     };
-    h.run('state.batchSelectAll=true; state.batchSelectedIds=[1]; state.batchCompanyOverrides={1:"中通"}; updateBatchPreviewUi=()=>{}; bindAdmin()');
+    h.document.querySelectorAll = selector => selector.includes("#shippingBatchPreviewHost") ? [select, submit] : [];
+    h.run('state.batchProfileId="kunming"; state.batchSelectAll=true; state.batchSelectedIds=[1]; state.batchCompanyOverrides={1:"中通"}; updateBatchPreviewUi=()=>{}; bindAdmin()');
     const change = handlers.change({currentTarget:select});
     assert.equal(select.disabled,true); assert.equal(submit.disabled,true);
     resolve(response({preview:{eligible:[],profile:{id:"banna"}}}));
     await change;
-    assert.equal(h.run('state.batchSelectAll'),false);
-    assert.equal(h.run('state.batchSelectedIds.length'),0);
+    assert.equal(h.run('state.batchSelectAll'),true);
+    assert.equal(h.run('state.batchSelectedIds.length'),1);
     assert.equal(h.run('Object.keys(state.batchCompanyOverrides).length'),0);
+    assert.equal(h.run('state.batchProfileId'),"banna");
+    assert.equal(h.run('state.batchPreviewLoading'),false);
   }
-  console.log("frontend reliability tests passed: latest response, identity isolation, double click, lost/deleted submission, hidden/navigation lifecycle, local progress, independent alerts, opaque task recovery, partial failures, drafts, full-scope pagination, fulfillment switching");
+  {
+    const h = harness(), requests = [];
+    h.run('state.batchProfileId=""; state.batchSelectAll=false; state.batchSelectedIds=[1,52]; state.batchPreviewPage=2; state.batchKnownTypes={1:"sale",52:"resend"}; state.batchKnownCompanies={1:"圆通",52:"圆通"}; state.batchFilters={q:"合成",store_id:"2"};');
+    for (const [profile, company] of [["kunming","中通"],["kunming_sf","顺丰"],["banna","圆通"],["",null]]) {
+      h.context.fetch = async (_url, options) => {
+        const body = JSON.parse(options.body); requests.push(body);
+        assert.equal(body.page,2); assert.equal(body.profile_id,profile);
+        return response({preview:{eligible_count:60,eligible:[{id:52,shipment_type:"resend",express_company:company}],pagination:{page:2,total_pages:2},profile:company?{id:profile,express_company:company}:null,preview_fingerprint:profile+"-new",settings_ready:!!company}});
+      };
+      await h.run(`loadShippingBatchPreview(state.batchFilters,{reset:false,profileId:${JSON.stringify(profile)}})`);
+      assert.equal(h.run('JSON.stringify(state.batchSelectedIds)'),"[1,52]");
+      assert.equal(h.run('state.batchSelectAll'),false);
+      assert.equal(h.run('state.batchPreviewPage'),2);
+      assert.equal(h.run('state.batchKnownTypes[1]'),"sale");
+      assert.equal(h.run('state.batchPreview.preview_fingerprint'),profile+"-new");
+      if (company) assert.equal(h.run('shippingBatchConfirmationSummary([{id:1},{id:52}],2).companySummary'),`${company} 2 单`);
+      assert.match(h.run('renderShippingBatchPreview()'),/确认提交 2 单/);
+    }
+    assert.equal(requests.every(item=>item.filters.q==="合成" && item.filters.store_id==="2"),true);
+    h.run('state.batchSelectedIds=[]');
+    await h.run('loadShippingBatchPreview(state.batchFilters,{reset:false,profileId:""})');
+    assert.equal(h.run('state.batchSelectedIds.length'),0); // Never silently reselect a cleared batch.
+  }
+  {
+    const h = harness(), handlers = {}, select = h.element(), submit = h.element();
+    select.value="kunming_sf";
+    select.addEventListener=(_name,fn)=>{handlers.change=fn;};
+    submit.addEventListener=(_name,fn)=>{handlers.submit=fn;};
+    h.document.getElementById=id=>id==="batchProfile"?select:id==="createShippingBatch"?submit:null;
+    h.document.querySelectorAll=selector=>selector.includes("#shippingBatchPreviewHost")?[select,submit]:[];
+    h.run('state.batchProfileId="kunming";state.batchFilters={q:"old"};state.batchSelectAll=false;state.batchSelectedIds=[1,52];state.batchPreviewPage=2;state.batchPreview={eligible:[],profile:{id:"kunming"},settings_ready:true,preview_fingerprint:"old"};updateBatchPreviewUi=()=>{};bindAdmin()');
+    let finish;
+    h.context.fetch=()=>new Promise(resolve=>{finish=resolve;});
+    const change=handlers.change({currentTarget:select});
+    await handlers.submit({currentTarget:submit});
+    assert.match(h.messages.at(-1),/正在核对/);
+    finish(response({error:"合成网络失败"},503)); await change;
+    assert.equal(h.run('state.batchProfileId'),"kunming");
+    assert.equal(h.run('state.batchPreview.preview_fingerprint'),"old");
+    assert.equal(h.run('JSON.stringify(state.batchSelectedIds)'),"[1,52]");
+    assert.equal(h.run('state.batchPreviewPage'),2);
+    assert.match(h.messages.at(-1),/原方案和订单选择已保留/);
+    // Failed filter reads also retain the old scope and choices atomically.
+    h.context.fetch=async()=>response({error:"合成读取失败"},503);
+    await assert.rejects(h.run('loadShippingBatchPreview({q:"new"})'));
+    assert.equal(h.run('state.batchFilters.q'),"old");
+    assert.equal(h.run('JSON.stringify(state.batchSelectedIds)'),"[1,52]");
+    h.context.fetch=async()=>response({preview:{eligible:[],eligible_count:0,profile:null}});
+    await h.run('loadShippingBatchPreview({q:"new"})');
+    assert.equal(h.run('state.batchFilters.q'),"new");
+    assert.equal(h.run('state.batchSelectedIds.length'),0); // A real scope change still resets selection.
+  }
+  {
+    const h=harness(), pending=[];
+    h.context.fetch=(_url,options)=>new Promise(resolve=>pending.push({body:JSON.parse(options.body),resolve}));
+    h.run('state.batchSelectAll=false;state.batchSelectedIds=[1,52];state.batchProfileId="kunming";state.batchPreview={profile:{id:"kunming"}}');
+    const old=h.run('loadShippingBatchPreview({}, {reset:false,profileId:"banna"})').catch(error=>error.constructor.name);
+    const latest=h.run('loadShippingBatchPreview({}, {reset:false,profileId:"kunming_sf"})');
+    pending[1].resolve(response({preview:{eligible:[],profile:{id:"kunming_sf",express_company:"顺丰"},settings_ready:false,profile_error:"缺模板",preview_fingerprint:"new"}}));
+    await latest;
+    pending[0].resolve(response({error:"迟到失败"},503));
+    assert.equal(await old,"StaleViewError");
+    assert.equal(h.run('state.batchProfileId'),"kunming_sf");
+    assert.equal(h.run('state.batchPreview.profile_error'),"缺模板");
+    assert.equal(h.run('JSON.stringify(state.batchSelectedIds)'),"[1,52]");
+    assert.match(h.run('renderShippingBatchPreview()'),/disabled>确认提交 2 单/);
+    const late=h.run('loadShippingBatchPreview({}, {reset:false,profileId:"banna"})').catch(error=>error.constructor.name);
+    h.run('invalidatePage({clearIdentity:true});state.user={id:2,role:"staff"}');
+    pending[2].resolve(response({preview:{eligible:[{id:999}],profile:{id:"banna"}}}));
+    assert.equal(await late,"StaleViewError");
+    assert.equal(h.run('state.batchPreview'),null);
+  }
+  {
+    const h=harness(), handlers={}, close=h.element(); let finish;
+    close.addEventListener=(_name,fn)=>{handlers.close=fn;};
+    h.document.getElementById=id=>id==="closeBatchPreview"?close:null;
+    h.context.fetch=()=>new Promise(resolve=>{finish=resolve;});
+    h.run('updateBatchPreviewUi=()=>{};updateShippingBatchUi=()=>{};scheduleShippingBatchPoll=()=>{};bindAdmin()');
+    const late=h.run('loadShippingBatchPreview({}, {reset:false,profileId:"banna"})').catch(error=>error.constructor.name);
+    handlers.close();
+    finish(response({preview:{eligible:[{id:1}],profile:{id:"banna"}}}));
+    assert.equal(await late,"StaleViewError");
+    assert.equal(h.run('state.batchPreview'),null);
+    assert.equal(h.run('state.batchPreviewLoading'),false);
+  }
+  {
+    const h=harness(), handlers={}, submit=h.element(), posted=[];
+    submit.addEventListener=(_name,fn)=>{handlers.submit=fn;};
+    h.document.getElementById=id=>id==="createShippingBatch"?submit:null;
+    h.run('state.batchProfileId="banna";state.batchSelectAll=false;state.batchSelectedIds=[1,52];state.batchCompanyOverrides={1:"圆通"};state.batchBulkCompany="圆通";state.batchKnownTypes={1:"sale",52:"resend"};updateBatchPreviewUi=()=>{};updateShippingBatchUi=()=>{};scheduleShippingBatchPoll=()=>{};confirmShippingBatch=async()=>true;bindAdmin()');
+    h.context.fetch=async(url,options)=>{
+      if (url.endsWith("/preview")) return response({preview:{eligible:[{id:52,shipment_type:"resend",express_company:"中通"}],profile:{id:"kunming",express_company:"中通"},settings_ready:true,preview_fingerprint:"kunming-new"}});
+      posted.push(JSON.parse(options.body)); return response({batch:{id:3}});
+    };
+    await h.run('loadShippingBatchPreview({}, {reset:false,profileId:"kunming"})');
+    await handlers.submit({currentTarget:submit});
+    assert.deepEqual(posted,[{filters:{},shipments:[{id:1},{id:52}],selection_mode:"selected",preview_fingerprint:"kunming-new",express_company:"",profile_id:"kunming"}]);
+    // Confirmation opened on an old preview must not create an old-profile task.
+    await h.run('loadShippingBatchPreview({}, {reset:false,profileId:"kunming"})');
+    h.run('confirmShippingBatch=async()=>{state.batchPreview={...state.batchPreview};return true;}');
+    await handlers.submit({currentTarget:submit});
+    assert.equal(posted.length,1);
+    assert.match(h.messages.at(-1),/预览或发货方案已变化/);
+  }
+  console.log("frontend reliability tests passed: latest response, identity isolation, double click, lost/deleted submission, hidden/navigation lifecycle, local progress, independent alerts, opaque task recovery, partial failures, drafts, full-scope pagination, preserved fulfillment selection and submission payload");
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1; });
