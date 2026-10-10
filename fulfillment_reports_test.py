@@ -74,6 +74,20 @@ def http_tests(db, users):
 
 
 def main():
+    with tempfile.TemporaryDirectory(prefix="fulfillment-sf-report-") as directory:
+        db=Database(str(Path(directory)/"synthetic.db")); users=seed(db); configure(db,users)
+        a,_=shipment(db,users,"SF-CHANNEL","kunming_sf",quantity=4)
+        shipment(db,users,"ZTO-CHANNEL","kunming",quantity=2)
+        report=read_report(db,users["admin"],{**RANGE,"channel":"kunming"})
+        assert report["summary"]["orders"]==2 and report["summary"]["product_quantity"]==6
+        assert all(r["channel"]=="kunming" for r in report["rows"])
+        assert read_report(db,users["admin"],{**RANGE,"channel":"banna"})["summary"]["orders"]==0
+        db.mark_booking_cancelled(a["id"])
+        assert read_report(db,users["admin"],{**RANGE,"channel":"kunming"})["summary"]["orders"]==1
+        # Conflicting profiles are still unknown even when both map to Kunming.
+        with db.connect() as c:
+            c.execute("UPDATE shipping_batch_items SET settings_snapshot_json=json_set(settings_snapshot_json,'$.profile_id','unrecognized') WHERE express_company='中通'")
+        assert read_report(db,users["admin"],{**RANGE,"channel":"kunming"})["summary"]["orders"]==0
     with tempfile.TemporaryDirectory(prefix="fulfillment-reports-test-") as directory:
         db=Database(str(Path(directory)/"synthetic.db"));users=seed(db);configure(db,users)
         a,job=shipment(db,users,"K1")

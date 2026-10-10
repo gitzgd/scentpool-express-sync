@@ -653,13 +653,14 @@ def main() -> None:
                     "items": [{"barcode": legacy_product["barcode"], "quantity": 1}],
                 },
             )
-        batch_preview = legacy_db.preview_shipping_batch({"id": 99, "role": "admin"}, {"q": "BATCH-"})
+        fulfillment_profiles_test.configure(legacy_db, {"admin": {"id": 1, "role": "admin"}})
+        batch_preview = legacy_db.preview_shipping_batch({"id": 99, "role": "admin"}, {"q": "BATCH-"}, profile_id="banna")
         assert len(batch_preview["eligible"]) == 50 and batch_preview["eligible_count"] == 51
         large_batch = legacy_db.create_shipping_batch(
             {"id": 1, "role": "admin"},
             [{"id": row["id"], "express_company": "圆通"} for row in batch_preview["eligible"]],
             {"q": "BATCH-"},
-            selection_mode="all_matching", preview_fingerprint=batch_preview["preview_fingerprint"],
+            selection_mode="all_matching", preview_fingerprint=batch_preview["preview_fingerprint"], profile_id="banna",
         )
         assert large_batch["batch"]["total_count"] == 51
         failed_job = legacy_db.claim_next_shipping_job()
@@ -900,6 +901,7 @@ def main() -> None:
         assert body["settings"]["carrier_settings"]["圆通"]["thirdCustomTemplateUrl"] == (
             "https://cloudprint.cainiao.com/template/customArea/77205369"
         )
+
         assert body["settings"]["carrier_settings"]["京东"]["thirdTemplateURL"] == ""
         assert body["settings"]["carrier_settings"]["顺丰"]["thirdTemplateURL"] == ""
 
@@ -1125,6 +1127,13 @@ def main() -> None:
         )
         assert status == 200, body
         assert body["settings"]["sender_name"] == "总部"
+        server.DB.save_label_branches([{"kuaidicom": "yuantong", "branchAccounts": [
+            {"tbNet": "测试网点,001", "quantity": 999}]}])
+        current_settings = server.DB.get_shipping_settings()
+        server.DB.save_fulfillment_profile({"role": "admin"}, {**current_settings,
+            "id": "banna", "name": "合成版纳", "tbNet": "测试网点,001",
+            "third_template_url": current_settings["carrier_settings"]["圆通"]["thirdTemplateURL"],
+            "third_custom_template_url": current_settings["carrier_settings"]["圆通"]["thirdCustomTemplateUrl"]})
         assert body["settings"]["carrier_settings"]["圆通"]["thirdTemplateURL"] == (
             "https://cloudprint.cainiao.com/template/standard/850338"
         )
@@ -1137,11 +1146,15 @@ def main() -> None:
             base,
             "POST",
             "/api/admin/shipping-batches/preview",
-            {"filters": {"q": "ORDER-SMOKE-001", "status": "待处理"}},
+            {"filters": {"q": "ORDER-SMOKE-001", "status": "待处理"}, "profile_id": "banna"},
         )
         assert status == 200, body
         assert len(body["preview"]["eligible"]) == 1
         assert body["preview"]["eligible"][0]["id"] == shipment_id
+        booking_fingerprint = body["preview"]["preview_fingerprint"]
+        status, missing_profile = request(admin, base, "POST", "/api/admin/shipping-batches",
+            {"shipments": [{"id": shipment_id}], "preview_fingerprint": booking_fingerprint})
+        assert status == 409 and "手动选择" in missing_profile["error"], missing_profile
 
         status, body = request(
             admin,
@@ -1151,6 +1164,7 @@ def main() -> None:
             {
                 "filters": {"q": "ORDER-SMOKE-001", "status": "待处理"},
                 "shipments": [{"id": shipment_id, "express_company": "圆通"}],
+                "profile_id": "banna", "preview_fingerprint": booking_fingerprint,
             },
         )
         assert status == 202, body
@@ -1434,6 +1448,8 @@ def main() -> None:
         assert body["shipment"]["tracking_no"] == ""
         assert body["shipment"]["express_company"] == "圆通"
 
+        rebook_preview = server.DB.preview_shipping_batch({"role": "admin"},
+            {"q": "ORDER-SMOKE-001", "status": "待处理"}, profile_id="banna")
         status, rebook_body = request(
             admin,
             base,
@@ -1442,6 +1458,7 @@ def main() -> None:
             {
                 "filters": {"q": "ORDER-SMOKE-001", "status": "待处理"},
                 "shipments": [{"id": shipment_id, "express_company": "圆通"}],
+                "profile_id": "banna", "preview_fingerprint": rebook_preview["preview_fingerprint"],
             },
         )
         assert status == 202, rebook_body

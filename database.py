@@ -3873,7 +3873,7 @@ class Database:
         return digest.hexdigest()
 
     def preview_shipping_batch(self, user: Dict[str, Any], filters: Dict[str, Any], *, page=1, page_size=50, profile_id=None) -> Dict[str, Any]:
-        from fulfillment_profiles import selected, public_profile, ensure_branch
+        from fulfillment_profiles import selected, public_profile, ensure_branch, ensure_template, branch_balance_warning
         if user.get("role") != "admin":
             raise AppError("只有总部可以预览打单。", 403)
         eligible = []
@@ -3885,12 +3885,15 @@ class Database:
         with self.connect() as conn:
             conn.execute("BEGIN")
             settings = self.get_shipping_settings(connection=conn)
-            profile = selected(conn, settings, profile_id)
-            profile_error = ""
+            profile = selected(conn, settings, profile_id, allow_unselected=True)
+            profile_error = "" if profile else "请手动选择本批次发货方案，系统不会自动选择快递或寄件地址。"
+            profile_warning = ""
             if profile:
                 try:
+                    ensure_template(profile)
                     option = ensure_branch(settings, profile)
-                    if int(option.get("quantity") or 0) <= 0:
+                    profile_warning = branch_balance_warning(profile, option)
+                    if int(option.get("quantity") or 0) <= 0 and not profile_warning:
                         profile_error = "所选网点的已知面单余额为零，请刷新余额或充值后再下单。"
                 except AppError as exc:
                     profile_error = exc.message
@@ -3922,6 +3925,7 @@ class Database:
                 "excluded_pages":max(1,(excluded_count+page_size-1)//page_size)},
             "profile": public_profile(profile) if profile else None,
             "profile_error": profile_error,
+            "profile_warning": profile_warning,
             "settings_ready": not profile_error and bool((profile or settings).get("sender_name") and (profile or settings).get("sender_mobile") and (profile or settings).get("sender_address")),
             "label_ready": bool(settings.get("partner_id") and settings.get("partner_key")),
         }
@@ -3959,14 +3963,15 @@ class Database:
 
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            from fulfillment_profiles import selected, snapshot, ensure_branch, encoded
+            from fulfillment_profiles import selected, snapshot, ensure_branch, ensure_template, branch_balance_warning, encoded
             settings = self.get_shipping_settings(connection=conn)
             profile = selected(conn, settings, profile_id)
             if profile:
+                ensure_template(profile)
                 if not preview_fingerprint:
                     raise AppError("使用发货方案必须先预览并确认。", 409)
                 option = ensure_branch(settings, profile)
-                if int(option.get("quantity") or 0) <= 0:
+                if int(option.get("quantity") or 0) <= 0 and not branch_balance_warning(profile, option):
                     raise AppError("所选网点面单余额为零，请刷新余额或充值后重试。", 409)
                 if any(company and company != profile["express_company"] for _, company in normalized) or (express_company and express_company != profile["express_company"]):
                     raise AppError("快递公司与发货方案不一致，请重新预览。", 409)

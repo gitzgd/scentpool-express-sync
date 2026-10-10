@@ -7,11 +7,11 @@ chosen at submission, even if a profile or authorization is changed afterwards.
 import hashlib
 import json
 
-PROFILE_COMPANIES = {"kunming": "中通", "banna": "圆通"}
-PROFILE_NAMES = {"kunming": "昆明中台发货", "banna": "版纳门店发货"}
+PROFILE_COMPANIES = {"kunming": "中通", "kunming_sf": "顺丰", "banna": "圆通"}
+PROFILE_NAMES = {"kunming": "昆明中台发货", "kunming_sf": "昆明中台顺丰", "banna": "版纳门店发货"}
 PUBLIC_FIELDS = ("id", "name", "express_company", "sender_name", "sender_mobile",
                  "sender_address", "sender_company", "tbNet", "exp_type",
-                 "third_template_url", "third_custom_template_url", "pay_type", "revision")
+                 "third_template_url", "third_custom_template_url", "pay_type", "monthly_account", "revision")
 SNAPSHOT_FIELDS = ("sender_name", "sender_mobile", "sender_address", "sender_company",
                    "cargo_name", "pay_type", "print_mode", "printer_siid", "template_id",
                    "paper_width", "paper_height", "need_desensitization", "need_logo")
@@ -40,6 +40,9 @@ def migrate(conn):
         columns = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         if name not in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+    # Retain the column for backward-safe schema compatibility, never a default.
+    # Existing batch snapshots and shipment records are deliberately untouched.
+    conn.execute("UPDATE shipping_settings SET default_profile_id='' WHERE default_profile_id<>''")
 
 
 def profiles(conn):
@@ -59,13 +62,13 @@ def account_hash(settings):
     return digest([settings.get("partner_id", ""), settings.get("partner_net", "")])
 
 
-def selected(conn, settings, profile_id=None):
+def selected(conn, settings, profile_id=None, *, allow_unselected=False):
     from database import AppError
-    target = settings.get("default_profile_id", "") if profile_id is None else profile_id
+    target = profile_id
     if not target:
-        if settings.get("default_profile_id"):
-            raise AppError("请选择发货方案，不可绕过默认方案使用旧寄件配置。", 409)
-        return None
+        if allow_unselected:
+            return None
+        raise AppError("请手动选择本批次发货方案，系统不会自动选择快递或寄件地址。", 409)
     profile = next((p for p in profiles(conn) if p["id"] == target), None)
     if not profile:
         raise AppError("发货方案不存在，请刷新后重新选择。", 409)
@@ -87,6 +90,10 @@ def snapshot(settings, company, profile=None):
                     "exp_type", "third_template_url", "third_custom_template_url", "pay_type"):
             result[key] = profile[key]
         result.update(profile_id=profile["id"], fulfillment_name=profile["name"], print_mode="PDF", printer_siid="")
+        if profile["id"] == "kunming_sf":
+            # Cainiao SF uses code for its carrier billing account, NOT partnerId.
+            # Never inherit another carrier's global code or change Cainiao tokens.
+            result["code"] = profile.get("monthly_account", "")
     return result
 
 
@@ -99,11 +106,30 @@ def ensure_branch(settings, profile):
     return option
 
 
+def ensure_template(profile):
+    from database import AppError
+    if profile["id"] == "kunming_sf" and not profile.get("third_template_url"):
+        raise AppError("昆明顺丰尚未配置基础面单模板，请先在面单设置填写顺丰模板 URL 并保存。", 409)
+
+
+def branch_balance_warning(profile, option):
+    # The observed Cainiao SF direct entry exposes no franchise branch code.
+    # Treat its 0 as unknown billing capacity, not proof of exhaustion or
+    # unlimited credit. Only this exact shape is advisory; provider decides.
+    if (profile["id"] == "kunming_sf" and option.get("company") == "顺丰"
+            and option.get("tbNet") == "SF" and not option.get("branchCode")
+            and int(option.get("quantity") or 0) <= 0):
+        return "顺丰授权已返回；该直营入口未提供可判断的预充值额度，请核对结算约定。实际下单仍以顺丰接受为准。"
+    return ""
+
+
 def save(conn, settings, payload):
     from database import AppError, re_phone_ok
     profile_id = str(payload.get("id") or "")
     if profile_id not in PROFILE_COMPANIES:
         raise AppError("请选择昆明中台或版纳门店方案。")
+    if payload.get("make_default"):
+        raise AppError("发货方案不再设置默认值，请在每次打单时手动选择。", 409)
     if not settings.get("partner_authorized"):
         raise AppError("请先完成菜鸟授权并刷新网点。", 409)
     old = conn.execute("SELECT revision FROM fulfillment_profiles WHERE id=?", (profile_id,)).fetchone()
@@ -112,7 +138,8 @@ def save(conn, settings, payload):
     result = {key: str(payload.get(key) or "").strip() for key in PUBLIC_FIELDS if key not in {"revision"}}
     result.update(id=profile_id, express_company=PROFILE_COMPANIES[profile_id],
                   name=result["name"] or PROFILE_NAMES[profile_id],
-                  exp_type=result["exp_type"] or "标准快递", pay_type=result["pay_type"] or "MONTHLY")
+                  exp_type=result["exp_type"] or ("顺丰标快" if profile_id == "kunming_sf" else "标准快递"),
+                  pay_type=result["pay_type"] or "MONTHLY")
     if not result["sender_name"] or not result["sender_address"] or not re_phone_ok(result["sender_mobile"]):
         raise AppError("请填写寄件人、有效联系电话和完整寄件地址。")
     for key, value in result.items():
@@ -120,6 +147,10 @@ def save(conn, settings, payload):
             raise AppError("方案内容过长，请缩短后保存。")
     if result["pay_type"] not in {"MONTHLY", "SHIPPER"}:
         raise AppError("请选择月结或寄方付。")
+    if profile_id != "kunming_sf":
+        result.pop("monthly_account", None)
+    elif result["monthly_account"] and not (result["monthly_account"].isascii() and result["monthly_account"].isdigit()):
+        raise AppError("顺丰月结账号请填写数字，不要填写 API 密钥。")
     for key in ("third_template_url", "third_custom_template_url"):
         if result[key] and not result[key].startswith("https://cloudprint.cainiao.com/template/"):
             raise AppError("请填写有效的菜鸟面单模板地址。")
@@ -130,8 +161,7 @@ def save(conn, settings, payload):
     conn.execute("""INSERT INTO fulfillment_profiles(id,config_json,revision) VALUES(?,?,1)
         ON CONFLICT(id) DO UPDATE SET config_json=excluded.config_json,revision=revision+1""",
         (profile_id, encoded(result)))
-    if payload.get("make_default") is True:
-        conn.execute("UPDATE shipping_settings SET default_profile_id=? WHERE id=1", (profile_id,))
+    conn.execute("UPDATE shipping_settings SET default_profile_id='' WHERE id=1")
 
 
 def guard_legacy_jobs(conn):

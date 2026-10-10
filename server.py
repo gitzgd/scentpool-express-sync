@@ -1299,8 +1299,8 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
                 raise AppError(f"电子面单配置不完整，Render 缺少：{missing or '必要环境变量'}。", 503)
             settings = DB.get_shipping_settings()
             body = self.read_json()
-            if not body.get("profile_id") and not settings.get("default_profile_id") and (not settings.get("sender_name") or not settings.get("sender_mobile") or not settings.get("sender_address")):
-                raise AppError("请先完成总部发货设置。", 409)
+            if not body.get("profile_id"):
+                raise AppError("请手动选择本批次发货方案，系统不会自动选择快递或寄件地址。", 409)
             if not settings.get("partner_id") or not settings.get("partner_key"):
                 raise AppError("请先在电子面单设置中完成菜鸟账号授权。", 409)
             choices = body.get("shipments") if isinstance(body.get("shipments"), list) else []

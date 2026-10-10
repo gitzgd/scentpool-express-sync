@@ -33,6 +33,25 @@ async function flush() { await Promise.resolve(); await Promise.resolve(); }
 
 async function main() {
   {
+    const h = harness(), handlers = {}, button = h.element();
+    button.addEventListener = (name, fn) => {handlers[name] = fn;};
+    h.document.getElementById = id => id === "previewShippingBatch" ? button : null;
+    h.context.fetch = async (_url, options) => {
+      assert.equal(JSON.parse(options.body).profile_id, "");
+      return response({preview:{eligible:[],profile:null,settings_ready:false,profile_error:"请手动选择"}});
+    };
+    h.run('state.batchProfileId="kunming_sf"; state.shippingSettings={default_profile_id:"kunming",fulfillment_profiles:[{id:"kunming",name:"昆明",express_company:"中通"},{id:"kunming_sf",name:"昆明顺丰",express_company:"顺丰",third_template_url:""}]}; updateBatchPreviewUi=()=>{}; updateShippingBatchUi=()=>{}; scheduleShippingBatchPoll=()=>{}; bindAdmin()');
+    await handlers.click({currentTarget:button});
+    assert.equal(h.run('state.batchProfileId'), "");
+    const html = h.run('renderShippingBatchPreview()');
+    assert.match(html, /value="" selected>请选择发货方案/);
+    assert.match(html, /顺丰（待配置模板）/);
+    assert.doesNotMatch(html, /（默认）|原总部配置（尚未切换）|id="batchBulkCompany"/);
+    const settings = h.run('renderFulfillmentSettings(state.shippingSettings)');
+    assert.match(settings, /data-profile-form="kunming_sf"/);
+    assert.doesNotMatch(settings, /name="make_default"/);
+  }
+  {
     const h = harness(), pending = [];
     h.context.fetch = (url) => new Promise(resolve => pending.push({ url, resolve }));
     h.run('state.adminFilters = {q:"old"}');
