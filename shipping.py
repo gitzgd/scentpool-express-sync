@@ -21,6 +21,7 @@ THIRD_PARTY_NETS = {"taobao", "cainiao", "jdalpha", "pinduoduoWx", "douyin", "ku
 LABEL_CARGO_MAX_CHARS = 50
 LABEL_REMARK_MAX_CHARS = 100
 LABEL_ITEM_KEYWORD_MAX_CHARS = 8
+CAINIAO_SF_CARGO_MAX_CHARS = 20
 
 
 def env_flag(name: str) -> bool:
@@ -136,6 +137,25 @@ def build_label_remark(shipment: Dict[str, Any]) -> str:
     return f"{prefix}{compact_label_text(manual_remark, remaining)}"
 
 
+def build_cainiao_sf_cargo(items: Any, fallback: str) -> str:
+    """Keep carrier cargo separate from the formatted picking/custom-area list.
+
+    Cainiao's SF goods description is limited to 20 characters. Send actual
+    product categories (or names when uncategorised), not the printable list.
+    Kuaidi100's internal itemName/goods_description mapping is not public;
+    this boundary must still be verified by a controlled provider retry.
+    """
+    names: list[str] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        category = compact_label_text(item.get("product_category"), 40)
+        name = category if category and category != "商品" else compact_label_text(item.get("product_name"), 40)
+        if name and name not in names:
+            names.append(name)
+    return compact_label_text("、".join(names) or fallback, CAINIAO_SF_CARGO_MAX_CHARS)
+
+
 class Kuaidi100LabelClient:
     def __init__(
         self,
@@ -246,6 +266,12 @@ class Kuaidi100LabelClient:
         api_print_type = "CLOUD" if print_mode == "CLOUD" and account_net not in THIRD_PARTY_NETS else "IMAGE"
         item_cargo = build_label_item_summary(shipment.get("items"), LABEL_CARGO_MAX_CHARS)
         label_remark = build_label_remark(shipment)
+        cargo = item_cargo or str(settings.get("cargo_name") or "香氛商品")
+        custom_summary = label_remark or cargo
+        if company_code == "shunfeng" and account_net in {"cainiao", "taobao"}:
+            cargo = build_cainiao_sf_cargo(shipment.get("items"), str(settings.get("cargo_name") or "香氛商品"))
+            if label_remark == cargo:
+                label_remark = compact_label_text(f"物品：{label_remark}", LABEL_REMARK_MAX_CHARS)
         account_param = self._account_param(settings)
         param: Dict[str, Any] = {
             **account_param,
@@ -262,7 +288,7 @@ class Kuaidi100LabelClient:
                 "printAddr": str(settings.get("sender_address") or ""),
                 "company": str(settings.get("sender_company") or ""),
             },
-            "cargo": item_cargo or str(settings.get("cargo_name") or "香氛商品"),
+            "cargo": cargo,
             "count": 1,
             "payType": str(settings.get("pay_type") or "MONTHLY"),
             "expType": str(settings.get("exp_type") or "标准快递"),
@@ -280,8 +306,8 @@ class Kuaidi100LabelClient:
         if settings.get("third_template_url") and account_net in THIRD_PARTY_NETS:
             param["thirdTemplateURL"] = str(settings["third_template_url"])
             param["customParam"] = {
-                "itemSummary": label_remark or item_cargo or str(settings.get("cargo_name") or "香氛商品"),
-                "cargo": item_cargo or str(settings.get("cargo_name") or "香氛商品"),
+                "itemSummary": custom_summary,
+                "cargo": cargo,
                 "remark": label_remark,
             }
             if settings.get("third_custom_template_url"):

@@ -37,6 +37,12 @@
 
 ## 验证
 
+### 顺丰取号描述与商品区
+
+菜鸟/淘宝顺丰的 `cargo` 使用真实商品类别，未分类时取商品名称，去重并压缩到 20 字；`customParam.itemSummary` 保持原商品、数量及包装备注。自定义 `cargo` 与取号 cargo 一致，不再用商品长清单覆盖；原 `remark` 如恰好相同则加“物品：”前缀。圆通、中通和顺丰直连请求不受影响；不改模板链接、批次授权、请求号、取消及重试规则。
+
+依据：[菜鸟顺丰字段限制](https://open.fliggy.com/docs/doc.htm?articleId=121268&docType=1&treeId=492)、[快递100 cargo 与自定义参数说明](https://api.kuaidi100.com/document/dianzimiandanV2)。快递100内部如何生成 `itemName/goods_description` 未在该文档公开，不能用本地模拟宣称供应商接受；需要一次单独授权的真实业务重试验收。`shipping_cargo_test.py` 覆盖空备注、混合物料、长描述、同值兜底、其他渠道兼容、原请求号及失败/幂等恢复；纳入完整烟测。
+
 `fulfillment_profiles_test.py` 使用合成数据库和供应商响应，覆盖权限、网点、版本冲突、零余额、预览失效、跨页全选、配置快照、凭证刷新、原批次重试、孤立请求号、历史任务保护、原授权取消和重复迁移。专项纳入完整 `smoke_test.py`。
 
 本地合成界面：`python3 fulfillment_demo.py --port 8880`，访问 `http://127.0.0.1:8880/demo`。仅回环监听、临时数据库、封锁对外快递请求，不启动真实下单/打印；手动选择、顺丰模板未配置、三方案切换与配置锁定三个案例不进入生产数据库。生产服务器没有 `/demo` 路由。
