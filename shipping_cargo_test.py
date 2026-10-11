@@ -63,6 +63,8 @@ def main():
     assert shipping.build_label_item_summary(single["items"], 50) == shipping.build_label_remark(single)
     param, _ = capture(single, SETTINGS)
     assert param["cargo"] == "睡眠喷雾"
+    param, _ = capture(examples()[1], SETTINGS)
+    assert param["cargo"] == "香包、拍摄背景板"
     # Unrelated carriers / direct SF are byte-for-byte compatible in these fields.
     for company, net in [("圆通", "cainiao"), ("中通", "taobao"), ("顺丰", "direct")]:
         row = {**single, "express_company": company}

@@ -150,7 +150,7 @@ def build_cainiao_sf_cargo(items: Any, fallback: str) -> str:
         if not isinstance(item, dict):
             continue
         category = compact_label_text(item.get("product_category"), 40)
-        name = category if category and category != "商品" else compact_label_text(item.get("product_name"), 40)
+        name = category if category and category not in {"商品", "临时物料"} else compact_label_text(item.get("product_name"), 40)
         if name and name not in names:
             names.append(name)
     return compact_label_text("、".join(names) or fallback, CAINIAO_SF_CARGO_MAX_CHARS)
