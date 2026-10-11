@@ -1478,6 +1478,11 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
             log_audit_print_event("batch_print", "success", request_started)
             return
 
+        if re.fullmatch(r"/api/shipments/[1-9][0-9]*/recipient", path) and self.command == "PATCH":
+            shipment = DB.update_shipment_recipient(int(path.split("/")[3]), user, self.read_json())
+            self.send_json({"shipment": shipment, "message": "收件信息已更新。"})
+            return
+
         if path.startswith("/api/shipments/") and path.endswith("/context") and self.command == "PATCH":
             shipment = DB.update_shipment_context(int(path.split("/")[3]), user, self.read_json())
             self.send_json({"shipment": shipment})

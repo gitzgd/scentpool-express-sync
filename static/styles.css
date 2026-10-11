@@ -73,6 +73,11 @@ body.task-alert-dialog-open {
 .batch-confirm-backdrop { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; background: rgba(20,20,24,.48); padding: 16px; }
 .batch-confirm-dialog { width: min(600px, 100%); max-height: calc(100dvh - 32px); overflow: auto; overscroll-behavior: contain; background: #fff; border-radius: 16px; padding: 24px; box-shadow: 0 24px 90px #0004; overflow-wrap: anywhere; }
 .batch-confirm-dialog h2 { margin: 0 0 16px; }
+.recipient-dialog .field { margin-bottom: 14px; }
+.recipient-dialog [hidden] { display: none !important; }
+.recipient-dialog textarea { resize: vertical; min-height: 100px; }
+.recipient-cell [data-edit-recipient] { margin-top: 8px; white-space: normal; }
+.recipient-cell > span { display: block; overflow-wrap: anywhere; }
 .batch-confirm-dialog dl { display: grid; gap: 8px; padding: 16px; background: #f6f7f9; border-radius: 10px; }
 .batch-confirm-dialog dt { font-weight: 600; }
 .batch-confirm-dialog dd { margin: 0 0 8px; }
