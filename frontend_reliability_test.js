@@ -33,6 +33,20 @@ async function flush() { await Promise.resolve(); await Promise.resolve(); }
 
 async function main() {
   {
+    const h = harness();
+    h.run('var recipientRow={id:1,status:"待处理",booking_status:"未下单",recipient_name:"<script>合成</script>",phone:"13800000000",address:"合成地址",content_revision:1}');
+    assert.equal(h.run('recipientEditable(recipientRow)'), true);
+    assert.match(h.run('renderRecipientCell(recipientRow)'), /编辑收件信息/);
+    assert.doesNotMatch(h.run('renderRecipientCell(recipientRow)'), /<script>/);
+    for (const key of ['tracking_no','booking_request_id','booking_task_id','booking_order_id','label_url']) {
+      assert.equal(h.run(`recipientEditable({...recipientRow,${key}:"SYNTHETIC"})`), false);
+      assert.doesNotMatch(h.run(`renderRecipientCell({...recipientRow,${key}:"SYNTHETIC"})`), /data-edit-recipient/);
+    }
+    for (const status of ['排队中','提交中','已出单']) assert.equal(h.run(`recipientEditable({...recipientRow,booking_status:"${status}"})`), false);
+    assert.equal(h.run('recipientEditable({...recipientRow,status:"已发货"})'), false);
+    assert.equal(h.run('recipientEditable({...recipientRow,booking_status:"已取消"})'), true);
+  }
+  {
     const h = harness(), handlers = {}, button = h.element();
     button.addEventListener = (name, fn) => {handlers[name] = fn;};
     h.document.getElementById = id => id === "previewShippingBatch" ? button : null;

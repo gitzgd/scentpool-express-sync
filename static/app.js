@@ -205,6 +205,88 @@ function bookingEditable(row) {
   return ["未下单", "下单失败", "已取消", ""].includes(String(row.booking_status || ""));
 }
 
+function recipientEditable(row) {
+  return row.status === "待处理" && bookingEditable(row) &&
+    ![row.tracking_no, row.booking_request_id, row.booking_task_id, row.booking_order_id, row.label_url].some(Boolean);
+}
+
+function renderRecipientCell(row) {
+  return `<strong class="recipient-name">${escapeHtml(row.recipient_name)}</strong>
+    <span class="muted recipient-phone" translate="no">${escapeHtml(row.phone)}</span>
+    <span class="recipient-address">${escapeHtml(row.address)}</span>
+    ${recipientEditable(row) ? `<button class="btn secondary small" type="button" data-edit-recipient="${Number(row.id)}">编辑收件信息</button>` :
+      row.status === "待处理" ? `<span class="muted mini">已进入面单流程，收件信息已锁定</span>` : ""}`;
+}
+
+function openRecipientEditor(row) {
+  if (document.querySelector(".recipient-dialog")) return;
+  const epoch = pageEpoch, userId = state.user?.id, previousFocus = document.activeElement;
+  let current = { ...row }, saving = false, closed = false;
+  const overlay = document.createElement("div");
+  overlay.className = "batch-confirm-backdrop";
+  overlay.innerHTML = `<section class="batch-confirm-dialog recipient-dialog" role="dialog" aria-modal="true" aria-labelledby="recipientTitle">
+    <h2 id="recipientTitle">编辑收件信息</h2><p class="muted mini">${escapeHtml(shipmentBusinessId(row))}</p>
+    <p>修改后用于下一次打单。仅待处理且尚未进入面单流程的订单可以保存。</p>
+    <form data-recipient-form><div class="field"><label for="editRecipientName">收件姓名</label><input id="editRecipientName" class="input" name="recipient_name" maxlength="100" required></div>
+    <div class="field"><label for="editRecipientPhone">联系电话</label><input id="editRecipientPhone" class="input" name="phone" type="tel" maxlength="80" required></div>
+    <div class="field"><label for="editRecipientAddress">收件地址</label><textarea id="editRecipientAddress" class="input" name="address" maxlength="1000" rows="4" required></textarea></div>
+    <p data-recipient-message role="alert" class="notice" hidden></p>
+    <div class="batch-confirm-actions"><button class="btn secondary" type="button" data-recipient-reload hidden>重新读取当前信息</button><button class="btn secondary" type="button" data-recipient-close>取消</button><button class="btn primary" type="submit">保存收件信息</button></div></form></section>`;
+  const form = overlay.querySelector("form"), message = overlay.querySelector("[data-recipient-message]"), reload = overlay.querySelector("[data-recipient-reload]");
+  const live = () => !closed && epoch === pageEpoch && userId === state.user?.id;
+  const fill = () => { for (const key of ["recipient_name", "phone", "address"]) form.elements.namedItem(key).value = current[key] || ""; };
+  const finish = () => { closed = true; activeConfirmations.delete(finish); overlay.remove(); if (previousFocus?.isConnected) previousFocus.focus(); };
+  const showError = text => { message.textContent = text; message.hidden = false; reload.hidden = false; };
+  const busy = value => { saving = value; form.querySelectorAll("input,textarea,button").forEach(node => { node.disabled = value; }); form.querySelector('[type="submit"]').textContent = value ? "保存中…" : "保存收件信息"; };
+  overlay.querySelector("[data-recipient-close]").addEventListener("click", () => { if (!saving) finish(); });
+  reload.addEventListener("click", async () => {
+    if (saving) return;
+    busy(true);
+    try {
+      const data = await api(`/api/shipments?id=${Number(row.id)}`);
+      if (!live()) return;
+      const latest = data.shipments?.find(item => Number(item.id) === Number(row.id));
+      if (!latest) throw new Error("订单已不存在或无权查看，请关闭窗口并刷新列表。");
+      current = latest; fill();
+      message.hidden = true; reload.hidden = true;
+      if (!recipientEditable(latest)) showError("此单已进入面单或发货流程，不能再修改收件信息。请关闭窗口后核对。");
+    } catch (error) { if (live()) showError(error.message || "读取失败，你的输入已保留。"); }
+    finally { if (live()) { busy(false); form.querySelector('[type="submit"]').disabled = !recipientEditable(current); } }
+  });
+  form.addEventListener("submit", async event => {
+    event.preventDefault(); if (saving || !live()) return;
+    const payload = { content_revision: current.content_revision };
+    for (const key of ["recipient_name", "phone", "address"]) payload[key] = form.elements.namedItem(key).value.trim();
+    busy(true); message.hidden = true;
+    try {
+      const data = await api(`/api/shipments/${Number(row.id)}/recipient`, { method: "PATCH", body: JSON.stringify(payload) });
+      if (!live()) return;
+      for (const key of ["shipments", "storeShipments"]) state[key] = state[key].map(item => Number(item.id) === Number(row.id) ? { ...item, ...data.shipment } : item);
+      document.querySelectorAll(`[data-recipient-cell="${Number(row.id)}"]`).forEach(cell => { cell.innerHTML = renderRecipientCell(data.shipment); bindRecipientEditors([data.shipment], cell); });
+      finish(); toast("收件信息已更新，下次打单将使用新信息。");
+    } catch (error) { if (live()) showError(`${error.message || "保存失败。"} 输入已保留；如网络中断，可先重新读取当前信息核对结果。`); }
+    finally { if (live()) busy(false); }
+  });
+  overlay.addEventListener("keydown", event => {
+    if (event.key === "Escape") { event.preventDefault(); if (!saving) finish(); }
+    if (event.key === "Tab") {
+      const nodes = Array.from(form.querySelectorAll("input,textarea,button")).filter(node => !node.disabled && !node.hidden);
+      const first = nodes[0], last = nodes[nodes.length - 1];
+      if (!first) { event.preventDefault(); return; }
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    }
+  });
+  activeConfirmations.add(finish); fill(); document.body.appendChild(overlay); form.elements.namedItem("recipient_name").focus();
+}
+
+function bindRecipientEditors(rows, root = document) {
+  root.querySelectorAll("[data-edit-recipient]").forEach(button => button.addEventListener("click", () => {
+    const row = rows.find(item => Number(item.id) === Number(button.dataset.editRecipient));
+    if (row && recipientEditable(row)) openRecipientEditor(row);
+  }));
+}
+
 function bookingStatusClass(status) {
   if (["下单失败"].includes(status)) return "exception";
   if (["已出单"].includes(status)) return "shipped";
@@ -1624,10 +1706,8 @@ function renderStoreBoardTable(shipments) {
                 <tr>
                   <td>${escapeHtml(formatDate(row.created_at))}</td>
                   <td>${shipmentContext(row)}<strong>${escapeHtml(row.store_order_no)}</strong></td>
-                  <td>
-                    <strong>${escapeHtml(row.recipient_name)}</strong><br />
-                    <span class="muted">${escapeHtml(row.phone)}</span><br />
-                    <span>${escapeHtml(row.address)}</span>
+                  <td class="recipient-cell" data-recipient-cell="${row.id}">
+                    ${renderRecipientCell(row)}
 	                  </td>
 	                  <td class="items-cell">
 	                    ${renderShipmentItemsWithEditButton(row)}
@@ -1745,6 +1825,7 @@ function renderShipmentItemEditor(row) {
 }
 
 function bindShipmentItemEditor(sourceRows, root = document) {
+  bindRecipientEditors(sourceRows, root);
   root.querySelectorAll("[data-edit-material-name], [data-edit-material-spec]").forEach(node => node.addEventListener("input", () => {
     const isName = node.hasAttribute("data-edit-material-name");
     state.shipmentEditItems[Number(isName ? node.dataset.editMaterialName : node.dataset.editMaterialSpec)][isName ? "name" : "material_spec"] = node.value;
@@ -2969,10 +3050,8 @@ function renderShipmentTable(shipments) {
                   <td class="created-cell">${escapeHtml(formatDate(row.created_at))}</td>
                   <td class="store-cell">${escapeHtml(row.store_name_snapshot)}</td>
                   <td>${renderAdminShipmentOrderCell(row)}</td>
-                  <td class="recipient-cell">
-                    <strong class="recipient-name">${escapeHtml(row.recipient_name)}</strong>
-                    <span class="muted recipient-phone" translate="no">${escapeHtml(row.phone)}</span>
-                    <span class="recipient-address">${escapeHtml(row.address)}</span>
+                  <td class="recipient-cell" data-recipient-cell="${row.id}">
+                    ${renderRecipientCell(row)}
 	                  </td>
 	                  <td class="items-cell">
 	                    ${renderShipmentItemsWithEditButton(row)}

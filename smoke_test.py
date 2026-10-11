@@ -35,6 +35,7 @@ import bounded_exports_test
 import http_limits_test
 import fulfillment_profiles_test
 import shipping_cargo_test
+import recipient_edit_test
 import fulfillment_reports_test
 from database import AppError, DEFAULT_PRODUCT_FILE, Database, now_text
 
@@ -1885,6 +1886,7 @@ def main() -> None:
         special_shipments_test.main()
         fulfillment_profiles_test.main()
         shipping_cargo_test.main()
+        recipient_edit_test.main()
         fulfillment_reports_test.main()
         reliability_test.run()
         reliability_http_test.run()

@@ -3310,6 +3310,43 @@ class Database:
             conn.execute("UPDATE shipments SET updated_at = ? WHERE id = ?", (now, shipment_id))
         return self.get_shipment(shipment_id, user)
 
+    def update_shipment_recipient(self, shipment_id: int, user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Edit before booking, serialized with booking and guarded against stale forms."""
+        if user.get("role") not in {"admin", "staff"}:
+            raise AppError("无权修改收件信息。", 403)
+        if not isinstance(payload, dict) or set(payload) != {"recipient_name", "phone", "address", "content_revision"}:
+            raise AppError("请完整填写收件姓名、电话和地址，不要提交其他订单字段。")
+        values = {}
+        for key, label, limit in (("recipient_name", "收件姓名", 100), ("phone", "联系电话", 80), ("address", "收件地址", 1000)):
+            value = payload[key]
+            if not isinstance(value, str) or not value.strip() or len(value.strip()) > limit:
+                raise AppError(f"请填写有效的{label}，最多 {limit} 个字符。")
+            value = value.strip()
+            if any(ord(char) < 32 and char not in "\n\r\t" for char in value):
+                raise AppError(f"{label}包含无效字符。")
+            values[key] = value
+        if not re_phone_ok(values["phone"]):
+            raise AppError("请输入有效联系电话。")
+        revision = payload["content_revision"]
+        if type(revision) is not int or revision < 0:
+            raise AppError("订单版本无效，请重新打开编辑窗口。")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM shipments WHERE id=?", (shipment_id,)).fetchone()
+            if not row or (user["role"] == "staff" and row["store_id"] != user.get("store_id")):
+                raise AppError("发货单不存在或无权修改。", 404)
+            if row["status"] != "待处理":
+                raise AppError("只有待处理订单可以修改收件信息。", 409)
+            if (row["booking_status"] not in BOOKING_EDITABLE_STATUSES
+                    or any(row[key] for key in ("tracking_no", "booking_request_id", "booking_task_id", "booking_order_id", "label_url"))):
+                raise AppError("此单已进入面单流程，不能修改收件信息。请总部先核实面单结果；已有面单须成功取消回收后再修改。", 409)
+            if any(row[key] != value for key, value in values.items()):
+                if row["content_revision"] != revision:
+                    raise AppError("订单已被其他人修改，本次未保存。请重新读取当前信息后核对，避免覆盖他人的修改。", 409)
+                conn.execute("UPDATE shipments SET recipient_name=?,phone=?,address=?,updated_at=? WHERE id=?",
+                             (values["recipient_name"], values["phone"], values["address"], now_text(), shipment_id))
+        return self.get_shipment(shipment_id, user)
+
     def update_shipment_remark(self, shipment_id: int, user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
         remark = str(payload.get("remark") or "").strip()
         if len(remark) > 500:
