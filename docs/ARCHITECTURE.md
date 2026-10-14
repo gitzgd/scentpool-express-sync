@@ -32,6 +32,12 @@ server.py
 
 ## 模块职责
 
+### `inventory_integration.py`（独立分支，未部署）
+
+- `/api/inventory/v1` 独立服务令牌、脱敏目录/当前状态流、补货/渠道任务、昆明双方案取号、受控 PDF、商品主档同步。
+- SQLite 事务追加事件、最新状态指针及历史参考集合；UUID stream + 随机 checkpoint 防止恢复后游标重用。它不是库存账本。
+- 失败同键重试保持原请求/快照；成功取消后新键重发；Worker 尝试版本与取消身份比较防止迟到结果回写。见 [ADR-0011](decisions/ADR-0011-inventory-integration-state-feed.md) 与 [契约](features/inventory-contract.json)。
+
 ### `fulfillment_reports.py` / `static/reports.js`
 
 - 版纳与昆明双渠道发货商品聚合，订单归属与渠道独立筛选；当前请求对应成功批次快照确定渠道，未知来源不猜测。

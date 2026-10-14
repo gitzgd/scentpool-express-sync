@@ -841,7 +841,7 @@ def process_next_shipping_job(connection: Optional[sqlite3.Connection] = None) -
             f"{original_error} 系统已自动重试 {SHIPPING_TRANSIENT_RETRIES} 次仍未成功，"
             "请稍后点击“重试失败订单”。"
         )
-    completed = DB.complete_shipping_job(int(job["batch_item_id"]), result)
+    completed = DB.complete_shipping_job(int(job["batch_item_id"]), result, expected_attempt=job["booking_attempt"])
     if completed.get("tracking_no"):
         TRACKING_QUEUE_EVENT.set()
     return True
@@ -1009,6 +1009,10 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
                 print(f"[slow-request] {self.command} {path} {elapsed_ms:.0f}ms")
 
     def route_api(self, path: str, query: Dict[str, str]) -> None:
+        if path.startswith("/api/inventory/"):
+            from inventory_integration import handle
+            handle(self, DB)
+            return
         if path == "/api/health" and self.command == "GET":
             self.send_health()
             return
@@ -1412,7 +1416,7 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
             )
             if not result.get("success"):
                 raise AppError(str(result.get("error") or "取消电子面单失败。"), 502)
-            DB.mark_booking_cancelled(shipment_id, str(result.get("raw") or ""))
+            DB.mark_booking_cancelled(shipment_id, str(result.get("raw") or ""), expected_request_id=booking["booking_request_id"])
             self.send_json({"shipment": DB.get_shipment(shipment_id, user), "provider_code": result.get("code", "")})
             return
 
