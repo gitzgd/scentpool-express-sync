@@ -37,6 +37,7 @@ import fulfillment_profiles_test
 import shipping_cargo_test
 import recipient_edit_test
 import fulfillment_reports_test
+import inventory_integration_test
 from database import AppError, DEFAULT_PRODUCT_FILE, Database, now_text
 
 
@@ -1892,6 +1893,7 @@ def main() -> None:
         reliability_http_test.run()
         bounded_exports_test.run()
         http_limits_test.main()
+        inventory_integration_test.main()
         print("smoke test passed")
 
 

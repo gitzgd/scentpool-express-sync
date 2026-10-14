@@ -1,0 +1,246 @@
+{
+  "schema_version": 1,
+  "status": "verified_for_draft_pr_not_deployed",
+  "base_path": "/api/inventory/v1",
+  "continuation_contract": {
+    "response_fields_on_every_success_including_empty_pages": {
+      "stream_id": "persistent lowercase UUID string",
+      "next_cursor": "nonnegative integer",
+      "next_checkpoint": "32 lowercase hexadecimal characters, empty only when next_cursor is 0"
+    },
+    "first_request": "GET /events?cursor=0&limit=100; stream_id/checkpoint may be omitted on initial bootstrap only",
+    "later_request": "GET /events?cursor=<next_cursor>&limit=100&stream_id=<stream_id>&checkpoint=<next_checkpoint>",
+    "empty_database": "events=[],next_cursor=0,next_checkpoint=empty string; stream_id is still present",
+    "empty_later_page": "Return all continuation fields. At a positive unchanged watermark return its same stored checkpoint. Never omit continuation fields just because events is empty.",
+    "failure": "For cursor>0, missing or mismatched stream_id/checkpoint returns 409. Cursor beyond watermark also returns 409. After restore/regrowth, reused cursor integers have different random checkpoints. Stop for manual reconciliation, never automatically reset cursor or rededuct stock.",
+    "consumer_transaction": "Persist stream_id,next_cursor,next_checkpoint atomically with local state reconciliation. Initial baseline/reference-only policy still applies.",
+    "event_id_format": "<stream_id>:<cursor>:<event_checkpoint>; opaque string, do not parse or construct",
+    "ordinary_business_id": "EXP-<internal shipment id>, not the old free-form business identifier which may contain personal data"
+  },
+  "booking_retry_contract": {
+    "same_key": "Explicit POST of the same key and original profile/revision requeues only a failed original current batch, preserving its provider request id and immutable configuration. Concurrent repeats while queued/running/success do not create or requeue another job. GET never retries. Do not automatically loop POST on failed status.",
+    "new_key": "Rejected once a task has attempted booking, including failure/unknown outcome. Allowed only after confirmed provider cancellation has been persisted and original request identity cleared.",
+    "cancelled_old_key": "Returns original batch identity with current dispatch status; never reactivates a cancelled label or newer attempt.",
+    "cancel": "No inventory cancellation API in v1. Operator opens headquarters_session_ui deep link, signs in to the original express system as headquarters, checks recipient and active label, and manually confirms the existing provider cancellation API. Failed/unknown cancellation never clears label; stale expected_cancel_version returns 409 before provider call. No automatic cancellation, rebooking or inventory posting.",
+    "late_results": "Results from cancelled/replaced batches or older recovered worker attempts are ignored; no inventory count resurrection. New booking after cancellation uses a new key/provider request id."
+  },
+  "authentication": {
+    "scheme": "Bearer",
+    "environment_variable": "SCENTPOOL_INVENTORY_TOKEN",
+    "minimum_length": 64,
+    "disabled_without_token": true,
+    "audit_token_or_browser_session_accepted": false
+  },
+  "limits": {
+    "json_bytes": 65536,
+    "items_per_dispatch": 100,
+    "quantity_per_item": 100000,
+    "events_page_max": 100,
+    "concurrent_requests": 2,
+    "events_item_rows_per_shipment_max": 500,
+    "events_page_state_bytes": 4194304,
+    "catalog_products_max": 20000,
+    "catalog_stores_max": 1000,
+    "catalog_text_characters_max": 1000000,
+    "events_item_text_characters_per_shipment_max": 262144
+  },
+  "errors": {
+    "body": {
+      "error": "human readable Chinese message"
+    },
+    "codes": {
+      "400": "invalid input",
+      "401": "invalid credentials",
+      "404": "not found or not integration-owned",
+      "409": "idempotency conflict, stale configuration or invalid state",
+      "413": "size limit",
+      "503": "disabled, busy or unavailable; retry same key"
+    }
+  },
+  "catalog": {
+    "method": "GET",
+    "path": "/catalog",
+    "response": {
+      "schema_version": 1,
+      "stores": [
+        {
+          "id": 1,
+          "name": "synthetic store",
+          "kind": "store",
+          "active": true
+        }
+      ],
+      "products": [
+        {
+          "barcode": "0001",
+          "name": "synthetic product",
+          "category": "synthetic",
+          "spec": "",
+          "status": "启用"
+        }
+      ],
+      "profiles": [
+        {
+          "id": "kunming",
+          "name": "昆明中台发货",
+          "revision": 1,
+          "ready": true
+        }
+      ]
+    },
+    "notes": "No private settings. Only kunming/kunming_sf are bookable by inventory."
+  },
+  "events": {
+    "method": "GET",
+    "path": "/events?cursor=0&limit=100",
+    "response": {
+      "schema_version": 1,
+      "events": [
+        {
+          "cursor": 1,
+          "event_id": "00000000-0000-4000-8000-000000000010:1:0123456789abcdef0123456789abcdef",
+          "kind": "shipment.upsert",
+          "historical_snapshot": true,
+          "shipment": {
+            "id": 1,
+            "business_id": "EXP-1",
+            "source_ref": "",
+            "source_kind": "express",
+            "historical_reference": true,
+            "store_id": 1,
+            "store_name": "synthetic store",
+            "shipment_type": "standard",
+            "status": "待处理",
+            "booking_status": "未下单",
+            "profile_id": "",
+            "channel": "unknown",
+            "tracking_no": "",
+            "express_company": "圆通",
+            "tracking_status": "",
+            "shipped_at": "",
+            "updated_at": "",
+            "items": [
+              {
+                "barcode": "0001",
+                "name": "synthetic product",
+                "quantity": 2,
+                "item_kind": "product"
+              }
+            ]
+          }
+        }
+      ],
+      "next_cursor": 1,
+      "has_more": false,
+      "watermark": 1,
+      "stream_id": "00000000-0000-4000-8000-000000000010",
+      "next_checkpoint": "0123456789abcdef0123456789abcdef"
+    },
+    "semantics": "Durable monotonic change-notification cursor, coalesced to latest committed state per shipment. Not an accounting movement ledger or point-in-time event replay. Transaction-consistent page; consumer idempotently upserts by shipment id and only advances cursor after successful local transaction. Deleted events are tombstones with id/source_ref/source_kind. Initial import and historical_reference=true are reference-only: never retroactively deduct inventory. Establish consumer baseline before applying live effective-state differences. Channel comes only from matching current successful booking snapshot; unknown is never guessed. No recipient fields, notes, URLs, credentials or raw third-party payloads. See continuation_contract: persist stream_id,next_cursor,next_checkpoint atomically. Always provide stream_id/checkpoint with positive cursors."
+  },
+  "create_dispatch": {
+    "method": "POST",
+    "path": "/dispatches",
+    "request": {
+      "reference": "00000000-0000-4000-8000-000000000001",
+      "purpose": "store_restock",
+      "owner": {
+        "kind": "store",
+        "external_id": "1",
+        "name": "synthetic store"
+      },
+      "recipient": {
+        "name": "synthetic",
+        "phone": "13900000000",
+        "address": "synthetic address"
+      },
+      "items": [
+        {
+          "barcode": "0001",
+          "quantity": 2
+        }
+      ],
+      "note": "internal note, not printed"
+    },
+    "response": {
+      "id": 1,
+      "reference": "00000000-0000-4000-8000-000000000001",
+      "status": "待处理"
+    },
+    "notes": "purpose=store_restock|channel; owner.kind=store|channel with matching purpose. External owner identity is metadata, not an existing express staff store permission. Dedicated integration ownership; hidden from store/team sessions. Same reference+same normalized content returns same shipment; changed content or deleted identity returns 409. No automatic booking."
+  },
+  "book_dispatch": {
+    "method": "POST",
+    "path": "/dispatches/{id}/book",
+    "request": {
+      "profile_id": "kunming",
+      "profile_revision": 1,
+      "request_key": "00000000-0000-4000-8000-000000000002"
+    },
+    "response": {
+      "id": 1,
+      "reference": "00000000-0000-4000-8000-000000000001",
+      "status": "待处理",
+      "booking_status": "排队中",
+      "batch_id": 1
+    },
+    "notes": "See booking_retry_contract. Same key preserves batch/provider request/configuration; explicit retry requeues only the original current failed batch. Never rotate key after failure or unknown outcome. New key only after confirmed cancellation. An accepted response means queued, not carrier success."
+  },
+  "get_dispatch": {
+    "method": "GET",
+    "path": "/dispatches/{id}",
+    "response": {
+      "id": 1,
+      "reference": "00000000-0000-4000-8000-000000000001",
+      "status": "已发货",
+      "booking_status": "已出单",
+      "tracking_no": "synthetic",
+      "express_company": "中通",
+      "profile_id": "kunming",
+      "channel": "kunming",
+      "label_available": true,
+      "label_path": "/api/inventory/v1/dispatches/1/label",
+      "failure_category": "",
+      "message": "",
+      "tracking_status": "等待揽收"
+    },
+    "notes": "Integration-owned records only. No recipient or direct vendor label URL returned. Polling does not retry or call provider. tracking_status is returned verbatim as the safe normalized logistics status; do not overwrite it with generic shipment status."
+  },
+  "label": {
+    "method": "GET",
+    "path": "/dispatches/{id}/label",
+    "response_content_type": "application/pdf",
+    "notes": "Integration-owned active label only, existing trusted URL, size/time/concurrency/subprocess validation. No arbitrary URL parameter, no automatic print status mutation. PDF necessarily contains delivery data; authorized inventory backend must proxy only to authorized operators and never log it."
+  },
+  "put_product": {
+    "method": "PUT",
+    "path": "/products/{urlencoded_barcode}",
+    "request": {
+      "name": "synthetic product",
+      "category": "synthetic",
+      "spec": "",
+      "status": "启用"
+    },
+    "response": {
+      "barcode": "0001",
+      "name": "synthetic product",
+      "category": "synthetic",
+      "spec": "",
+      "status": "启用"
+    },
+    "notes": "Idempotent master-data upsert, status 启用|停用, preserve existing price and historical item snapshots. No packaging code or unit conversion. Existing manual product UI remains available until coordinated cutover."
+  },
+  "release": "Development acceptance and consumer synthetic end-to-end passed. Draft PR review only; no main merge, production deployment, token provisioning or real carrier calls authorized.",
+  "headquarters_session_ui": {
+    "path": "/?inventory_task=<remote shipment id>",
+    "authentication": "Original express headquarters session only. Staff gets 403; inventory/audit Bearer tokens cannot authorize the task API or cancellation. Anonymous page contains only login shell.",
+    "read_path": "GET /api/admin/inventory-tasks/{id}",
+    "read_scope": "Only the specified integration-owned task; ordinary shipment IDs return 404. Headquarters can view recipient, items and active label for confirmation; no raw payload, configuration or direct label URL.",
+    "cancel_path": "POST /api/shipments/{id}/label/cancel",
+    "cancel_body": {
+      "reason": "operator reason",
+      "expected_cancel_version": "opaque version returned by headquarters task read"
+    },
+    "handoff": "After operator-confirmed cancellation, new inventory application refreshes GET /dispatches/{id}. Only booking_status=已取消 and empty tracking_no allow a new request_key; keep the same remote shipment id and source_ref. Do not treat opening the page or closing the tab as success. No automatic stock posting."
+  }
+}

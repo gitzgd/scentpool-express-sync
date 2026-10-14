@@ -1,0 +1,22 @@
+.inventory-task-page { max-width: 840px; margin: 32px auto; padding: 0 20px 40px; overflow-wrap: anywhere; }
+.inventory-task-page [hidden] { display: none !important; }
+.inventory-task-page h1 { margin-bottom: 8px; }
+.inventory-task-page header { margin-bottom: 24px; }
+.inventory-task-page h2 { font-size: 20px; }
+.inventory-task-page label { display: grid; gap: 8px; margin-bottom: 16px; }
+.inventory-task-page .task-heading { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.inventory-task-page dl { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 12px; }
+.inventory-task-page dd { margin: 0; white-space: pre-wrap; }
+.inventory-task-page dt { color: #6e6e73; }
+.inventory-task-page li { margin: 10px 0; }
+.inventory-task-page .task-actions { display: flex; gap: 12px; flex-wrap: wrap; }
+.inventory-task-page .btn { min-height: 44px; white-space: normal; }
+.inventory-task-page #notice { padding: 12px; border-radius: 8px; background: #edf3ff; }
+.inventory-task-page #notice.error { color: #922323; background: #fff0ef; }
+@media (max-width: 520px) {
+  .inventory-task-page { margin-top: 20px; padding: 0 16px 28px; }
+  .inventory-task-page .panel-pad { padding: 18px; }
+  .inventory-task-page dl { grid-template-columns: 1fr; gap: 5px; }
+  .inventory-task-page dd { margin-bottom: 12px; }
+  .inventory-task-page .task-actions .btn { flex: 1 1 100%; }
+}

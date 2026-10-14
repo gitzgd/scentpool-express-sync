@@ -30,6 +30,11 @@ python3 server.py --host 0.0.0.0 --port 8765
 
 ## 环境变量
 
+进销存接口目前仅在独立开发分支验收，未部署。未来启用需另行授权设置独立的
+`SCENTPOOL_INVENTORY_TOKEN`（64 至 256 位字母/数字/下划线/连字符，建议随机32字节hex）；
+缺失或与审计令牌相同则接口返回503。不能将令牌放入浏览器、URL、代码或日志。
+接口边界、同键重试和恢复续读协议见 [集成说明](docs/features/inventory-integration.md)。
+
 售后与合作发货无需新增环境变量。门店通过 `/special/new` 创建补发/换货；总部在“门店与团队”创建独立合作账号后，该账号直接进入合作寄送。历史订单保留未分类，内部用途不上面单。完整权限、统计及迁移/回滚说明见 [售后与合作发货](docs/features/special-shipments.md)。专项测试为 `python3 special_shipments_test.py`，已包含于完整烟测。
 
 - `PORT`：云端端口，Render 会自动注入。

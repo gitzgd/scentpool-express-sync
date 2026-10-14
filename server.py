@@ -841,7 +841,7 @@ def process_next_shipping_job(connection: Optional[sqlite3.Connection] = None) -
             f"{original_error} 系统已自动重试 {SHIPPING_TRANSIENT_RETRIES} 次仍未成功，"
             "请稍后点击“重试失败订单”。"
         )
-    completed = DB.complete_shipping_job(int(job["batch_item_id"]), result)
+    completed = DB.complete_shipping_job(int(job["batch_item_id"]), result, expected_attempt=job["booking_attempt"])
     if completed.get("tracking_no"):
         TRACKING_QUEUE_EVENT.set()
     return True
@@ -978,6 +978,16 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
             path = parsed.path
             query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
 
+            if path == "/" and "inventory_task" in parse_qs(parsed.query, keep_blank_values=True):
+                values = parse_qs(parsed.query, keep_blank_values=True)
+                if set(values) != {"inventory_task"} or len(values["inventory_task"]) != 1 or not re.fullmatch(r"[1-9][0-9]{0,11}", values["inventory_task"][0]):
+                    raise AppError("库存任务链接无效。", 400)
+                user = DB.user_for_session(self.session_token())
+                if user:
+                    self.require_admin(user)
+                self.serve_file(STATIC_DIR / "inventory-task.html", "text/html; charset=utf-8")
+                return
+
             if path.startswith("/api/"):
                 self.route_api(path, query)
                 return
@@ -1009,6 +1019,10 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
                 print(f"[slow-request] {self.command} {path} {elapsed_ms:.0f}ms")
 
     def route_api(self, path: str, query: Dict[str, str]) -> None:
+        if path.startswith("/api/inventory/"):
+            from inventory_integration import handle
+            handle(self, DB)
+            return
         if path == "/api/health" and self.command == "GET":
             self.send_health()
             return
@@ -1090,6 +1104,13 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
             return
 
         user = self.require_user()
+
+        inventory_task = re.fullmatch(r"/api/admin/inventory-tasks/([1-9][0-9]{0,11})", path)
+        if inventory_task and self.command == "GET":
+            self.require_admin(user)
+            from inventory_integration import admin_task
+            self.send_json({"task": admin_task(DB, int(inventory_task[1]), user)})
+            return
 
         if path.startswith("/api/tracking/tasks/") and self.command == "GET":
             self.send_json({"task": TrackingQueue(DB).task(path.rsplit("/",1)[-1], user)})
@@ -1405,6 +1426,10 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
             shipment_id = int(path.split("/")[3])
             body = self.read_json()
             booking = DB.booking_for_cancel(shipment_id)
+            if booking.get("inventory_source_kind") != "express":
+                from inventory_integration import cancel_version
+                if body.get("expected_cancel_version") != cancel_version(booking):
+                    raise AppError("库存面单已变化或尚未核对，请从总部任务页刷新后重新确认取消。", 409)
             result = Kuaidi100LabelClient.from_env().cancel_label(
                 booking,
                 DB.shipping_settings_for_company(str(booking.get("express_company") or "")),
@@ -1412,7 +1437,7 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
             )
             if not result.get("success"):
                 raise AppError(str(result.get("error") or "取消电子面单失败。"), 502)
-            DB.mark_booking_cancelled(shipment_id, str(result.get("raw") or ""))
+            DB.mark_booking_cancelled(shipment_id, str(result.get("raw") or ""), expected_request_id=booking["booking_request_id"])
             self.send_json({"shipment": DB.get_shipment(shipment_id, user), "provider_code": result.get("code", "")})
             return
 

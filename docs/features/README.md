@@ -20,6 +20,7 @@
 | [脱敏业务日报](daily-audit.md) | 独立 Bearer 鉴权、只读汇总、历史日末、脱敏失败与时间证据、连接双采样/容量基线、高精度打印时间、延迟套餐限制分类及网站状态/采集完整性分离 | `database.py`, `server.py`, `tools/scentpool_daily_audit_probe.py`, `daily_audit_test.py`, `daily_audit_probe_test.py` |
 | 导出 | CSV/XLSX、门店和日期命名、商品分类换行 | `server.py` |
 | 数据安全 | SQLite 在线备份、恢复保护、完整性检查 | `database.py`, `manage.py`, `server.py` |
+| [进销存接口（待审查、未部署）](inventory-integration.md) | 独立令牌、带恢复检查点的脱敏状态流、补货/渠道幂等任务、安全重试、总部单任务手动取消页与本地合成联调 | `inventory_integration.py`, `inventory_integration_test.py`, `static/inventory-task.js` |
 | 运维 | 健康检查、进程与 SQLite 连接诊断、慢请求、资源限制 | `server.py`, `database.py`, `render.yaml`, `OPERATIONS.md` |
 
 ## 新增功能文档要求

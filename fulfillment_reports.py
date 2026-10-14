@@ -80,7 +80,7 @@ class Report:
         conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 5000)
         conn.create_function("report_day", 1, _day, deterministic=True)
         conn.create_function("report_time", 1, _instant, deterministic=True)
-        where = ["s.status IN ('已发货','已签收')"]
+        where = ["s.status IN ('已发货','已签收')", "s.inventory_source_kind='express'"]
         self.params = dict(filters)
         if filters["store_id"]:
             where.append("s.store_id=:store_id")

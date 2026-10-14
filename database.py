@@ -557,6 +557,8 @@ class Database:
             migrate(conn)
             from fulfillment_reports import migrate as migrate_reports
             migrate_reports(conn)
+            from inventory_integration import migrate as migrate_inventory
+            migrate_inventory(conn)
 
         if self.count_products() == 0 and os.path.exists(product_file):
             self.import_products(product_file)
@@ -1651,7 +1653,7 @@ class Database:
                         LIMIT 1
                     ) AS latest_batch_id
                 FROM shipments
-                WHERE
+                WHERE inventory_source_kind = 'express' AND (
                     shipments.booking_status = '下单失败'
                     OR (
                         shipments.booking_status IN ('排队中', '提交中')
@@ -1660,6 +1662,7 @@ class Database:
                     )
                     OR shipments.tracking_status = '查询失败'
                     OR shipments.label_print_status = '打印失败'
+                )
                 """,
                 (stale_before,),
             ).fetchall()
@@ -2292,17 +2295,21 @@ class Database:
                 (day_start, day_end, day_start, day_end, day_start, day_end, day_end),
             ).fetchall()
 
-            type_rows = conn.execute("""SELECT shipment_type,
+            type_rows = conn.execute("""SELECT CASE WHEN inventory_source_kind='express' THEN shipment_type
+                ELSE inventory_source_kind END AS shipment_type,
                 SUM(CASE WHEN julianday(created_at)>=julianday(?) AND julianday(created_at)<julianday(?) THEN 1 ELSE 0 END) AS new_shipments,
                 SUM(CASE WHEN julianday(shipped_at)>=julianday(?) AND julianday(shipped_at)<julianday(?) THEN 1 ELSE 0 END) AS shipped_shipments,
                 SUM(CASE WHEN julianday(tracking_signed_at)>=julianday(?) AND julianday(tracking_signed_at)<julianday(?) THEN 1 ELSE 0 END) AS signed_shipments,
                 SUM(CASE WHEN status='待处理' AND julianday(created_at)<julianday(?) THEN 1 ELSE 0 END) AS backlog_current_snapshot
-                FROM shipments GROUP BY shipment_type""", (day_start,day_end,day_start,day_end,day_start,day_end,day_end)).fetchall()
+                FROM shipments GROUP BY 1""", (day_start,day_end,day_start,day_end,day_start,day_end,day_end)).fetchall()
             by_type = {key: {metric: 0 for metric in totals} for key in SHIPMENT_TYPES}
             for row in type_rows:
                 by_type[row["shipment_type"]] = {metric: int(row[metric] or 0) for metric in totals}
             by_group = {group: {metric: sum(by_type[key][metric] for key, value in SHIPMENT_TYPES.items() if value[2] == group)
                                 for metric in totals} for group in GROUP_LABELS}
+            if any(key.startswith("inventory_") for key in by_type):
+                by_group["inventory"] = {metric: sum(values[metric] for key,values in by_type.items()
+                    if key.startswith("inventory_")) for metric in totals}
 
             recent_totals = dict(
                 conn.execute(
@@ -2939,8 +2946,9 @@ class Database:
             LEFT JOIN users ON users.store_id = stores.id AND users.role = 'staff'
         """
         params: List[Any] = []
+        sql += " WHERE stores.id NOT IN (SELECT CAST(value AS INTEGER) FROM inventory_meta WHERE key='store_id')"
         if not include_inactive:
-            sql += " WHERE stores.active = 1"
+            sql += " AND stores.active = 1"
         sql += " GROUP BY stores.id ORDER BY stores.active DESC, stores.name"
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(sql, params).fetchall()]
@@ -2978,6 +2986,8 @@ class Database:
     def update_store(self, store_id: int, active: bool) -> Dict[str, Any]:
         now = now_text()
         with self.connect() as conn:
+            if conn.execute("SELECT 1 FROM inventory_meta WHERE key='store_id' AND value=?", (str(store_id),)).fetchone():
+                raise AppError("系统集成归属不能作为员工账号启用。",403)
             cursor = conn.execute(
                 "UPDATE stores SET active = ?, updated_at = ? WHERE id = ?",
                 (1 if active else 0, now, store_id),
@@ -3282,6 +3292,10 @@ class Database:
 
     def get_shipment(self, shipment_id: int, user: Dict[str, Any]) -> Dict[str, Any]:
         shipments = self.list_shipments(user, {"id": shipment_id})
+        # HQ may inspect a specific service task for controlled cancellation;
+        # regular lists/reports remain ordinary customer shipments only.
+        if not shipments and user.get("role") == "admin":
+            shipments = self.list_shipments({**user, "inventory_service": True}, {"id": shipment_id})
         if not shipments:
             raise AppError("发货单不存在。", 404)
         return shipments[0]
@@ -3378,7 +3392,10 @@ class Database:
         user: Dict[str, Any],
         filters: Dict[str, Any],
     ) -> tuple[List[str], List[Any]]:
-        where = []
+        # Inventory service tasks are not customer/store sales. This internal
+        # flag is constructed only by the isolated Bearer bridge, never filters.
+        where = ["shipments.inventory_source_kind <> 'express'" if user.get("inventory_service")
+                 else "shipments.inventory_source_kind = 'express'"]
         params: List[Any] = []
 
         if filters.get("id"):
@@ -3973,6 +3990,7 @@ class Database:
         shipment_choices: List[Dict[str, Any]],
         filters: Optional[Dict[str, Any]] = None,
         *, selection_mode="selected", preview_fingerprint="", express_company="", profile_id=None,
+        inventory_request=None,
     ) -> Dict[str, Any]:
         if not shipment_choices and selection_mode != "all_matching":
             raise AppError("没有可下单的发货单。")
@@ -4000,6 +4018,26 @@ class Database:
 
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if inventory_request is not None:
+                from inventory_integration import owned
+                if not user.get("inventory_service") or len(normalized) != 1 or normalized[0][0] != inventory_request["shipment_id"]:
+                    raise AppError("库存取号范围无效。",403)
+                inventory_row = owned(conn, inventory_request["shipment_id"])
+                replay = conn.execute("SELECT * FROM inventory_bookings WHERE request_key=?",
+                    (inventory_request["request_key"],)).fetchone()
+                if replay:
+                    if (replay["shipment_id"],replay["profile_id"],replay["profile_revision"]) != (
+                            inventory_request["shipment_id"],profile_id,inventory_request["profile_revision"]):
+                        raise AppError("取号请求标识已经用于不同内容。",409)
+                    if conn.execute("SELECT 1 FROM shipping_batch_items WHERE batch_id=? AND status='失败'", (replay["batch_id"],)).fetchone():
+                        self._retry_shipping_batch_locked(conn, replay["batch_id"])
+                    return {"batch": {"id": replay["batch_id"]}}
+                if inventory_row["booking_request_id"]:
+                    raise AppError("此任务已尝试取号，请查询原请求结果，不能用新标识重复取号。",409)
+                revision = conn.execute("SELECT revision FROM fulfillment_profiles WHERE id=?",(profile_id,)).fetchone()
+                if not revision or revision[0] != inventory_request["profile_revision"]:
+                    raise AppError("发货方案版本已变化，请重新读取主档后确认。",409)
+                preview_fingerprint = self._preview_fingerprint(conn,user,filters or {},profile_id)
             from fulfillment_profiles import selected, snapshot, ensure_branch, ensure_template, branch_balance_warning, encoded
             settings = self.get_shipping_settings(connection=conn)
             profile = selected(conn, settings, profile_id)
@@ -4106,6 +4144,10 @@ class Database:
                     """,
                     (batch_id, shipment["id"], company, request_id, salt, now, now, encoded(snapshots[shipment["id"]])),
                 )
+            if inventory_request is not None:
+                conn.execute("INSERT INTO inventory_bookings VALUES(?,?,?,?,?)", (
+                    inventory_request["request_key"],inventory_request["shipment_id"],profile_id,
+                    inventory_request["profile_revision"],batch_id))
         return self.get_shipping_batch(batch_id)
 
     def claim_next_shipping_job(
@@ -4170,6 +4212,7 @@ class Database:
         payload = dict(shipment)
         payload["items"] = [dict(item) for item in items]
         payload["batch_item_id"] = job["id"]
+        payload["booking_attempt"] = int(job["attempt_count"]) + 1
         payload["batch_id"] = job["batch_id"]
         payload["shipping_settings_snapshot"] = config
         payload["express_company"] = job["express_company"]
@@ -4258,19 +4301,29 @@ class Database:
             "tracking_signed_at_source": signed_source,
         }
 
-    def complete_shipping_job(self, item_id: int, result: Dict[str, Any]) -> Dict[str, Any]:
+    def complete_shipping_job(self, item_id: int, result: Dict[str, Any], *, expected_attempt=None) -> Dict[str, Any]:
         now = now_text()
         success = bool(result.get("success"))
         tracking_no = str(result.get("tracking_no") or "").strip()
         item_status = "成功" if success and tracking_no else "失败"
         booking_status = "已出单" if success and tracking_no else "下单失败"
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             item = conn.execute("SELECT * FROM shipping_batch_items WHERE id = ?", (item_id,)).fetchone()
             if not item:
                 raise AppError("批次任务不存在。", 404)
             shipment = conn.execute("SELECT * FROM shipments WHERE id = ?", (item["shipment_id"],)).fetchone()
             if not shipment:
                 raise AppError("发货单不存在。", 404)
+            newest = conn.execute("SELECT id FROM shipping_batch_items WHERE shipment_id=? ORDER BY id DESC LIMIT 1", (item["shipment_id"],)).fetchone()
+            # A cancelled/replaced generation and a recovered older worker must
+            # never resurrect a label. Worker supplies its persisted attempt.
+            if (newest[0] != item_id or item["request_id"] != shipment["booking_request_id"]
+                    or item["status"] in {"已取消", "成功"}
+                    or shipment["booking_status"] == "已取消"
+                    or (expected_attempt is not None and (
+                        item["status"] != "提交中" or item["attempt_count"] != expected_attempt))):
+                return {"shipment_id": item["shipment_id"], "tracking_no": "", "success": False, "ignored": True}
             status = "已发货" if tracking_no else shipment["status"]
             times = self._resolved_shipment_times(
                 shipment,
@@ -4378,36 +4431,32 @@ class Database:
                 "pagination":{"page":page,"page_size":page_size,"total":total,"total_pages":max(1,(total+page_size-1)//page_size)}}
 
     def retry_shipping_batch(self, batch_id: int) -> Dict[str, Any]:
-        now = now_text()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            failed = conn.execute(
-                "SELECT shipment_id,request_id,settings_snapshot_json FROM shipping_batch_items WHERE batch_id = ? AND status = '失败'",
-                (batch_id,),
-            ).fetchall()
-            if not failed:
-                raise AppError("这个批次没有可重试的失败订单。", 409)
-            for row in failed:
-                current = conn.execute("SELECT booking_request_id,status,tracking_no,booking_status FROM shipments WHERE id=?", (row["shipment_id"],)).fetchone()
-                newest = conn.execute("SELECT batch_id FROM shipping_batch_items WHERE shipment_id=? ORDER BY id DESC LIMIT 1", (row["shipment_id"],)).fetchone()
-                if not current or not self.shipment_booking_eligible(dict(current)) or current["booking_request_id"] != row["request_id"] or newest[0] != batch_id:
-                    raise AppError("原批次订单已变化或已进入其他批次，不能再次提交。",409)
-                if row["settings_snapshot_json"] == '{}':
-                    raise AppError("历史失败任务缺少原寄件配置快照，请先核对供应商结果，不能直接重试。",409)
-            conn.execute(
-                "UPDATE shipping_batch_items SET status = '排队中', error = '', updated_at = ? WHERE batch_id = ? AND status = '失败'",
-                (now, batch_id),
-            )
-            for row in failed:
-                conn.execute(
-                    "UPDATE shipments SET booking_status = '排队中', booking_error = '', booking_updated_at = ?, updated_at = ? WHERE id = ?",
-                    (now, now, row["shipment_id"]),
-                )
-            conn.execute(
-                "UPDATE shipping_batches SET status = '排队中', finished_at = '', updated_at = ? WHERE id = ?",
-                (now, batch_id),
-            )
+            self._retry_shipping_batch_locked(conn, batch_id)
         return self.get_shipping_batch(batch_id)
+
+    def _retry_shipping_batch_locked(self, conn, batch_id):
+        """Caller must own the immediate transaction; retain request and snapshot."""
+        now = now_text()
+        failed = conn.execute(
+            "SELECT shipment_id,request_id,settings_snapshot_json FROM shipping_batch_items WHERE batch_id=? AND status='失败'",
+            (batch_id,)).fetchall()
+        if not failed:
+            raise AppError("这个批次没有可重试的失败订单。", 409)
+        for row in failed:
+            current = conn.execute("SELECT booking_request_id,status,tracking_no,booking_status FROM shipments WHERE id=?", (row["shipment_id"],)).fetchone()
+            newest = conn.execute("SELECT batch_id FROM shipping_batch_items WHERE shipment_id=? ORDER BY id DESC LIMIT 1", (row["shipment_id"],)).fetchone()
+            if not current or not self.shipment_booking_eligible(dict(current)) or current["booking_request_id"] != row["request_id"] or newest[0] != batch_id:
+                raise AppError("原批次订单已变化或已进入其他批次，不能再次提交。",409)
+            if row["settings_snapshot_json"] == '{}':
+                raise AppError("历史失败任务缺少原寄件配置快照，请先核对供应商结果，不能直接重试。",409)
+        conn.execute("UPDATE shipping_batch_items SET status='排队中',error='',updated_at=? WHERE batch_id=? AND status='失败'", (now,batch_id))
+        for row in failed:
+            conn.execute(
+                "UPDATE shipments SET booking_status='排队中',booking_error='',booking_updated_at=?,updated_at=? WHERE id=?",
+                (now,now,row["shipment_id"]))
+        conn.execute("UPDATE shipping_batches SET status='排队中',finished_at='',updated_at=? WHERE id=?", (now,batch_id))
 
     def reset_stale_shipping_jobs(
         self,
@@ -4527,16 +4576,17 @@ class Database:
 
     def booking_for_cancel(self, shipment_id: int) -> Dict[str, Any]:
         with self.connect() as conn:
+            conn.execute("BEGIN")
             row = conn.execute("SELECT * FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
             batch_item = conn.execute(
                 """
                 SELECT cancel_param_json
                 FROM shipping_batch_items
-                WHERE shipment_id = ? AND status = '成功'
+                WHERE shipment_id = ? AND status = '成功' AND request_id = ?
                 ORDER BY id DESC
                 LIMIT 1
                 """,
-                (shipment_id,),
+                (shipment_id, row["booking_request_id"] if row else ""),
             ).fetchone()
         if not row:
             raise AppError("发货单不存在。", 404)
@@ -4635,9 +4685,15 @@ class Database:
                 [now, *normalized_ids],
             )
 
-    def mark_booking_cancelled(self, shipment_id: int, raw: str = "") -> Dict[str, Any]:
+    def mark_booking_cancelled(self, shipment_id: int, raw: str = "", *, expected_request_id=None) -> Dict[str, Any]:
         now = now_text()
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute("SELECT booking_request_id FROM shipments WHERE id=?", (shipment_id,)).fetchone()
+            if not current:
+                raise AppError("发货单不存在。", 404)
+            if expected_request_id is not None and current[0] != expected_request_id:
+                raise AppError("取消响应对应的面单已变化，未清除当前面单，请总部核对。", 409)
             conn.execute(
                 """
                 UPDATE shipments
