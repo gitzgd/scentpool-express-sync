@@ -21,7 +21,7 @@
     "same_key": "Explicit POST of the same key and original profile/revision requeues only a failed original current batch, preserving its provider request id and immutable configuration. Concurrent repeats while queued/running/success do not create or requeue another job. GET never retries. Do not automatically loop POST on failed status.",
     "new_key": "Rejected once a task has attempted booking, including failure/unknown outcome. Allowed only after confirmed provider cancellation has been persisted and original request identity cleared.",
     "cancelled_old_key": "Returns original batch identity with current dispatch status; never reactivates a cancelled label or newer attempt.",
-    "cancel": "No inventory cancellation API in v1. A headquarters-authorized operator uses the existing provider-confirmed cancellation flow. Failed/unknown cancellation does not clear the label. Cancellation response is guarded against replacing a newer booking.",
+    "cancel": "No inventory cancellation API in v1. Operator opens headquarters_session_ui deep link, signs in to the original express system as headquarters, checks recipient and active label, and manually confirms the existing provider cancellation API. Failed/unknown cancellation never clears label; stale expected_cancel_version returns 409 before provider call. No automatic cancellation, rebooking or inventory posting.",
     "late_results": "Results from cancelled/replaced batches or older recovered worker attempts are ignored; no inventory count resurrection. New booking after cancellation uses a new key/provider request id."
   },
   "authentication": {
@@ -201,9 +201,10 @@
       "label_available": true,
       "label_path": "/api/inventory/v1/dispatches/1/label",
       "failure_category": "",
-      "message": ""
+      "message": "",
+      "tracking_status": "等待揽收"
     },
-    "notes": "Integration-owned records only. No recipient or direct vendor label URL returned. Polling does not retry or call provider."
+    "notes": "Integration-owned records only. No recipient or direct vendor label URL returned. Polling does not retry or call provider. tracking_status is returned verbatim as the safe normalized logistics status; do not overwrite it with generic shipment status."
   },
   "label": {
     "method": "GET",
@@ -229,5 +230,17 @@
     },
     "notes": "Idempotent master-data upsert, status 启用|停用, preserve existing price and historical item snapshots. No packaging code or unit conversion. Existing manual product UI remains available until coordinated cutover."
   },
-  "release": "Development acceptance and consumer synthetic end-to-end passed. Draft PR review only; no main merge, production deployment, token provisioning or real carrier calls authorized."
+  "release": "Development acceptance and consumer synthetic end-to-end passed. Draft PR review only; no main merge, production deployment, token provisioning or real carrier calls authorized.",
+  "headquarters_session_ui": {
+    "path": "/?inventory_task=<remote shipment id>",
+    "authentication": "Original express headquarters session only. Staff gets 403; inventory/audit Bearer tokens cannot authorize the task API or cancellation. Anonymous page contains only login shell.",
+    "read_path": "GET /api/admin/inventory-tasks/{id}",
+    "read_scope": "Only the specified integration-owned task; ordinary shipment IDs return 404. Headquarters can view recipient, items and active label for confirmation; no raw payload, configuration or direct label URL.",
+    "cancel_path": "POST /api/shipments/{id}/label/cancel",
+    "cancel_body": {
+      "reason": "operator reason",
+      "expected_cancel_version": "opaque version returned by headquarters task read"
+    },
+    "handoff": "After operator-confirmed cancellation, new inventory application refreshes GET /dispatches/{id}. Only booking_status=已取消 and empty tracking_no allow a new request_key; keep the same remote shipment id and source_ref. Do not treat opening the page or closing the tab as success. No automatic stock posting."
+  }
 }

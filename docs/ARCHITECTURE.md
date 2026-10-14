@@ -34,6 +34,8 @@ server.py
 
 ### `inventory_integration.py`（独立分支，未部署）
 
+- `static/inventory-task.*` 提供仅总部会话的单任务深链接核对及手动取消，库存令牌不继承总部权限；取消版本指纹防旧页面误取消新面单，无自动重发或库存写入。
+
 - `/api/inventory/v1` 独立服务令牌、脱敏目录/当前状态流、补货/渠道任务、昆明双方案取号、受控 PDF、商品主档同步。
 - SQLite 事务追加事件、最新状态指针及历史参考集合；UUID stream + 随机 checkpoint 防止恢复后游标重用。它不是库存账本。
 - 失败同键重试保持原请求/快照；成功取消后新键重发；Worker 尝试版本与取消身份比较防止迟到结果回写。见 [ADR-0011](decisions/ADR-0011-inventory-integration-state-feed.md) 与 [契约](features/inventory-contract.json)。

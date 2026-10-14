@@ -333,9 +333,29 @@ def get_dispatch(db, sid):
         available=bool(row["booking_status"]=='已出单' and row["tracking_no"] and row["label_url"])
         failed=row["booking_status"]=='下单失败'
         return dict(id=sid,reference=row["inventory_source_ref"],status=row["status"],booking_status=row["booking_status"],
-            tracking_no=row["tracking_no"],express_company=row["express_company"],profile_id=profile,channel=channel,
+            tracking_no=row["tracking_no"],tracking_status=row["tracking_status"],express_company=row["express_company"],profile_id=profile,channel=channel,
             label_available=available,label_path=f"{PREFIX}/dispatches/{sid}/label" if available else "",
             failure_category="booking_failed" if failed else "",message="面单未成功；人工确认重试时沿用原请求标识和配置，禁止换新标识重复取号。" if failed else "")
+
+
+def admin_task(db, sid, user):
+    """Narrow, headquarters-session-only view. Never available to service tokens."""
+    if user.get("role") != "admin":
+        raise AppError("需要总部权限。", 403)
+    row = db.get_shipment(sid, user)
+    if row.get("inventory_source_kind") not in SOURCE_KINDS.values():
+        raise AppError("库存任务不存在。", 404)
+    fields = ("id", "business_id", "inventory_source_kind", "inventory_source_ref", "status", "booking_status",
+              "recipient_name", "phone", "address", "tracking_no", "express_company", "tracking_status")
+    result = {key: row[key] for key in fields}
+    result["items"] = [{"name": i["product_name"], "quantity": i["quantity"]} for i in row["items"]]
+    result["can_cancel"] = bool(row["booking_status"] == "已出单" and row["booking_task_id"] and row["tracking_no"] and row["status"] != "已签收")
+    result["cancel_version"] = cancel_version(row)
+    return result
+
+
+def cancel_version(row):
+    return hashlib.sha256(json.dumps([row[key] for key in ("id", "booking_request_id", "booking_task_id", "tracking_no")]).encode()).hexdigest()
 
 
 def book_dispatch(db, sid, body):

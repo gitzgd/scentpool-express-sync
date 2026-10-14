@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="same-origin">
+  <title>库存发货任务 · 万物香铺</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/inventory-task.css">
+  <script src="/static/inventory-task.js" defer></script>
+</head>
+<body>
+<main class="inventory-task-page">
+  <header><a href="/admin">万物香铺 · 总部</a><h1>库存发货任务</h1>
+    <p class="muted">此页只核对新中台指定的一笔任务，不影响普通门店订单。</p></header>
+  <p id="notice" role="status" aria-live="polite">正在读取任务…</p>
+  <section id="loginPanel" class="panel panel-pad" hidden>
+    <h2>请登录总部账号</h2><p>请使用原快递系统的总部账号登录。</p>
+    <form id="loginForm">
+      <label>总部账号<input class="input" name="username" autocomplete="username" required></label>
+      <label>密码<input class="input" type="password" name="password" autocomplete="current-password" required></label>
+      <button class="btn primary" type="submit">登录并查看此任务</button>
+    </form>
+  </section>
+  <section id="taskPanel" class="panel panel-pad" hidden>
+    <div class="task-heading"><h2 id="taskTitle"></h2><span id="taskKind" class="shipment-type"></span></div>
+    <dl id="taskDetails"></dl>
+    <h3>寄送明细</h3><ul id="taskItems"></ul>
+    <p class="notice">只有快递平台确认取消且系统保存成功后，旧面单才会回收。取消后请回新中台刷新状态，再发起换单；本页不会自动重新下单或调整库存。</p>
+    <div class="task-actions">
+      <button id="refreshTask" class="btn secondary" type="button">刷新任务状态</button>
+      <button id="cancelTask" class="btn danger" type="button" disabled>取消并回收此面单</button>
+    </div>
+    <p id="cancelHint" class="muted"></p>
+  </section>
+</main>
+</body>
+</html>

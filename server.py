@@ -978,6 +978,16 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
             path = parsed.path
             query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
 
+            if path == "/" and "inventory_task" in parse_qs(parsed.query, keep_blank_values=True):
+                values = parse_qs(parsed.query, keep_blank_values=True)
+                if set(values) != {"inventory_task"} or len(values["inventory_task"]) != 1 or not re.fullmatch(r"[1-9][0-9]{0,11}", values["inventory_task"][0]):
+                    raise AppError("库存任务链接无效。", 400)
+                user = DB.user_for_session(self.session_token())
+                if user:
+                    self.require_admin(user)
+                self.serve_file(STATIC_DIR / "inventory-task.html", "text/html; charset=utf-8")
+                return
+
             if path.startswith("/api/"):
                 self.route_api(path, query)
                 return
@@ -1094,6 +1104,13 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
             return
 
         user = self.require_user()
+
+        inventory_task = re.fullmatch(r"/api/admin/inventory-tasks/([1-9][0-9]{0,11})", path)
+        if inventory_task and self.command == "GET":
+            self.require_admin(user)
+            from inventory_integration import admin_task
+            self.send_json({"task": admin_task(DB, int(inventory_task[1]), user)})
+            return
 
         if path.startswith("/api/tracking/tasks/") and self.command == "GET":
             self.send_json({"task": TrackingQueue(DB).task(path.rsplit("/",1)[-1], user)})
@@ -1409,6 +1426,10 @@ class Handler(RequestReadLimitsMixin, BaseHTTPRequestHandler):
             shipment_id = int(path.split("/")[3])
             body = self.read_json()
             booking = DB.booking_for_cancel(shipment_id)
+            if booking.get("inventory_source_kind") != "express":
+                from inventory_integration import cancel_version
+                if body.get("expected_cancel_version") != cancel_version(booking):
+                    raise AppError("库存面单已变化或尚未核对，请从总部任务页刷新后重新确认取消。", 409)
             result = Kuaidi100LabelClient.from_env().cancel_label(
                 booking,
                 DB.shipping_settings_for_company(str(booking.get("express_company") or "")),

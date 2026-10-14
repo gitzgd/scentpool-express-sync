@@ -11,6 +11,7 @@ import secrets
 import sys
 import tempfile
 import threading
+import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -62,7 +63,7 @@ def main():
     if not 1024 <= args.port <= 65535:
         parser.error("port must be between 1024 and 65535")
     # Guard applies before fixture initialization, imports and serving. No real
-    # worker, tracking scheduler, browser login or production DB option exists.
+    # worker, tracking scheduler or production DB option exists.
     sys.addaudithook(external_io_guard)
     os.environ["SCENTPOOL_TRACKING_AUTO"] = "0"
     os.environ["SCENTPOOL_KUAIDI100_LABEL_ENABLED"] = "0"
@@ -86,12 +87,37 @@ def main():
             conn.execute("INSERT INTO inventory_historical VALUES(?)", (examples[0]["id"],))
         server.DB = db
         server.build_batch_label_pdf_file = synthetic_pdf
+        import inventory_integration as integration
+        inventory_examples = []
+        for n in range(12):
+            db.upsert_product({"barcode": f"UI-DEMO-{n}", "name": "合成多商品及长名称界面验证" * 4 + str(n), "category": "合成商品", "price": "1.00"})
+        for index in range(3):
+            payload = sample_payload(str(uuid.uuid4()))
+            payload["recipient"]["address"] = "仅限本地合成地址、禁止真实寄送。" * 20
+            payload["items"] = [{"barcode": f"UI-DEMO-{n}", "quantity": n+1} for n in range(12)]
+            row = integration.create_dispatch(db, payload)
+            profile = next(p for p in integration.catalog(db)["profiles"] if p["id"] == "kunming")
+            integration.book_dispatch(db, row["id"], {"profile_id": "kunming", "profile_revision": profile["revision"], "request_key": str(uuid.uuid4())})
+            complete_one(db)
+            if index == 2:
+                db.mark_booking_cancelled(row["id"])
+            inventory_examples.append(row["id"])
+        class SyntheticCancelClient:
+            def cancel_label(self, booking, _settings, _reason):
+                if booking["id"] == inventory_examples[1]:
+                    return {"success": False, "error": "合成平台拒绝取消，原面单仍保留。"}
+                return {"success": True, "code": "200"}
+        server.Kuaidi100LabelClient.from_env = staticmethod(lambda: SyntheticCancelClient())
         class Handler(server.Handler):
             def log_message(self, *_args):
                 pass
             def route_api(self, path, query):
-                if not urlsplit(self.path).path.startswith("/api/inventory/v1/"):
-                    self.error_json("Local fixture exposes only the inventory API", 404)
+                current = urlsplit(self.path).path
+                allowed = current.startswith(("/api/inventory/v1/", "/api/admin/inventory-tasks/")) or current in {"/api/login", "/api/me", "/api/logout"}
+                cancel_id = current.split("/")[3] if current.startswith("/api/shipments/") and current.endswith("/label/cancel") else ""
+                allowed = allowed or (cancel_id.isdigit() and int(cancel_id) in inventory_examples)
+                if not allowed:
+                    self.error_json("Local fixture exposes only inventory and synthetic headquarters task routes", 404)
                     return
                 super().route_api(path, query)
         base = f"http://127.0.0.1:{args.port}/api/inventory/v1"
@@ -105,6 +131,7 @@ def main():
         manifest.write_text(json.dumps({"base_url": base, "token_file": str(token_file),
             "sample_payload_file": str(sample), "database": str(root / "synthetic.db"),
             "synthetic_shipped_samples": examples, "production_ready": False,
+            "inventory_task_samples": inventory_examples,
             "behavior": "book queues real local DB job, synthetic worker succeeds; PDF is blank synthetic only"}, indent=2))
         manifest.chmod(0o600)
         stop = threading.Event()

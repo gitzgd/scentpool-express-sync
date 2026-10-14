@@ -184,6 +184,10 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(self.fail_job(first)["ignored"])
         current = api.get_dispatch(self.db, sid)
         self.assertEqual((current["profile_id"], current["booking_status"]), ("kunming_sf", "已出单"))
+        self.assertEqual(current["tracking_status"], "等待揽收")
+        with self.db.connect() as conn:
+            conn.execute("UPDATE shipments SET tracking_status='运输中' WHERE id=?", (sid,))
+        self.assertEqual(api.get_dispatch(self.db, sid)["tracking_status"], "运输中")
         self.assertTrue(self.db.apply_label_print_callback("TASK-"+str(first["batch_item_id"]), "synthetic late callback", {"status":"200"})["ignored"])
 
     def test_events_transaction_rollback_items_and_delete(self):
@@ -299,6 +303,22 @@ class IntegrationTests(unittest.TestCase):
                 cookie = self.db.create_session(self.users["admin"]["id"])
                 admin_cookie = {"Cookie": "scentpool_session="+cookie}
                 self.assertEqual(request("/api/me", auth="", extra=admin_cookie)[0], 200)
+                task_path = f"/api/admin/inventory-tasks/{sid}"
+                self.assertEqual(request(task_path)[0], 401)
+                self.assertEqual(request(task_path, auth="a"*64)[0], 401)
+                staff_cookie = {"Cookie": "scentpool_session="+self.db.create_session(self.users["store"]["id"])}
+                self.assertEqual(request(task_path, auth="", extra=staff_cookie)[0], 403)
+                self.assertEqual(request(f"/?inventory_task={sid}", auth="", extra=staff_cookie)[0], 403)
+                self.assertEqual(request(f"/?inventory_task={sid}", auth="", extra=admin_cookie)[0], 200)
+                self.assertEqual(request(f"/?inventory_task={sid}&inventory_task={sid}")[0], 400)
+                ordinary = order(self.db, self.users, "NOT-INVENTORY")
+                self.assertEqual(request(f"/api/admin/inventory-tasks/{ordinary['id']}", auth="", extra=admin_cookie)[0], 404)
+                status, content = request(task_path, auth="", extra=admin_cookie)
+                self.assertEqual(status, 200)
+                task = json.loads(content)["task"]
+                self.assertTrue(task["can_cancel"])
+                self.assertFalse({"settings_snapshot_json", "booking_raw", "label_url"}.intersection(task))
+                cancel_body = json.dumps({"expected_cancel_version": task["cancel_version"]}).encode()
                 self.assertEqual(request(prefix+"/catalog", auth="", extra=admin_cookie)[0], 401)
                 self.assertEqual(request(prefix+"/catalog", auth="a"*64)[0], 401)
                 self.assertEqual(request(prefix+"/dispatches", "POST", b"x"*65537)[0], 413)
@@ -310,11 +330,13 @@ class IntegrationTests(unittest.TestCase):
                     status, content = request(prefix+f"/dispatches/{sid}/label")
                     self.assertEqual(status, 200); self.assertTrue(content.startswith(b"%PDF"))
                 with patch.object(server.Kuaidi100LabelClient, "from_env") as factory:
+                    self.assertEqual(request(f"/api/shipments/{sid}/label/cancel", "POST", b"{}", auth="", extra=admin_cookie)[0], 409)
+                    factory.assert_not_called()
                     factory.return_value.cancel_label.return_value = {"success":False,"error":"合成取消拒绝"}
-                    self.assertEqual(request(f"/api/shipments/{sid}/label/cancel", "POST", b"{}", auth="", extra=admin_cookie)[0], 502)
+                    self.assertEqual(request(f"/api/shipments/{sid}/label/cancel", "POST", cancel_body, auth="", extra=admin_cookie)[0], 502)
                     self.assertEqual(api.get_dispatch(self.db, sid)["booking_status"], "已出单")
                     factory.return_value.cancel_label.side_effect = TimeoutError("synthetic timeout")
-                    self.assertEqual(request(f"/api/shipments/{sid}/label/cancel", "POST", b"{}", auth="", extra=admin_cookie)[0], 500)
+                    self.assertEqual(request(f"/api/shipments/{sid}/label/cancel", "POST", cancel_body, auth="", extra=admin_cookie)[0], 500)
                     self.assertEqual(api.get_dispatch(self.db, sid)["booking_status"], "已出单")
                 def cancelled(rows, directory):
                     path = synthetic_pdf(rows, directory)
@@ -323,6 +345,19 @@ class IntegrationTests(unittest.TestCase):
                 with patch.object(server, "build_batch_label_pdf_file", cancelled):
                     self.assertEqual(request(prefix+f"/dispatches/{sid}/label")[0], 409)
                 self.assertEqual(request(prefix+f"/dispatches/{sid}/label?url=https://example.com")[0], 400)
+                self.booking(sid); self.succeed(self.db.claim_next_shipping_job())
+                with patch.object(server.Kuaidi100LabelClient, "from_env") as factory:
+                    self.assertEqual(request(f"/api/shipments/{sid}/label/cancel", "POST", cancel_body, auth="", extra=admin_cookie)[0], 409)
+                    factory.assert_not_called()
+                    current = api.admin_task(self.db, sid, self.users["admin"])
+                    fresh_body = json.dumps({"expected_cancel_version": current["cancel_version"]}).encode()
+                    factory.return_value.cancel_label.return_value = {"success": True}
+                    self.assertEqual(request(f"/api/shipments/{sid}/label/cancel", "POST", fresh_body, auth="", extra=staff_cookie)[0], 403)
+                    self.assertEqual(request(f"/api/shipments/{sid}/label/cancel", "POST", fresh_body)[0], 401)
+                    factory.assert_not_called()
+                    self.assertEqual(request(f"/api/shipments/{sid}/label/cancel", "POST", fresh_body, auth="", extra=admin_cookie)[0], 200)
+                    self.assertEqual(api.get_dispatch(self.db, sid)["booking_status"], "已取消")
+                    self.assertFalse(api.admin_task(self.db, sid, self.users["admin"])["can_cancel"])
             finally:
                 httpd.shutdown(); thread.join(timeout=5); httpd.server_close()
 
