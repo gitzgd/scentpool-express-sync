@@ -13,7 +13,7 @@
 | [发货与签收时间完整性](shipment-time-integrity.md) | 写入约束、证据等级、历史聚合预览与受控修复 | `database.py`, `tracking.py`, `manage.py` |
 | 物流 | 快递100查询、自动/手动同步、签收更新 | `tracking.py`, `server.py` |
 | [电子面单与发货方案](fulfillment-profiles.md) | 昆明中通/昆明顺丰/版纳圆通手动选择且保留跨页勾选、顺丰取号描述与商品区分离、菜鸟授权、模板保护、网点余额、不可变批次配置、取消、复打 | `fulfillment_profiles.py`, `shipping.py`, `database.py`, `server.py` |
-| 打印 | 待打印选择、PDF 合并、打印状态、单张复打 | `label_pdf.py`, `server.py`, `static/app.js` |
+| 打印 | 待打印选择、PDF 合并、打印状态、单张复打；线香“雨林与苔藓”缩略时固定为“雨林苔藓”，不与“雨林古檀”混淆 | `shipping.py`, `label_pdf.py`, `server.py`, `static/app.js` |
 | [双渠道发货统计](fulfillment-reports.md) | 版纳/昆明、门店商品/每日汇总、有效面单取消联动、只读权限与四表 Excel | `fulfillment_reports.py`, `static/reports.js`, `server.py` |
 | [任务可靠性与失败提示](task-reliability.md) | 面单短暂故障重试、中断恢复、分类异常角标、60 秒刷新、人工确认与操作指引 | `database.py`, `shipping.py`, `server.py`, `static/app.js` |
 | [操作体验与后台稳定性](experience-reliability.md) | 分阶段开发：局部更新、输入保护、持久查询、分页范围一致性、容量保护及证据完整性 | `tracking_queue.py`, `database.py`, `server.py`, `static/app.js` |

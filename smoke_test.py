@@ -534,6 +534,26 @@ def main() -> None:
         assert "基诺山雨林*5" in long_summary
         assert "\n【香包】" in long_summary
         assert "另" not in long_summary
+        # Incense aliases must remain distinguishable, including tight budgets.
+        for raw_name in ("雨林与苔藓", "灵气线香（雨林与苔藓）", "线香(雨林与苔藓)", "（线香）雨林与苔藓", "雨林 与 苔藓"):
+            cleaned = shipping.clean_label_product_name(raw_name, "线香")
+            for budget in (10, 4, 3, 2, 1):
+                assert shipping.abbreviate_label_product_name(cleaned, "线香", budget) == "雨林苔藓"
+        assert shipping.abbreviate_label_product_name("雨林古檀", "线香") == "雨林古檀"
+        assert shipping.abbreviate_label_product_name("雨林与苔藓", "香包") == "雨林"
+        assert shipping.abbreviate_label_product_name("基诺山雨林与苔藓", "睡眠喷雾") == "基诺山雨林"
+        incense_items = [
+            {"product_category": "线香", "product_name": "灵气线香（雨林与苔藓）", "quantity": 2},
+            {"product_category": "线香", "product_name": "灵气线香（雨林古檀）", "quantity": 3},
+        ]
+        assert shipping.build_label_item_summary(incense_items, 17) == "【线香】雨林苔藓*2、雨林古檀*3"
+        assert "雨林苔藓*2" in shipping.build_label_item_summary(incense_items, 1)
+        assert shipping.build_label_item_summary(incense_items, 100) == "【线香】雨林与苔藓*2、雨林古檀*3"
+        crowded_incense = {"items": incense_items + [
+            {"product_category": "线香", "product_name": "用于触发简称的合成线香名称" * 5, "quantity": 1}
+        ], "remark": "两袋两卡"}
+        assert "雨林苔藓*2" in shipping.build_label_remark(crowded_incense)
+        assert "雨林古檀*3" in shipping.build_label_remark(crowded_incense)
         auth_credentials = shipping.parse_auth_callback(
             json.dumps(
                 {
