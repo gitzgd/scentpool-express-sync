@@ -73,6 +73,10 @@ def clean_label_product_name(value: Any, category: Any) -> str:
 
 
 def abbreviate_label_product_name(name: str, category: str, max_chars: int = LABEL_ITEM_KEYWORD_MAX_CHARS) -> str:
+    # Keep this picking identifier intact even at the shortest fallback: "雨林"
+    # is ambiguous with the existing incense "雨林古檀".
+    if category == "线香" and re.sub(r"\s+", "", name) == "雨林与苔藓":
+        return "雨林苔藓"
     keyword = re.split(r"\s*(?:与|和|及|&|＋|\+|/|、)\s*", name, maxsplit=1)[0].strip()
     suffixes = [category, "睡眠喷雾", "喷雾", "香氛蜡烛", "蜡烛", "手串", "项链", "香包", "线香", "系列"]
     for suffix in suffixes:
